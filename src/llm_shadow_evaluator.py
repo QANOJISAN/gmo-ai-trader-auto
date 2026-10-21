@@ -39,6 +39,8 @@ class LLMShadowEvaluator:
     AI の BUY 判定および HOLD (Veto) 判定の事後パフォーマンス（4h / 12h / 24h MFE, MAE, パス依存PnL）を評価するエンジン
     """
 
+    MAX_IN_MEMORY_RECORDS = 1000
+
     def __init__(self, db_wal: Optional[DatabaseWAL] = None) -> None:
         self.db_wal = db_wal
         self.records: Dict[str, Dict[str, Any]] = {}
@@ -85,6 +87,10 @@ class LLMShadowEvaluator:
             "outcome_24h": "PENDING",
         }
         self.records[eval_id] = rec
+        if len(self.records) > self.MAX_IN_MEMORY_RECORDS:
+            completed_keys = [k for k, v in self.records.items() if v.get("outcome_24h") != "PENDING"]
+            evict_key = completed_keys[0] if completed_keys else next(iter(self.records))
+            self.records.pop(evict_key, None)
         if self.db_wal is not None:
             self.db_wal.record_shadow_evaluation(
                 eval_id=eval_id,

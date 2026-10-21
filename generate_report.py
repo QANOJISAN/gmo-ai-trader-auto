@@ -109,10 +109,13 @@ def compute_performance_metrics(
         portfolio.get("realized_pnl_total_jpy", portfolio.get("total_realized_pnl_jpy", 0)) or 0
     )
     positions: List[Dict[str, Any]] = portfolio.get("positions", []) or []
+    active_positions: List[Dict[str, Any]] = [
+        p for p in positions if str(p.get("state", "PROTECTED")).strip().upper() != "DUST_QUARANTINED"
+    ]
     closed_trades: List[Dict[str, Any]] = portfolio.get("closed_trades", []) or []
 
     invested_jpy = 0
-    for pos in positions:
+    for pos in active_positions:
         if pos.get("cost_jpy") is not None:
             invested_jpy += int(
                 Decimal(str(pos["cost_jpy"])).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
@@ -162,13 +165,17 @@ def compute_performance_metrics(
     max_win_jpy = max((int(round(float(t.get("pnl_jpy", 0)))) for t in wins), default=0)
     max_loss_jpy = min((int(round(float(t.get("pnl_jpy", 0)))) for t in losses), default=0)
 
-    # 決済理由別カウント
+    # 決済理由別カウント（v2拡張理由 BREAKEVEN_SL / BOT_REDUNDANT_SL / SL_PARTIAL_FAK_SWEEP / AI_SELL 等も正確に集計）
     reason_counts: Dict[str, int] = {"TP": 0, "SL": 0, "MANUAL": 0}
     for t in sorted_trades:
-        r = str(t.get("reason", "MANUAL")).upper()
+        r = str(t.get("reason", "MANUAL")).strip().upper()
         if r not in reason_counts:
             reason_counts[r] = 0
         reason_counts[r] += 1
+        if r != "SL" and "SL" in r:
+            reason_counts["SL"] += 1
+        elif r not in ("TP", "SL", "MANUAL") and "SL" not in r:
+            reason_counts["MANUAL"] += 1
 
     # 最大ドローダウン算出 (初期資金からの決済ごと資産推移ベース)
     equity = init_cap
@@ -269,7 +276,7 @@ def compute_performance_metrics(
         "initial_capital_jpy": init_cap,
         "jpy_balance": jpy_balance,
         "invested_jpy": invested_jpy,
-        "open_positions_count": len(positions),
+        "open_positions_count": len(active_positions),
         "total_asset_jpy": total_asset_jpy,
         "total_pnl_jpy": total_pnl_jpy,
         "total_pnl_pct": round(total_pnl_pct, 2),
@@ -480,6 +487,7 @@ def send_report_notification(message: str, dry_run: bool = False) -> Dict[str, s
         return results
 
     session = requests.Session()
+    session.headers.update({"User-Agent": "gmo-ai-trader-v2/2.0"})
     session.mount("https://", SystemSSLAdapter())
 
     if discord_url and not discord_url.startswith("your_") and "your_webhook" not in discord_url:

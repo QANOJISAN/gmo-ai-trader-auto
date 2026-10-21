@@ -57,6 +57,9 @@ class TieredNotificationDispatcher:
     15分サイクルの `HOLD` や軽微なログで通知がスパム化することを防ぐディスパッチャ。
     """
 
+    MAX_DIGEST_BUFFER = 500
+    MAX_SENT_HISTORY = 500
+
     def __init__(
         self,
         notifier: Optional[Any] = None,
@@ -89,6 +92,8 @@ class TieredNotificationDispatcher:
                 "message": message,
             }
             self.digest_buffer.append(entry)
+            if len(self.digest_buffer) > self.MAX_DIGEST_BUFFER:
+                self.digest_buffer = self.digest_buffer[-self.MAX_DIGEST_BUFFER :]
             return {
                 "sent_immediately": False,
                 "tier": tier_up,
@@ -117,6 +122,8 @@ class TieredNotificationDispatcher:
             "sent_immediately": True,
         }
         self.sent_history.append(record)
+        if len(self.sent_history) > self.MAX_SENT_HISTORY:
+            self.sent_history = self.sent_history[-self.MAX_SENT_HISTORY :]
         return record
 
     def flush_daily_digest(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
@@ -144,6 +151,8 @@ class TieredNotificationDispatcher:
             "summary": summary_msg,
         }
         self.sent_history.append(record)
+        if len(self.sent_history) > self.MAX_SENT_HISTORY:
+            self.sent_history = self.sent_history[-self.MAX_SENT_HISTORY :]
         return record
 
 
@@ -151,6 +160,9 @@ class RemoteControlManager:
     """
     `PAUSE`, `CANCEL_ENTRIES`, `FLATTEN_ALL`（2段階 nonce 承認）を管理するリモート緊急制御クラス
     """
+
+    MAX_CONSUMED_NONCES = 2000
+    MAX_PENDING_NONCES = 500
 
     def __init__(
         self,
@@ -178,6 +190,29 @@ class RemoteControlManager:
         # (nonce -> {"actor_id": str, "expires_at": datetime, "consumed": bool})
         self._pending_flatten_nonces: Dict[str, Dict[str, Any]] = {}
         self._consumed_nonces: set[str] = set()
+        self._consumed_nonces_order: List[str] = []
+
+    def _record_consumed_nonce(self, nonce: str) -> None:
+        if nonce not in self._consumed_nonces:
+            self._consumed_nonces.add(nonce)
+            self._consumed_nonces_order.append(nonce)
+            while len(self._consumed_nonces_order) > self.MAX_CONSUMED_NONCES:
+                oldest = self._consumed_nonces_order.pop(0)
+                self._consumed_nonces.discard(oldest)
+
+    def _prune_pending_nonces(self, now_jst: datetime) -> None:
+        if len(self._pending_flatten_nonces) <= self.MAX_PENDING_NONCES:
+            return
+        expired_keys = [
+            k
+            for k, v in self._pending_flatten_nonces.items()
+            if v.get("consumed") or (isinstance(v.get("expires_at"), datetime) and _now_jst(v["expires_at"]) < now_jst)
+        ]
+        for k in expired_keys:
+            self._pending_flatten_nonces.pop(k, None)
+        while len(self._pending_flatten_nonces) > self.MAX_PENDING_NONCES:
+            oldest_key = next(iter(self._pending_flatten_nonces))
+            self._pending_flatten_nonces.pop(oldest_key, None)
 
     def _verify_owner(self, actor_id: Optional[str]) -> str:
         actor = str(actor_id or "").strip()
@@ -223,7 +258,7 @@ class RemoteControlManager:
                 if not inserted:
                     raise ReplayOrExpiredNonceError(f"SQLite 台帳リプレイ検知: nonce '{command_nonce}' は既に使用済みです。")
                 self.db_wal.confirm_and_execute_command(nonce=command_nonce, actor_id=verified_actor, now_dt=now_jst)
-            self._consumed_nonces.add(command_nonce)
+            self._record_consumed_nonce(command_nonce)
 
         if cmd == "PAUSE":
             return self.pause_new_entries(actor_id=verified_actor, now_dt=now_jst)
@@ -357,6 +392,7 @@ class RemoteControlManager:
             "expires_at": expires_at,
             "consumed": False,
         }
+        self._prune_pending_nonces(now_jst)
         if self.db_wal is not None:
             self.db_wal.register_control_command(
                 nonce=nonce,

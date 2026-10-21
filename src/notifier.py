@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Dict
 
 import requests
@@ -18,6 +19,33 @@ from src.gmo_client import SystemSSLAdapter
 from src.validator import format_decimal_plain, format_price_jpy, normalize_confidence
 
 logger = logging.getLogger(__name__)
+
+_SECRET_ENV_KEYS = (
+    "GMO_API_KEY",
+    "GMO_API_SECRET",
+    "GEMINI_API_KEY",
+    "DISCORD_WEBHOOK_URL",
+    "LINE_CHANNEL_ACCESS_TOKEN",
+    "CRYPTOPANIC_API_KEY",
+)
+
+
+def mask_secrets(text: str) -> str:
+    """通知メッセージやログ文字列から APIキー・シークレット・Webhookトークンを完全マスキングする"""
+    if not text:
+        return ""
+    masked = str(text)
+    for env_key in _SECRET_ENV_KEYS:
+        val = os.getenv(env_key, "").strip()
+        if val and len(val) >= 6 and not val.startswith("your_"):
+            masked = masked.replace(val, "***REDACTED***")
+    masked = re.sub(
+        r"https://discord(?:app)?\.com/api/webhooks/[^/\s]+/[^\s]+",
+        "https://discord.com/api/webhooks/***/***REDACTED***",
+        masked,
+    )
+    masked = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "AIza***REDACTED***", masked)
+    return masked
 
 
 def format_order_type_label(action: str, order_type: str) -> str:
@@ -182,6 +210,7 @@ class Notifier:
         self.line_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
         self.line_user_id = os.getenv("LINE_USER_ID", "").strip()
         self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "gmo-ai-trader-v2/2.0"})
         self.session.mount("https://", SystemSSLAdapter())
 
     def _is_configured(self, value: str) -> bool:
@@ -189,7 +218,9 @@ class Notifier:
 
     def notify(self, decision: Dict[str, Any], dry_run: bool = False) -> Dict[str, str]:
         """判定結果をコンソールおよびログに出力し、設定済みの外部チャネルへ送信する"""
-        message = format_notification_message(decision)
+        message = mask_secrets(format_notification_message(decision))
+        if len(message) > 1900:
+            message = message[:1890].rstrip() + "\n...（省略）"
         logger.info("AI判定レポート出力:\n%s", message)
 
         results: Dict[str, str] = {"console": "sent"}
@@ -250,16 +281,21 @@ class Notifier:
             "BREAKEVEN": "🛡️",
             "TP": "🎯",
             "SL": "⚠️",
+            "WARN": "⚠️",
+            "WARNING": "⚠️",
             "EXPIRE": "⏱️",
             "MAINT": "🔧",
             "ERROR": "🚨",
+            "CRITICAL": "🚨",
         }
         icon = prefix_map.get(level.upper(), "🤖")
-        formatted = f"{icon} **{title}**\n{message}".strip()
+        safe_title = mask_secrets(title)
+        safe_msg = mask_secrets(message)
+        formatted = f"{icon} **{safe_title}**\n{safe_msg}".strip()
         if len(formatted) > 1900:
             formatted = formatted[:1890].rstrip() + "\n...（省略）"
 
-        logger.info("[v2 Event %s] %s | %s", level, title, message.replace("\n", " "))
+        logger.info("[v2 Event %s] %s | %s", level, safe_title, safe_msg.replace("\n", " "))
         results: Dict[str, str] = {"console": "sent"}
         if dry_run:
             results["external"] = "skipped (dry_run)"

@@ -625,9 +625,14 @@ class GMOPrivateClient:
         if losscut_price is not None and _to_decimal(losscut_price) > 0:
             body["losscutPrice"] = format_decimal_plain(losscut_price)
         self._request("POST", "/private/v1/changeOrder", body=body, priority=2)
-        return {"order_id": str(order_id), "price": float(_to_decimal(price)), "status": "ORDERED"}
+        return {
+            "order_id": str(order_id),
+            "price": float(_to_decimal(price)),
+            "status": "CHANGED",
+            "order_status": "ORDERED",
+        }
 
-    def cancel_order(self, order_id: Union[str, int]) -> Dict[str, Any]:
+    def cancel_order(self, order_id: Union[str, int], now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """単一注文をキャンセルする (`POST /private/v1/cancelOrder`, Priority 2)"""
         oid = int(order_id) if str(order_id).isdigit() else order_id
         self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid}, priority=2)
@@ -674,10 +679,13 @@ class GMOPrivateClient:
         count: int = 100,
     ) -> List[Dict[str, Any]]:
         """最新約定一覧を取得する (`GET /private/v1/latestExecutions`, Priority 3)"""
+        if not symbol or not str(symbol).strip():
+            raise ValueError("get_latest_executions には有効な symbol 指定が必須です。")
+        sym_up = str(symbol).strip().upper()
         data = self._request(
             "GET",
             "/private/v1/latestExecutions",
-            params={"symbol": symbol.upper(), "page": page, "count": count},
+            params={"symbol": sym_up, "page": page, "count": count},
             priority=3,
         )
         raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
@@ -687,7 +695,7 @@ class GMOPrivateClient:
                 {
                     "execution_id": str(item.get("executionId", item.get("execution_id", ""))),
                     "order_id": str(item.get("orderId", item.get("order_id", ""))),
-                    "symbol": str(item.get("symbol", symbol)).upper(),
+                    "symbol": str(item.get("symbol", sym_up)).upper(),
                     "side": str(item.get("side", "")).upper(),
                     "execution_type": str(item.get("executionType", item.get("execution_type", ""))).upper(),
                     "size": float(item.get("size", 0) or 0),
@@ -709,6 +717,7 @@ class GMOPrivateClient:
         time_in_force: Optional[str] = None,
         cancel_before: bool = False,
         max_post_only_retries: int = 2,
+        now_dt: Optional[datetime] = None,
         intent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -1034,17 +1043,34 @@ class PaperBroker:
         active_orders = [
             o for o in state.get("orders", []) if str(o.get("status", "")).upper() in ("WAITING", "ORDERED")
         ]
+        pending_order_ids = {
+            str(p.get("order_id", "")) for p in (portfolio.get("pending_orders", []) or []) if p.get("order_id")
+        }
 
+        has_explicit_state_jpy = "jpy_balance" in state
         jpy_balance = _to_decimal(
-            state["jpy_balance"] if "jpy_balance" in state else portfolio.get("jpy_balance", 10000)
+            state["jpy_balance"] if has_explicit_state_jpy else portfolio.get("jpy_balance", 10000)
         )
         locked_jpy = Decimal("0")
         locked_spot: Dict[str, Decimal] = {}
+        partial_buy_spot: Dict[str, Decimal] = {}
 
         for o in active_orders:
             side = str(o.get("side", "")).upper()
             sym = str(o.get("symbol", "")).upper()
-            rem_size = _to_decimal(o.get("size", 0)) - _to_decimal(o.get("executed_size", 0))
+            oid = str(o.get("order_id", ""))
+            exec_sz = _to_decimal(o.get("executed_size", 0))
+            rem_size = _to_decimal(o.get("size", 0)) - exec_sz
+            if side == "BUY" and exec_sz > 0 and oid in pending_order_ids:
+                exec_px = _to_decimal(o.get("executed_price") or o.get("price", 0))
+                rule = DEFAULT_SYMBOL_RULES.get(sym, {})
+                maker_fee_rate = _to_decimal(rule.get("maker_fee", "-0.0001"))
+                partial_cost = (exec_px * exec_sz * (Decimal("1") + maker_fee_rate)).to_integral_value(
+                    rounding=ROUND_HALF_UP
+                )
+                if not has_explicit_state_jpy:
+                    jpy_balance -= partial_cost
+                partial_buy_spot[sym] = partial_buy_spot.get(sym, Decimal("0")) + exec_sz
             if rem_size <= 0:
                 continue
             if side == "BUY":
@@ -1069,6 +1095,9 @@ class PaperBroker:
             sz = _to_decimal(pos.get("size", 0))
             if sym and sz > 0:
                 spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
+        for sym, p_sz in partial_buy_spot.items():
+            if sym and p_sz > 0:
+                spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + p_sz
 
         for sym, total_sz in spot_totals.items():
             lck = locked_spot.get(sym, Decimal("0"))
@@ -1242,6 +1271,7 @@ class PaperBroker:
                     "execution_type": exec_up,
                     "time_in_force": tif,
                     "price": float(price_dec),
+                    "losscut_price": float(_to_decimal(losscut_price or 0)),
                     "size": float(size_dec),
                     "executed_size": 0.0,
                     "remaining_size": 0.0,
@@ -1273,6 +1303,7 @@ class PaperBroker:
                 "execution_type": exec_up,
                 "time_in_force": tif,
                 "price": float(price_dec) if exec_up in ("LIMIT", "STOP") else 0.0,
+                "losscut_price": float(_to_decimal(losscut_price or 0)),
                 "size": float(size_dec),
                 "executed_size": 0.0,
                 "remaining_size": float(size_dec),
@@ -1333,8 +1364,13 @@ class PaperBroker:
                 tick = _to_decimal(DEFAULT_SYMBOL_RULES.get(sym, {}).get("tick_size", "1"))
                 p_dec = round_to_step(_to_decimal(price), tick, rounding=ROUND_DOWN)
                 o["price"] = float(p_dec)
+                if losscut_price is not None:
+                    o["losscut_price"] = float(_to_decimal(losscut_price))
                 self._save_state(state)
-                return dict(o)
+                res = dict(o)
+                res["order_status"] = str(o.get("status", "ORDERED"))
+                res["status"] = "CHANGED"
+                return res
         raise GMOPrivateAPIError(f"[PaperBroker] 変更対象の注文IDが見つかりません: {oid}")
 
     def _fill_order_in_state(
@@ -1521,9 +1557,11 @@ class PaperBroker:
 
     def get_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> List[Dict[str, Any]]:
         if isinstance(order_ids, (str, int)):
-            id_set = {str(order_ids)}
+            id_set = {str(order_ids)} if str(order_ids).strip() else set()
         else:
-            id_set = {str(x) for x in order_ids}
+            id_set = {str(x) for x in order_ids if str(x).strip()}
+        if not id_set:
+            return []
         state = self._ensure_state_file()
         return [dict(o) for o in state.get("orders", []) if str(o.get("order_id", "")) in id_set]
 
@@ -1590,6 +1628,8 @@ class PaperBroker:
         page: int = 1,
         count: int = 100,
     ) -> List[Dict[str, Any]]:
+        if not symbol or not str(symbol).strip():
+            raise ValueError("get_latest_executions には有効な symbol 指定が必須です。")
         sym = symbol.strip().upper()
         state = self._ensure_state_file()
         execs = [dict(e) for e in state.get("executions", []) if str(e.get("symbol", "")).upper() == sym]

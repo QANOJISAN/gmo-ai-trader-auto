@@ -206,7 +206,10 @@ class ThreeWayReconciler:
                 tp_price = float(p_ord.get("take_profit_price", 0) or round(fill_price * 1.05))
 
                 sl_order_id = ""
-                if sl_price > 0 and filled_size_dec > Decimal("0"):
+                rule_for_sym = self.symbol_rules.get(sym, {})
+                min_size_for_sym = _to_decimal(rule_for_sym.get("min_order_size", "0.0001"))
+                is_dust_fill = Decimal("0") < filled_size_dec < min_size_for_sym
+                if sl_price > 0 and filled_size_dec >= min_size_for_sym:
                     try:
                         sl_res = self.broker.place_order(
                             symbol=sym,
@@ -220,7 +223,6 @@ class ThreeWayReconciler:
                     except Exception as exc:
                         logger.error("幽霊注文約定後のSL発注エラー (%s): %s", sym, exc)
 
-                rule_for_sym = self.symbol_rules.get(sym, {})
                 maker_fee_rate = _to_decimal(rule_for_sym.get("maker_fee", "-0.0001"))
                 notional_d = _to_decimal(fill_price) * filled_size_dec
                 if matched_execs and any("fee" in e for e in matched_execs):
@@ -229,6 +231,25 @@ class ThreeWayReconciler:
                     entry_fee_d = (notional_d * maker_fee_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
                 total_cost_jpy = int((notional_d + entry_fee_d).to_integral_value(rounding=ROUND_HALF_UP))
                 pf["jpy_balance"] = int(_to_decimal(pf.get("jpy_balance", 10000)) - Decimal(total_cost_jpy))
+
+                if is_dust_fill:
+                    pf.setdefault("quarantined_dust", []).append(
+                        {
+                            "symbol": sym,
+                            "size": float(filled_size_dec),
+                            "entry_price": fill_price,
+                            "cost_jpy": total_cost_jpy,
+                            "buy_order_id": oid,
+                            "state": "DUST_QUARANTINED",
+                            "quarantined_at": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+                    if self.db_wal is not None:
+                        self.db_wal.quarantine_dust_position(sym, float(filled_size_dec), fill_price)
+                    dust_quarantined.append(sym)
+                    ghost_orders_resolved.append(oid)
+                    actions_taken.append(f"幽霊注文の端数約定をDUST隔離: {sym} order_id={oid} size={format_decimal_plain(filled_size_dec)}")
+                    continue
 
                 new_pos = {
                     "symbol": sym,
@@ -368,6 +389,7 @@ class ThreeWayReconciler:
 
         # 3b. 取引所に現物残高があるのにローカル `positions` に存在しない「完全な裸ポジション」の検知と0.5秒以内保護
         local_syms = {str(p.get("symbol", "")).upper() for p in remaining_positions}
+        quarantined_syms = {str(d.get("symbol", "")).upper() for d in (pf.get("quarantined_dust", []) or [])}
         for sym, asset_info in spot_assets.items():
             sym_up = sym.strip().upper()
             if sym_up == "JPY" or sym_up in local_syms:
@@ -382,6 +404,8 @@ class ThreeWayReconciler:
             tick_dec = _to_decimal(rule.get("tick_size", "1"))
 
             if amt_dec < min_size_dec:
+                if sym_up in quarantined_syms:
+                    continue
                 # 最小注文数量未満は DUST_QUARANTINED として隔離
                 dust_pos = {
                     "symbol": sym_up,

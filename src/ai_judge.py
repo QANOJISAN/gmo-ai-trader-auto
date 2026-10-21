@@ -391,6 +391,16 @@ class AIJudge:
             return
         now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
         self._last_symbol_ai_eval_at[sym_up] = now_jst
+        if len(self._last_symbol_ai_eval_at) > 200:
+            oldest_k = min(
+                self._last_symbol_ai_eval_at,
+                key=lambda k: (
+                    self._last_symbol_ai_eval_at[k].astimezone(JST)
+                    if self._last_symbol_ai_eval_at[k].tzinfo
+                    else self._last_symbol_ai_eval_at[k].replace(tzinfo=JST)
+                ),
+            )
+            self._last_symbol_ai_eval_at.pop(oldest_k, None)
 
     def record_sl_hit_cooldown(self, symbol: str, now_dt: Optional[datetime] = None) -> None:
         sym_up = str(symbol or "").strip().upper()
@@ -398,6 +408,16 @@ class AIJudge:
             return
         now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
         self._last_symbol_sl_hit_at[sym_up] = now_jst
+        if len(self._last_symbol_sl_hit_at) > 200:
+            oldest_k = min(
+                self._last_symbol_sl_hit_at,
+                key=lambda k: (
+                    self._last_symbol_sl_hit_at[k].astimezone(JST)
+                    if self._last_symbol_sl_hit_at[k].tzinfo
+                    else self._last_symbol_sl_hit_at[k].replace(tzinfo=JST)
+                ),
+            )
+            self._last_symbol_sl_hit_at.pop(oldest_k, None)
 
     def is_symbol_on_ai_cooldown(self, symbol: str, now_dt: Optional[datetime] = None) -> Tuple[bool, str]:
         sym_up = str(symbol or "").strip().upper()

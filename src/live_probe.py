@@ -109,7 +109,11 @@ class GMOCoinLiveProbe:
                         order_id=oid_limit,
                         price=self.deep_modified_price,
                     )
-                    capabilities["limit_change_order_supported"] = bool(chg_res.get("status") == "CHANGED")
+                    capabilities["limit_change_order_supported"] = str(chg_res.get("status", "")).upper() in (
+                        "CHANGED",
+                        "ORDERED",
+                        "WAITING",
+                    )
                     # changeOrder 後も同じ orderId が activeOrders に存在するか確認
                     active_after = self.broker.get_active_orders(symbol=self.probe_symbol)
                     active_ids = {str(o.get("order_id", "")) for o in active_after}
@@ -134,7 +138,11 @@ class GMOCoinLiveProbe:
                         created_order_ids.append(oid_stop)
                         try:
                             s_chg = self.broker.change_order(order_id=oid_stop, price="998")
-                            capabilities["stop_change_order_supported"] = bool(s_chg.get("status") == "CHANGED")
+                            capabilities["stop_change_order_supported"] = str(s_chg.get("status", "")).upper() in (
+                                "CHANGED",
+                                "ORDERED",
+                                "WAITING",
+                            )
                         except Exception:
                             capabilities["stop_change_order_supported"] = False
                 except Exception:

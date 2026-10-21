@@ -45,6 +45,8 @@ class WSHybridEngine:
     TOKEN_REFRESH_INTERVAL_SEC = 35 * 60.0  # 35分周期 (有効期限60分に対し25分の安全マージン)
     SUBSCRIPTION_INTERVAL_SEC = 1.2         # 1.2秒間隔シリアル購読 (1 req/sec 制限遵守)
     SILENCE_TIMEOUT_SEC = 75.0              # 75秒無音検知で能動Ping / 再接続
+    MAX_EVENT_BUFFER_LEN = 5000
+    MAX_SUBSCRIPTION_TIMESTAMPS = 200
 
     def __init__(
         self,
@@ -69,12 +71,23 @@ class WSHybridEngine:
         self.reconnect_count: int = 0
         self.malformed_message_count: int = 0
 
-        self.ws_event_buffer: Deque[Dict[str, Any]] = collections.deque()
+        self.ws_event_buffer: Deque[Dict[str, Any]] = collections.deque(maxlen=self.MAX_EVENT_BUFFER_LEN)
         self.subscribed_private_channels: List[str] = []
         self.subscribed_public_channels: List[Dict[str, Any]] = []
         self.subscription_timestamps: List[float] = []
         self.phase_trace: List[str] = []
         self.high_watermark_execution_id: int = self.wal_db.get_high_watermark_execution_id()
+
+    def shutdown(self) -> None:
+        """WebSocket エンジンのクリーンシャットダウン（Private WS トークンの破棄とバッファ解放）"""
+        if self.ws_token:
+            try:
+                self.broker.delete_ws_auth_token(self.ws_token)
+            except Exception as exc:
+                logger.debug("WS トークン破棄時の警告: %s", exc)
+            self.ws_token = ""
+        self.ws_event_buffer.clear()
+        self.sync_state = SyncState.DISCONNECTED
 
     # ------------------------------------------------------------------
     # 1. トークン管理 (35分周期自動延長 PUT ➔ 失敗時 POST 再取得)
@@ -141,6 +154,8 @@ class WSHybridEngine:
             ts = time.monotonic()
             self.last_subscribe_ts = ts
             self.subscription_timestamps.append(ts)
+            if len(self.subscription_timestamps) > self.MAX_SUBSCRIPTION_TIMESTAMPS:
+                self.subscription_timestamps = self.subscription_timestamps[-self.MAX_SUBSCRIPTION_TIMESTAMPS :]
             if send_fn is not None:
                 send_fn(req)
             sent_messages.append(req)

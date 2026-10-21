@@ -944,7 +944,25 @@ class AutoTraderDaemon:
                     break
                 time.sleep(self.fast_loop_sec)
         finally:
-            self.instance_lock.release()
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        """デーモン終了時のリソース解放（WSトークン失効・WALクローズ・ロック解放）"""
+        try:
+            if getattr(self, "ws_engine", None) is not None:
+                self.ws_engine.shutdown()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "db_wal", None) is not None:
+                self.db_wal.close()
+        except Exception:
+            pass
+        try:
+            if getattr(self, "instance_lock", None) is not None:
+                self.instance_lock.release()
+        except Exception:
+            pass
 
 
 def setup_logging() -> None:

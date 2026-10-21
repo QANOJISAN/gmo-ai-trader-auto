@@ -715,11 +715,54 @@ class PseudoOCOManager:
                 pf_changed = True
                 continue
 
-            # 部分約定発生時のグレースタイマー開始記録
-            if 0 < exec_size < total_size and not pending.get("first_partial_fill_at"):
-                pending["first_partial_fill_at"] = now_jst.isoformat(timespec="seconds")
-                pending["state"] = "PARTIAL_FILLED"
-                pf_changed = True
+            # 部分約定発生時のグレースタイマー開始記録 ＆ 60秒グレースタイムアウト処理
+            if 0 < exec_size < total_size:
+                if float(pending.get("executed_size", 0) or 0) != exec_size:
+                    pending["executed_size"] = exec_size
+                    pf_changed = True
+                if not pending.get("first_partial_fill_at"):
+                    pending["first_partial_fill_at"] = now_jst.isoformat(timespec="seconds")
+                    pending["state"] = "PARTIAL_FILLED"
+                    pf_changed = True
+                elif pending.get("state") != "PARTIAL_FILLED":
+                    pending["state"] = "PARTIAL_FILLED"
+                    pf_changed = True
+
+                first_partial_dt = _parse_iso_jst(str(pending.get("first_partial_fill_at", "")), now_jst)
+                partial_elapsed_sec = (now_jst - first_partial_dt).total_seconds()
+                if partial_elapsed_sec >= self.PARTIAL_FILL_GRACE_SEC and elapsed_hours < self.order_expiry_hours:
+                    try:
+                        self.broker.cancel_order(oid)
+                    except Exception as exc:
+                        logger.warning("部分約定グレース期限切れキャンセル時の警告 (order_id=%s): %s", oid, exc)
+
+                    rechecked = self.broker.get_orders([oid])
+                    final_exec_size = float(
+                        (rechecked[0].get("executed_size", exec_size) if rechecked else exec_size) or 0
+                    )
+                    if final_exec_size >= min_order_size:
+                        _, sl_event = self._activate_position_with_sl(
+                            pf=pf,
+                            pending=pending,
+                            filled_size=final_exec_size,
+                            filled_price=exec_price,
+                            now_jst=now_jst,
+                            partial_expired=True,
+                        )
+                        events.append(sl_event)
+                    elif final_exec_size > 0:
+                        events.append(
+                            self._quarantine_partial_buy_dust(
+                                pf=pf,
+                                pending=pending,
+                                dust_size=final_exec_size,
+                                exec_price=exec_price,
+                                min_order_size=min_order_size,
+                                now_jst=now_jst,
+                            )
+                        )
+                    pf_changed = True
+                    continue
 
             # ケース2: 有効期限（4時間）経過によるタイムアウト
             if elapsed_hours >= self.order_expiry_hours:
@@ -744,28 +787,16 @@ class PseudoOCOManager:
                     )
                     events.append(sl_event)
                 elif final_exec_size > 0:
-                    # minOrderSize 未満の端数部分約定は DUST_QUARANTINED へ安全隔離
-                    pf.setdefault("quarantined_dust", []).append(
-                        {
-                            "symbol": sym,
-                            "size": final_exec_size,
-                            "entry_price": exec_price,
-                            "buy_order_id": oid,
-                            "state": "DUST_QUARANTINED",
-                            "quarantined_at": now_jst.isoformat(timespec="seconds"),
-                        }
-                    )
-                    if self.wal_db is not None:
-                        self.wal_db.quarantine_dust_position(sym, final_exec_size, exec_price)
+                    # minOrderSize 未満の端数部分約定は DUST_QUARANTINED へ安全隔離（約定代金も減算）
                     events.append(
-                        {
-                            "type": "PARTIAL_DUST_QUARANTINED",
-                            "symbol": sym,
-                            "order_id": oid,
-                            "dust_size": final_exec_size,
-                            "min_order_size": min_order_size,
-                            "timestamp": now_jst.isoformat(timespec="seconds"),
-                        }
+                        self._quarantine_partial_buy_dust(
+                            pf=pf,
+                            pending=pending,
+                            dust_size=final_exec_size,
+                            exec_price=exec_price,
+                            min_order_size=min_order_size,
+                            now_jst=now_jst,
+                        )
                     )
                 else:
                     exp_event = {
@@ -802,27 +833,15 @@ class PseudoOCOManager:
                     )
                     events.append(sl_event)
                 elif exec_size > 0:
-                    pf.setdefault("quarantined_dust", []).append(
-                        {
-                            "symbol": sym,
-                            "size": exec_size,
-                            "entry_price": exec_price,
-                            "buy_order_id": oid,
-                            "state": "DUST_QUARANTINED",
-                            "quarantined_at": now_jst.isoformat(timespec="seconds"),
-                        }
-                    )
-                    if self.wal_db is not None:
-                        self.wal_db.quarantine_dust_position(sym, exec_size, exec_price)
                     events.append(
-                        {
-                            "type": "PARTIAL_DUST_QUARANTINED",
-                            "symbol": sym,
-                            "order_id": oid,
-                            "dust_size": exec_size,
-                            "min_order_size": min_order_size,
-                            "timestamp": now_jst.isoformat(timespec="seconds"),
-                        }
+                        self._quarantine_partial_buy_dust(
+                            pf=pf,
+                            pending=pending,
+                            dust_size=exec_size,
+                            exec_price=exec_price,
+                            min_order_size=min_order_size,
+                            now_jst=now_jst,
+                        )
                     )
                 pf_changed = True
                 continue
@@ -1308,6 +1327,65 @@ class PseudoOCOManager:
             dry_run=self.dry_run_notify,
         )
         return pos_entry, event
+
+    def _quarantine_partial_buy_dust(
+        self,
+        pf: Dict[str, Any],
+        pending: Dict[str, Any],
+        dust_size: float,
+        exec_price: float,
+        min_order_size: float,
+        now_jst: datetime,
+    ) -> Dict[str, Any]:
+        """minOrderSize未満の部分約定端数を安全隔離し、約定代金（手数料込み）を日本円残高から正確に減算する"""
+        sym = str(pending.get("symbol", "")).upper()
+        oid = str(pending.get("order_id", ""))
+        rule = self.symbol_rules.get(sym, {})
+        maker_fee_rate = _to_decimal(rule.get("maker_fee", "-0.0001"))
+
+        price_d = _to_decimal(exec_price)
+        size_d = _to_decimal(dust_size)
+        notional_d = price_d * size_d
+        entry_fee_d = (notional_d * maker_fee_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        total_cost_jpy = int((notional_d + entry_fee_d).to_integral_value(rounding=ROUND_HALF_UP))
+
+        pf["jpy_balance"] = int(_to_decimal(pf.get("jpy_balance", 10000)) - Decimal(total_cost_jpy))
+        pf.setdefault("quarantined_dust", []).append(
+            {
+                "symbol": sym,
+                "size": float(size_d),
+                "entry_price": float(price_d),
+                "cost_jpy": total_cost_jpy,
+                "buy_order_id": oid,
+                "state": "DUST_QUARANTINED",
+                "quarantined_at": now_jst.isoformat(timespec="seconds"),
+            }
+        )
+        if self.wal_db is not None:
+            ts_ms = int(now_jst.timestamp() * 1000)
+            if oid:
+                self.wal_db.upsert_order(
+                    order_id=oid,
+                    symbol=sym,
+                    side="BUY",
+                    execution_type="LIMIT",
+                    state="CANCELED",
+                    price=price_d,
+                    size=pending.get("size", size_d),
+                    executed_size=size_d,
+                    now_ts_ms=ts_ms,
+                )
+            self.wal_db.quarantine_dust_position(sym, float(size_d), float(price_d))
+
+        return {
+            "type": "PARTIAL_DUST_QUARANTINED",
+            "symbol": sym,
+            "order_id": oid,
+            "dust_size": float(size_d),
+            "cost_jpy": total_cost_jpy,
+            "min_order_size": min_order_size,
+            "timestamp": now_jst.isoformat(timespec="seconds"),
+        }
 
     def _record_closed_trade(
         self,

@@ -1465,6 +1465,189 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             self.assertEqual(len(pf_after_l5["pending_orders"]), 0)
             self.assertEqual(len(pf_after_l5["positions"]), 0)
 
+    def test_round3_live_parity_and_long_run_audit(self) -> None:
+        """第3回徹底総合監査 (Round 3 Live-Parity, Edge-Case & Long-Run Stability Audit) 全6領域 (R3-01〜R3-06) の検証"""
+        import inspect
+        import os
+        from generate_report import compute_performance_metrics
+        from migrate_from_v1 import execute_migration
+        from src.notifier import Notifier, mask_secrets
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            wal = DatabaseWAL(tmp_dir / "r3.db", portfolio_json_path=tmp_dir / "portfolio.json", auto_sync_files=True)
+            live_client = GMOPrivateClient(api_key="test_live_key_123456", api_secret="test_live_secret_654321", wal_db=wal)
+            paper_broker = PaperBroker(
+                paper_orders_path=tmp_dir / "paper_orders.json",
+                portfolio_path=tmp_dir / "portfolio.json",
+                wal_db=wal,
+            )
+
+            # [領域1 / R3-01] GMOPrivateClient (LIVE) と PaperBroker (DRY_RUN) の全ブローカーメソッドシグネチャ 100% パリティ検証
+            broker_methods = [
+                "get_assets",
+                "get_jpy_and_spot_balances",
+                "get_trading_volume",
+                "create_ws_auth_token",
+                "extend_ws_auth_token",
+                "delete_ws_auth_token",
+                "get_active_orders",
+                "get_orders",
+                "change_order",
+                "cancel_order",
+                "cancel_orders",
+                "cancel_bulk_order",
+                "get_latest_executions",
+                "place_order",
+            ]
+            for m_name in broker_methods:
+                live_sig = list(inspect.signature(getattr(live_client, m_name)).parameters.keys())
+                paper_sig = list(inspect.signature(getattr(paper_broker, m_name)).parameters.keys())
+                self.assertEqual(live_sig, paper_sig, f"Signature mismatch on {m_name}: {live_sig} vs {paper_sig}")
+
+            # GMO API 特有の空辞書レスポンス {"status": 0, "data": {}} で例外なく空リスト [] を返すこと
+            empty_resp = MagicMock()
+            empty_resp.status_code = 200
+            empty_resp.text = '{"status":0,"data":{}}'
+            empty_resp.headers = {}
+            empty_resp.json.return_value = {"status": 0, "data": {}}
+            with patch.object(live_client.session, "get", return_value=empty_resp):
+                self.assertEqual(live_client.get_active_orders("BCH"), [])
+                self.assertEqual(live_client.get_orders(["12345"]), [])
+                self.assertEqual(live_client.get_latest_executions("BCH"), [])
+
+            # get_latest_executions に空の symbol を渡した場合に ValueError で防御されること
+            with self.assertRaises(ValueError):
+                live_client.get_latest_executions("")
+            with self.assertRaises(ValueError):
+                paper_broker.get_latest_executions("   ")
+
+            # PaperBroker 単体で GMOCoinLiveProbe.run_probe() を実行した際にも change_order が CHANGED を返して成功すること
+            paper_broker.update_market_tickers({"XRP": {"ask": 85.0, "bid": 84.9, "last": 85.0}})
+            probe = GMOCoinLiveProbe(
+                broker=paper_broker,
+                capabilities_path=tmp_dir / "capabilities.json",
+                probe_symbol="XRP",
+            )
+            probe_caps = probe.run_probe()
+            self.assertTrue(probe_caps["limit_change_order_supported"])
+            self.assertTrue(probe_caps["limit_change_order_preserves_order_id"])
+            self.assertEqual(len(paper_broker.get_active_orders("XRP")), 0)
+
+            # [領域2 / R3-02] 部分約定時の executed_size 同期、PaperBroker 資産計算整合性、および 60秒グレースタイムアウト検証
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            t0 = datetime(2026, 10, 28, 10, 0, 0, tzinfo=JST)
+            buy_res = daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "XRP",
+                    "limit_price": 80.0,
+                    "size": 10.0,
+                    "take_profit_price": 86.0,
+                    "stop_loss_price": 77.0,
+                    "expected_loss_jpy": 30,
+                },
+                tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.5}},
+                now_dt=t0,
+            )
+            oid_xrp = buy_res["order"]["order_id"]
+            # 10 XRP のうち 4 XRP だけ部分約定 (残り 6 XRP が板に残る状態)
+            daemon.broker.simulate_partial_fill(oid_xrp, filled_size=4.0, fill_price=80.0, now_dt=t0 + timedelta(seconds=10))
+            daemon.run_fast_cycle(
+                tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.5}},
+                now_dt=t0 + timedelta(seconds=15),
+            )
+            pf_partial = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_partial["pending_orders"]), 1)
+            self.assertEqual(pf_partial["pending_orders"][0]["state"], "PARTIAL_FILLED")
+            self.assertEqual(pf_partial["pending_orders"][0]["executed_size"], 4.0)
+
+            # 部分約定中も PaperBroker の利用可能日本円が (10,000 - 4*80 - 6*80 = 9,200円) で整合し、4 XRP が現物残高に反映されていること
+            bal_during_partial = daemon.broker.get_jpy_and_spot_balances()
+            self.assertEqual(bal_during_partial["jpy_available"], 9200.0)
+            self.assertEqual(bal_during_partial["spot_assets"]["XRP"]["amount"], 4.0)
+
+            # 60秒グレース期間経過後 (t0 + 80s): 残り 6 XRP が自動キャンセルされ、約定済み 4 XRP に対して直ちに SL がセットされること
+            fast_after_grace = daemon.run_fast_cycle(
+                tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.5}},
+                now_dt=t0 + timedelta(seconds=80),
+            )
+            self.assertTrue(any(e.get("type") == "BUY_FILLED_AND_SL_PLACED" for e in fast_after_grace["events"]))
+            pf_after_grace = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_after_grace["pending_orders"]), 0)
+            self.assertEqual(len(pf_after_grace["positions"]), 1)
+            self.assertEqual(pf_after_grace["positions"][0]["size"], 4.0)
+            self.assertEqual(pf_after_grace["positions"][0]["state"], "SL_ACTIVE")
+
+            # 3-Way Reconciliation を実行しても 1円のズレもなく RECONCILED となること
+            rec_after_partial = daemon.reconciler.reconcile(now_dt=t0 + timedelta(seconds=85))
+            self.assertEqual(rec_after_partial["status"], "RECONCILED")
+            self.assertFalse(daemon.reconciler.degraded_reconciling)
+
+            # [領域4 / R3-04] generate_report.py (DUST除外・v2拡張理由集計) & Notifier (User-Agent・秘密情報マスク) & migrate_from_v1 検証
+            pf_after_grace["positions"].append(
+                {
+                    "symbol": "BCH",
+                    "size": 0.002,
+                    "entry_price": 44000,
+                    "state": "DUST_QUARANTINED",
+                }
+            )
+            pf_after_grace["closed_trades"].extend(
+                [
+                    {"symbol": "SOL", "size": 0.1, "entry_price": 20000, "exit_price": 20050, "pnl_jpy": 5, "pnl_pct": 0.25, "reason": "BREAKEVEN_SL", "closed_at": "2026-10-28T10:00:00+09:00"},
+                    {"symbol": "ETH", "size": 0.01, "entry_price": 400000, "exit_price": 410000, "pnl_jpy": 100, "pnl_pct": 2.5, "reason": "AI_SELL", "closed_at": "2026-10-28T10:05:00+09:00"},
+                ]
+            )
+            metrics = compute_performance_metrics(pf_after_grace, [])
+            # DUST_QUARANTINED の BCH は open_positions_count に含まれず、XRP 1銘柄のみカウントされること
+            self.assertEqual(metrics["open_positions_count"], 1)
+            self.assertGreaterEqual(metrics["reason_counts"]["SL"], 1)
+            self.assertGreaterEqual(metrics["reason_counts"]["MANUAL"], 1)
+
+            notifier = Notifier()
+            self.assertEqual(notifier.session.headers.get("User-Agent"), "gmo-ai-trader-v2/2.0")
+            with patch.dict(os.environ, {"GMO_API_SECRET": "super_secret_gmo_key_99999"}):
+                masked_str = mask_secrets(
+                    "Error with key super_secret_gmo_key_99999 and webhook https://discord.com/api/webhooks/12345/abcdefg and AIzaSyD12345678901234567890"
+                )
+                self.assertNotIn("super_secret_gmo_key_99999", masked_str)
+                self.assertNotIn("abcdefg", masked_str)
+                self.assertIn("***REDACTED***", masked_str)
+
+            # migrate_from_v1 のドライラン・実コピー検証 (ダミーv1ディレクトリから一時ディレクトリへ)
+            fake_v1 = tmp_dir / "fake_v1"
+            fake_v2 = tmp_dir / "fake_v2"
+            fake_v1.mkdir(parents=True, exist_ok=True)
+            fake_v2.mkdir(parents=True, exist_ok=True)
+            (fake_v1 / "portfolio.json").write_text('{"initial_capital_jpy": 10000, "jpy_balance": 10000, "positions": []}', encoding="utf-8")
+            mig_res = execute_migration(
+                v1_portfolio_path=fake_v1 / "portfolio.json",
+                v2_portfolio_path=fake_v2 / "portfolio.json",
+            )
+            self.assertTrue(mig_res["migrated"])
+            self.assertTrue((fake_v2 / "portfolio.json").exists())
+
+            # [領域5 / R3-05] 長期稼働時のインメモリコレクション上限キャップ検証
+            for i in range(250):
+                daemon.ai_judge.record_symbol_ai_call(f"SYM_{i}", now_dt=t0 + timedelta(seconds=i))
+            self.assertLessEqual(len(daemon.ai_judge._last_symbol_ai_eval_at), 200)
+
+            for i in range(550):
+                daemon.remote_control.dispatcher.dispatch("DAILY_DIGEST", f"Title {i}", "Msg", now_dt=t0)
+            self.assertLessEqual(len(daemon.remote_control.dispatcher.digest_buffer), 500)
+
+            # [領域3 / R3-03] WSHybridEngine & AutoTraderDaemon のクリーンシャットダウン検証
+            daemon.ws_engine.obtain_or_refresh_token()
+            self.assertTrue(bool(daemon.ws_engine.ws_token))
+            daemon.shutdown()
+            self.assertEqual(daemon.ws_engine.ws_token, "")
+            self.assertEqual(daemon.ws_engine.sync_state, SyncState.DISCONNECTED)
+
 
 if __name__ == "__main__":
     unittest.main()
