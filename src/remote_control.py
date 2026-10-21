@@ -187,6 +187,12 @@ class RemoteControlManager:
         )
 
         self.is_paused: bool = False
+        try:
+            pf_init = self.oco_manager.load_portfolio()
+            if isinstance(pf_init, dict):
+                self.is_paused = bool(pf_init.get("is_paused", False))
+        except Exception:
+            pass
         # (nonce -> {"actor_id": str, "expires_at": datetime, "consumed": bool})
         self._pending_flatten_nonces: Dict[str, Dict[str, Any]] = {}
         self._consumed_nonces: set[str] = set()
@@ -288,6 +294,8 @@ class RemoteControlManager:
         verified_actor = self._verify_owner(actor_id)
         self.is_paused = True
         pf = self.oco_manager.load_portfolio()
+        pf["is_paused"] = True
+        self.oco_manager.save_portfolio(pf, now_dt=now_jst)
         protected_sl_ids = [
             str(p.get("sl_order_id", ""))
             for p in (pf.get("positions", []) or [])
@@ -310,6 +318,9 @@ class RemoteControlManager:
         now_jst = _now_jst(now_dt)
         verified_actor = self._verify_owner(actor_id)
         self.is_paused = False
+        pf = self.oco_manager.load_portfolio()
+        pf["is_paused"] = False
+        self.oco_manager.save_portfolio(pf, now_dt=now_jst)
         return {
             "command": "RESUME",
             "status": "ACTIVE",
@@ -326,6 +337,8 @@ class RemoteControlManager:
         """
         Level 2 (`CANCEL_ENTRIES`): 未約定の `BUY` 指値のみ全キャンセルし、
         既存ポジションの `STOP` 逆指値注文は絶対にキャンセルせず維持する。
+        もしキャンセル直前に一部または全部が約定していた場合 (`executed_size > 0`) は、
+        約定分を孤児化させずに `SL_ACTIVE`（または `DUST_QUARANTINED`）へ安全に昇格する。
         """
         now_jst = _now_jst(now_dt)
         verified_actor = self._verify_owner(actor_id)
@@ -333,25 +346,68 @@ class RemoteControlManager:
 
         canceled_order_ids: List[str] = []
         remaining_pending: List[Dict[str, Any]] = []
-        for p_ord in pf.get("pending_orders", []) or []:
+        for p_ord in list(pf.get("pending_orders", []) or []):
             oid = str(p_ord.get("order_id", ""))
             side = str(p_ord.get("side", "BUY")).upper()
+            sym = str(p_ord.get("symbol", "")).strip().upper()
             if side == "BUY" and oid:
                 try:
                     self.oco_manager.broker.cancel_order(oid)
                 except Exception as exc:
                     logger.warning("CANCEL_ENTRIES 注文取消警告 (order_id=%s): %s", oid, exc)
                 canceled_order_ids.append(oid)
-                if self.db_wal is not None:
-                    self.db_wal.upsert_order(
-                        order_id=oid,
-                        symbol=str(p_ord.get("symbol", "")),
-                        side="BUY",
-                        execution_type="LIMIT",
-                        state="CANCELED",
-                        price=str(p_ord.get("limit_price", "0")),
-                        size=str(p_ord.get("size", "0")),
-                    )
+
+                exec_size = 0.0
+                exec_price = float(p_ord.get("limit_price", 0) or 0)
+                try:
+                    if hasattr(self.oco_manager, "_query_orders_by_id"):
+                        ord_info = self.oco_manager._query_orders_by_id([oid]).get(oid)
+                    else:
+                        raw_orders = self.oco_manager.broker.get_orders([oid])
+                        ord_info = raw_orders[0] if isinstance(raw_orders, list) and raw_orders else None
+                    if ord_info is not None:
+                        exec_size = float(ord_info.get("executed_size", 0) or 0)
+                        exec_price = float(
+                            ord_info.get("executed_price")
+                            or ord_info.get("price")
+                            or p_ord.get("limit_price")
+                            or 0
+                        )
+                except Exception:
+                    exec_size = 0.0
+
+                if exec_size > 0 and hasattr(self.oco_manager, "_activate_position_with_sl"):
+                    rule = (getattr(self.oco_manager, "symbol_rules", None) or {}).get(sym, {})
+                    min_order_size = float(rule.get("min_order_size", 0.0001) or 0.0001)
+                    if exec_size + 1e-12 >= min_order_size:
+                        self.oco_manager._activate_position_with_sl(
+                            pf=pf,
+                            pending=p_ord,
+                            filled_size=exec_size,
+                            filled_price=exec_price,
+                            now_jst=now_jst,
+                            partial_expired=True,
+                        )
+                    else:
+                        self.oco_manager._quarantine_partial_buy_dust(
+                            pf=pf,
+                            pending=p_ord,
+                            dust_size=exec_size,
+                            exec_price=exec_price,
+                            min_order_size=min_order_size,
+                            now_jst=now_jst,
+                        )
+                else:
+                    if self.db_wal is not None:
+                        self.db_wal.upsert_order(
+                            order_id=oid,
+                            symbol=sym,
+                            side="BUY",
+                            execution_type="LIMIT",
+                            state="CANCELED",
+                            price=str(p_ord.get("limit_price", "0")),
+                            size=str(p_ord.get("size", "0")),
+                        )
             else:
                 remaining_pending.append(p_ord)
 
@@ -430,6 +486,19 @@ class RemoteControlManager:
             raise ReplayOrExpiredNonceError(f"使用済みまたは無効なワンタイム nonce です: '{clean_nonce}'")
 
         meta = self._pending_flatten_nonces.get(clean_nonce)
+        if meta is None and self.db_wal is not None and hasattr(self.db_wal, "get_control_command_by_nonce"):
+            db_row = self.db_wal.get_control_command_by_nonce(clean_nonce)
+            if db_row is not None and str(db_row.get("command", "")).upper() == "FLATTEN_ALL":
+                created_ms = int(db_row.get("created_ts_ms", 0) or 0)
+                issued_dt = datetime.fromtimestamp(created_ms / 1000.0, tz=JST) if created_ms > 0 else now_jst
+                meta = {
+                    "actor_id": str(db_row.get("requested_by", verified_actor)),
+                    "issued_at": issued_dt,
+                    "expires_at": issued_dt + timedelta(seconds=self.nonce_ttl_seconds),
+                    "consumed": str(db_row.get("status", "")).upper() == "EXECUTED",
+                }
+                self._pending_flatten_nonces[clean_nonce] = meta
+
         if meta is None:
             raise ReplayOrExpiredNonceError(f"未発行のワンタイム nonce です: '{clean_nonce}'")
 
@@ -449,7 +518,7 @@ class RemoteControlManager:
                 raise ReplayOrExpiredNonceError(f"SQLite 台帳上で承認できない nonce です: '{clean_nonce}'")
 
         meta["consumed"] = True
-        self._consumed_nonces.add(clean_nonce)
+        self._record_consumed_nonce(clean_nonce)
         self.is_paused = True
 
         # 1. 未約定の買い指値を全キャンセル
@@ -457,6 +526,8 @@ class RemoteControlManager:
 
         # 2. 保有中の全ポジション（DUST_QUARANTINED 除く）を緊急成行決済
         pf = self.oco_manager.load_portfolio()
+        pf["is_paused"] = True
+        self.oco_manager.save_portfolio(pf, now_dt=now_jst)
         symbols_to_close = [
             str(p.get("symbol", "")).upper()
             for p in (pf.get("positions", []) or [])
@@ -522,7 +593,7 @@ class RemoteControlManager:
                 else:
                     continue
                 self.db_wal.confirm_and_execute_command(nonce=nonce, actor_id=actor, now_dt=now_jst)
-                self._consumed_nonces.add(nonce)
+                self._record_consumed_nonce(nonce)
                 executed_results.append(res)
             except Exception as exc:
                 logger.warning("control_commands ポーリング実行スキップ (nonce=%s, cmd=%s): %s", nonce, cmd, exc)

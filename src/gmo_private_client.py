@@ -1095,6 +1095,11 @@ class PaperBroker:
             sz = _to_decimal(pos.get("size", 0))
             if sym and sz > 0:
                 spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
+        for dust in portfolio.get("quarantined_dust", []) or []:
+            sym = str(dust.get("symbol", "")).upper()
+            sz = _to_decimal(dust.get("size", 0))
+            if sym and sz > 0 and sym not in spot_totals:
+                spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
         for sym, p_sz in partial_buy_spot.items():
             if sym and p_sz > 0:
                 spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + p_sz

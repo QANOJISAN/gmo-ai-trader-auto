@@ -3,6 +3,7 @@ param(
     [switch]$ForceAi,
     [switch]$DryRunNotify,
     [switch]$ProbeLive,
+    [string]$ProbeSymbol = "XRP",
     [switch]$Backtest,
     [string]$RemoteCmd = ""
 )
@@ -22,24 +23,28 @@ if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 }
 
+$IsOneShotTool = ($ProbeLive -or $Backtest -or (-not [string]::IsNullOrWhiteSpace($RemoteCmd)))
+
 # Use v2_launcher.lock for the PowerShell wrapper so it does not collide with Python's SingleInstanceLock(v2_daemon.lock)
 $LockFile = Join-Path $ProjectDir "v2_launcher.lock"
-if (Test-Path -LiteralPath $LockFile) {
-    $ExistingPidText = ""
-    try {
-        $ExistingPidText = (Get-Content -LiteralPath $LockFile -ErrorAction Stop | Select-Object -First 1).Trim()
-    } catch {
+if (-not $IsOneShotTool) {
+    if (Test-Path -LiteralPath $LockFile) {
         $ExistingPidText = ""
-    }
-    $ExistingPid = 0
-    if ([int]::TryParse($ExistingPidText, [ref]$ExistingPid) -and $ExistingPid -gt 0 -and $ExistingPid -ne $PID) {
-        $RunningProc = Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue
-        if ($null -ne $RunningProc) {
-            Write-Host ("[SKIP] GMO AI Trader v2 daemon is already running (PID=" + $ExistingPid + "). Exiting.")
-            exit 0
+        try {
+            $ExistingPidText = (Get-Content -LiteralPath $LockFile -ErrorAction Stop | Select-Object -First 1).Trim()
+        } catch {
+            $ExistingPidText = ""
         }
+        $ExistingPid = 0
+        if ([int]::TryParse($ExistingPidText, [ref]$ExistingPid) -and $ExistingPid -gt 0 -and $ExistingPid -ne $PID) {
+            $RunningProc = Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue
+            if ($null -ne $RunningProc) {
+                Write-Host ("[SKIP] GMO AI Trader v2 daemon is already running (PID=" + $ExistingPid + "). Exiting.")
+                exit 0
+            }
+        }
+        Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
     }
-    Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
 }
 
 # Resolve Python executable (prefer local .venv, then v1 .venv as read-only runtime, then system python)
@@ -66,8 +71,12 @@ if ($null -eq $PythonExe) {
     throw "Python executable not found."
 }
 
+$LockAcquired = $false
 try {
-    [System.IO.File]::WriteAllText($LockFile, $PID.ToString(), [System.Text.Encoding]::ASCII)
+    if (-not $IsOneShotTool) {
+        [System.IO.File]::WriteAllText($LockFile, $PID.ToString(), [System.Text.Encoding]::ASCII)
+        $LockAcquired = $true
+    }
 
     $ArgsList = @("-B", "auto_trader.py")
     if ($Once) {
@@ -81,6 +90,10 @@ try {
     }
     if ($ProbeLive) {
         $ArgsList += "--probe-live"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ProbeSymbol)) {
+        $ArgsList += "--probe-symbol"
+        $ArgsList += $ProbeSymbol
     }
     if ($Backtest) {
         $ArgsList += "--backtest"
@@ -96,7 +109,7 @@ try {
         throw ("auto_trader.py exited with code " + $ExitCode)
     }
 } finally {
-    if (Test-Path -LiteralPath $LockFile) {
+    if ($LockAcquired -and (Test-Path -LiteralPath $LockFile)) {
         Remove-Item -LiteralPath $LockFile -Force -ErrorAction SilentlyContinue
     }
 }

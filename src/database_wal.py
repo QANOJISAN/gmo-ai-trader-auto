@@ -178,6 +178,7 @@ class DatabaseWAL:
         )
         self.auto_sync_files = auto_sync_files
         self._conn: Optional[sqlite3.Connection] = None
+        self._write_count: int = 0
         self._lock = _WalSessionLock(self)
         self._initialize_pragmas_and_schema()
 
@@ -384,8 +385,28 @@ class DatabaseWAL:
                 "busy_timeout": int(bt),
             }
 
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict[str, int]:
+        """SQLite WAL チェックポイントを実行し、WAL ファイル (`.db-wal`) の肥大化を防止する"""
+        valid_modes = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
+        mode_up = str(mode or "PASSIVE").strip().upper()
+        if mode_up not in valid_modes:
+            mode_up = "PASSIVE"
+        with self._lock:
+            row = self._conn.execute(f"PRAGMA wal_checkpoint({mode_up});").fetchone()
+            if row is not None and len(row) >= 3:
+                return {
+                    "busy": int(row[0] or 0),
+                    "log_frames": int(row[1] or 0),
+                    "checkpointed_frames": int(row[2] or 0),
+                }
+            return {"busy": 0, "log_frames": 0, "checkpointed_frames": 0}
+
     def close(self) -> None:
         with self._lock:
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
             try:
                 self._conn.close()
             except Exception:
@@ -415,6 +436,12 @@ class DatabaseWAL:
                     (iid, kind.strip().upper(), symbol.strip().upper(), dumps_json(payload, indent=None), ts, ts),
                 )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -445,6 +472,12 @@ class DatabaseWAL:
                         (st, ts, intent_id),
                     )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -580,6 +613,12 @@ class DatabaseWAL:
                     ),
                 )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -805,6 +844,12 @@ class DatabaseWAL:
                         ),
                     )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -814,6 +859,18 @@ class DatabaseWAL:
                 (exec_id,),
             ).fetchone()
             return True, dict(inserted_row) if inserted_row else None
+
+    def has_execution_for_order(self, order_id: Union[str, int]) -> bool:
+        """指定された `order_id` に紐づく約定レコードが既に `executions` テーブルに存在するか確認する"""
+        oid = str(order_id).strip()
+        if not oid:
+            return False
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM executions WHERE order_id = ? LIMIT 1",
+                (oid,),
+            ).fetchone()
+            return row is not None
 
     def get_high_watermark_execution_id(self, symbol: Optional[str] = None) -> int:
         """記録済み `execution_id`（数値変換可能なもの）の最大値（ハイウォーターマーク）を返す"""
@@ -976,6 +1033,12 @@ class DatabaseWAL:
                     ),
                 )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -1058,6 +1121,14 @@ class DatabaseWAL:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def get_control_command_by_nonce(self, nonce: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM control_commands WHERE nonce = ?",
+                (str(nonce or "").strip(),),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
     def mark_control_command(
         self,
         nonce: str,
@@ -1121,6 +1192,12 @@ class DatabaseWAL:
                     ),
                 )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -1171,6 +1248,12 @@ class DatabaseWAL:
                     ),
                 )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise
@@ -1202,6 +1285,12 @@ class DatabaseWAL:
                     (dumps_json(portfolio, indent=None), ts),
                 )
                 self._conn.execute("COMMIT;")
+                self._write_count += 1
+                if self._write_count % 100 == 0:
+                    try:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                    except Exception:
+                        pass
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise

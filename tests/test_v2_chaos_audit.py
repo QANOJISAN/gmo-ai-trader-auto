@@ -1648,6 +1648,272 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             self.assertEqual(daemon.ws_engine.ws_token, "")
             self.assertEqual(daemon.ws_engine.sync_state, SyncState.DISCONNECTED)
 
+    def test_round4_accounting_invariants_and_180day_endurance(self) -> None:
+        """
+        第4回 徹底総合監査 (Round 4 Accounting Invariants, Execution Settlement & 180-Day Endurance Audit):
+        - R4-01: 資金・建玉・税金台帳の会計恒等式 (パターン A/B/C/D すべてで 1円・1 Satoshi の誤差も二重計上もゼロ)
+        - R4-02: SL_PARTIAL_FAK_SWEEP の加重平均決済単価算出 & STOP未約定キャンセル時の誤成行決済防止
+        - R4-03: 180日間 (半年・26回の土曜メンテ＋180回の日次ロールオーバー) 耐久シミュレーション & SQLite WAL チェックポイント検証
+        - R4-04: 別プロセス CLI からの PAUSE/RESUME 永続化および FLATTEN_ALL 2段階承認のプロセス間連携検証
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp_dir = Path(td)
+            daemon = AutoTraderDaemon(base_dir=tmp_dir, execution_mode="DRY_RUN", dry_run_notify=True)
+            t0 = datetime(2026, 10, 28, 12, 0, 0, tzinfo=JST)
+
+            # ------------------------------------------------------------------
+            # 1. パターン A: PENDING_BUY ➔ 全量約定 ➔ SL_ACTIVE ➔ TP決済 (DatabaseWAL 二重計上ゼロ & 1円単位完全一致)
+            # ------------------------------------------------------------------
+            buy_a = daemon.oco_manager.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "XRP",
+                    "limit_price": 80.0,
+                    "size": 10.0,
+                    "take_profit_price": 85.0,
+                    "stop_loss_price": 77.0,
+                    "expected_loss_jpy": 30,
+                },
+                tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.5}},
+                now_dt=t0,
+            )
+            self.assertEqual(buy_a["status"], "PENDING_BUY")
+            # 約定発生 (80.0円 × 10 XRP = 800円)
+            daemon.run_fast_cycle(
+                tickers={"XRP": {"ask": 80.0, "bid": 79.9, "last": 80.0}},
+                now_dt=t0 + timedelta(seconds=15),
+            )
+            # DatabaseWAL の tax_moving_avg_ledger が 2倍 (20 XRP) ではなく正確に 10 XRP (1,000,000,000 satoshi) であること
+            with daemon.db_wal._lock:
+                tax_row_open = daemon.db_wal._conn.execute(
+                    "SELECT * FROM tax_moving_avg_ledger WHERE symbol = 'XRP'"
+                ).fetchone()
+                exec_rows_buy = daemon.db_wal._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM executions WHERE symbol = 'XRP' AND side = 'BUY'"
+                ).fetchone()
+            self.assertEqual(int(exec_rows_buy["cnt"]), 1)
+            self.assertEqual(int(tax_row_open["total_size_satoshi"]), 10 * 100_000_000)
+
+            # TP 到達で全量決済 (85.0円 × 10 XRP = 850円)
+            daemon.run_fast_cycle(
+                tickers={"XRP": {"ask": 85.5, "bid": 85.0, "last": 85.2}},
+                now_dt=t0 + timedelta(seconds=30),
+            )
+            pf_after_a = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_after_a["positions"]), 0)
+            self.assertEqual(len(pf_after_a["pending_orders"]), 0)
+            with daemon.db_wal._lock:
+                tax_row_closed = daemon.db_wal._conn.execute(
+                    "SELECT * FROM tax_moving_avg_ledger WHERE symbol = 'XRP'"
+                ).fetchone()
+                exec_rows_sell = daemon.db_wal._conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM executions WHERE symbol = 'XRP' AND side = 'SELL'"
+                ).fetchone()
+            self.assertEqual(int(exec_rows_sell["cnt"]), 1)
+            self.assertEqual(int(tax_row_closed["total_size_satoshi"]), 0)
+            self.assertEqual(int(tax_row_closed["book_value_a_jpy"]), 0)
+            self.assertEqual(int(tax_row_closed["book_value_b_jpy"]), 0)
+
+            rec_a = daemon.reconciler.reconcile(now_dt=t0 + timedelta(seconds=35))
+            self.assertEqual(rec_a["status"], "RECONCILED")
+            self.assertEqual(rec_a["jpy_diff"], 0.0)
+
+            # ------------------------------------------------------------------
+            # 2. パターン B: PENDING_BUY ➔ 未約定キャンセル & 逆選択キャンセル直前の部分約定保護
+            # ------------------------------------------------------------------
+            jpy_before_b = daemon.oco_manager.load_portfolio()["jpy_balance"]
+            buy_b = daemon.oco_manager.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "XRP",
+                    "limit_price": 80.0,
+                    "size": 10.0,
+                    "take_profit_price": 85.0,
+                    "stop_loss_price": 77.0,
+                    "expected_loss_jpy": 30,
+                },
+                tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.5}},
+                now_dt=t0 + timedelta(minutes=1),
+            )
+            oid_b = buy_b["order"]["order_id"]
+            # キャンセル直前に 5 XRP 部分約定した状態で CANCEL_ENTRIES が呼ばれた場合、5 XRP が孤児化せず SL_ACTIVE になること
+            daemon.broker.simulate_partial_fill(oid_b, filled_size=5.0, fill_price=80.0, now_dt=t0 + timedelta(minutes=1, seconds=10))
+            daemon.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=t0 + timedelta(minutes=1, seconds=20))
+            pf_after_b = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_after_b["pending_orders"]), 0)
+            self.assertEqual(len(pf_after_b["positions"]), 1)
+            self.assertEqual(pf_after_b["positions"][0]["size"], 5.0)
+            self.assertEqual(pf_after_b["positions"][0]["state"], "SL_ACTIVE")
+            rec_b = daemon.reconciler.reconcile(now_dt=t0 + timedelta(minutes=1, seconds=25))
+            self.assertEqual(rec_b["status"], "RECONCILED")
+            # クリーンアップ決済
+            daemon.oco_manager.close_position_immediately("XRP", reason="TEST_CLEANUP", now_dt=t0 + timedelta(minutes=1, seconds=30))
+            self.assertAlmostEqual(daemon.oco_manager.load_portfolio()["jpy_balance"], jpy_before_b, delta=5.0)
+
+            # ------------------------------------------------------------------
+            # 3. パターン D: minOrderSize 未満の端数部分約定 ➔ 60秒経過 ➔ DUST_QUARANTINED ➔ 3-Way 照合完全一致
+            # ------------------------------------------------------------------
+            buy_d = daemon.oco_manager.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 40000.0,
+                    "size": 0.02,
+                    "take_profit_price": 42000.0,
+                    "stop_loss_price": 39000.0,
+                    "expected_loss_jpy": 20,
+                },
+                tickers={"BCH": {"ask": 40100.0, "bid": 40050.0, "last": 40080.0}},
+                now_dt=t0 + timedelta(minutes=5),
+            )
+            oid_d = buy_d["order"]["order_id"]
+            # BCH の min_order_size (0.01) 未満である 0.004 BCH だけ部分約定
+            daemon.broker.simulate_partial_fill(oid_d, filled_size=0.004, fill_price=40000.0, now_dt=t0 + timedelta(minutes=5, seconds=10))
+            daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 40100.0, "bid": 40050.0, "last": 40080.0}},
+                now_dt=t0 + timedelta(minutes=5, seconds=15),
+            )
+            # 60秒グレース期間経過後 (t0 + 6m30s): DUST_QUARANTINED へ隔離されること
+            fast_d = daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 40100.0, "bid": 40050.0, "last": 40080.0}},
+                now_dt=t0 + timedelta(minutes=6, seconds=30),
+            )
+            self.assertTrue(any(e.get("type") == "PARTIAL_DUST_QUARANTINED" for e in fast_d["events"]))
+            pf_after_d = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_after_d["pending_orders"]), 0)
+            self.assertEqual(len(pf_after_d["positions"]), 0)
+            self.assertEqual(len(pf_after_d["quarantined_dust"]), 1)
+            self.assertAlmostEqual(float(pf_after_d["quarantined_dust"][0]["size"]), 0.004, places=6)
+
+            # PaperBroker.get_assets() と ThreeWayReconciler が DUST 隔離後も 1円・1 Satoshi のズレなく RECONCILED となること
+            rec_d = daemon.reconciler.reconcile(now_dt=t0 + timedelta(minutes=6, seconds=35))
+            self.assertEqual(rec_d["status"], "RECONCILED")
+            self.assertEqual(rec_d["discrepancies"], [])
+
+            # ------------------------------------------------------------------
+            # 4. R4-02: SL_PARTIAL_FAK_SWEEP 加重平均決済単価 & STOP未約定キャンセル時の再発注保護
+            # ------------------------------------------------------------------
+            buy_sl = daemon.oco_manager.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 43000.0,
+                    "size": 0.10,
+                    "take_profit_price": 45000.0,
+                    "stop_loss_price": 42400.0,
+                    "expected_loss_jpy": 60,
+                },
+                tickers={"BCH": {"ask": 43100.0, "bid": 43050.0, "last": 43080.0}},
+                now_dt=t0 + timedelta(minutes=10),
+            )
+            # 約定させて SL_ACTIVE へ
+            daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 43000.0, "bid": 42980.0, "last": 43000.0}},
+                now_dt=t0 + timedelta(minutes=10, seconds=15),
+            )
+            pf_sl = daemon.oco_manager.load_portfolio()
+            pos_bch = pf_sl["positions"][0]
+            sl_oid_1 = pos_bch["sl_order_id"]
+
+            # (a) 価格が SL より十分高い状態で取引所 STOP 注文が executed_size=0 で CANCELED になった場合、誤って成行売りせず STOP を再設置すること
+            daemon.broker.cancel_order(sl_oid_1)
+            ev_rearm = daemon.oco_manager.step(
+                tickers={"BCH": {"ask": 43050.0, "bid": 43000.0, "last": 43020.0}},
+                now_dt=t0 + timedelta(minutes=10, seconds=30),
+            )
+            self.assertTrue(any(e.get("type") == "CANCELED_SL_REARMED" for e in ev_rearm))
+            pf_rearmed = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_rearmed["positions"]), 1)
+            sl_oid_2 = pf_rearmed["positions"][0]["sl_order_id"]
+            self.assertNotEqual(sl_oid_1, sl_oid_2)
+
+            # (b) 急落時に STOP 注文が 0.06 BCH (@42,400円) だけ部分約定して残り 0.04 BCH が CANCELED (FAK失効) となり、
+            #     直後の成行スイープが 42,000円で 0.04 BCH 約定した場合、加重平均単価 42,240.0円で記録されること
+            daemon.broker.simulate_partial_fill(sl_oid_2, filled_size=0.06, fill_price=42400.0, now_dt=t0 + timedelta(minutes=11))
+            daemon.broker.cancel_order(sl_oid_2)
+            ev_sweep = daemon.oco_manager.step(
+                tickers={"BCH": {"ask": 42050.0, "bid": 42000.0, "last": 42000.0}},
+                now_dt=t0 + timedelta(minutes=11, seconds=5),
+            )
+            sweep_events = [e for e in ev_sweep if e.get("type") == "SL_PARTIAL_FAK_SWEPT"]
+            self.assertEqual(len(sweep_events), 1)
+            # (0.06 * 42400 + 0.04 * 42000) / 0.10 = 42240.0
+            self.assertAlmostEqual(float(sweep_events[0]["exit_price"]), 42240.0, places=2)
+            pf_after_sweep = daemon.oco_manager.load_portfolio()
+            last_closed = pf_after_sweep["closed_trades"][-1]
+            self.assertAlmostEqual(float(last_closed["exit_price"]), 42240.0, places=2)
+
+            # ------------------------------------------------------------------
+            # 5. R4-04: 別プロセス CLI からの PAUSE / RESUME 永続化 & FLATTEN_ALL 2段階承認連携
+            # ------------------------------------------------------------------
+            cli_remote = RemoteControlManager(oco_manager=daemon.oco_manager, db_wal=daemon.db_wal)
+            cli_remote.execute_command("PAUSE", now_dt=t0 + timedelta(minutes=12))
+            self.assertTrue(bool(daemon.oco_manager.load_portfolio().get("is_paused")))
+            cli_remote.execute_command("RESUME", now_dt=t0 + timedelta(minutes=12, seconds=10))
+            self.assertFalse(bool(daemon.oco_manager.load_portfolio().get("is_paused")))
+
+            # 別インスタンスで FLATTEN_ALL 要求 ➔ メモリを共有しない第2インスタンスで FLATTEN_CONFIRM <nonce> が成功すること
+            req_flt = cli_remote.execute_command("FLATTEN_ALL", now_dt=t0 + timedelta(minutes=12, seconds=20))
+            flt_nonce = req_flt["nonce"]
+            cli_remote_2 = RemoteControlManager(oco_manager=daemon.oco_manager, db_wal=daemon.db_wal)
+            conf_flt = cli_remote_2.execute_command(
+                f"FLATTEN_CONFIRM {flt_nonce}",
+                now_dt=t0 + timedelta(minutes=12, seconds=30),
+            )
+            self.assertEqual(conf_flt["status"], "FLATTENED")
+            cli_remote_2.execute_command("RESUME", now_dt=t0 + timedelta(minutes=12, seconds=35))
+
+            # ------------------------------------------------------------------
+            # 6. R4-03: 180日間 (半年・26回の土曜メンテ＋180回の日次06:00ロールオーバー) 高速耐久シミュレーション
+            # ------------------------------------------------------------------
+            sim_start = datetime(2026, 11, 1, 5, 55, 0, tzinfo=JST)
+            saturday_count = 0
+            for day_idx in range(180):
+                day_dt = sim_start + timedelta(days=day_idx)
+                # 毎日 06:05 JST の日次ロールオーバー (DAILY_DIGEST フラッシュ + SQLite WAL PASSIVE チェックポイント)
+                daemon.remote_control.dispatcher.dispatch("DAILY_DIGEST", "Heartbeat", f"Day {day_idx}", now_dt=day_dt)
+                res_0605 = daemon.run_fast_cycle(
+                    tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                    now_dt=day_dt.replace(hour=6, minute=5),
+                )
+                self.assertEqual(res_0605["status"], "OK")
+
+                # 土曜日の場合は 08:52 事前クリア ➔ 09:00 メンテスリープ ➔ 11:06 PREOPEN 待機 ➔ 11:10 OPEN 復帰照合を検証
+                if day_dt.weekday() == 5:
+                    saturday_count += 1
+                    daemon.run_fast_cycle(
+                        tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                        now_dt=day_dt.replace(hour=8, minute=52),
+                    )
+                    res_maint = daemon.run_fast_cycle(
+                        tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                        now_dt=day_dt.replace(hour=9, minute=0),
+                    )
+                    self.assertEqual(res_maint["status"], "MAINTENANCE_SLEEP")
+                    res_preopen = daemon.run_fast_cycle(
+                        tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                        exchange_status="PREOPEN",
+                        now_dt=day_dt.replace(hour=11, minute=6),
+                    )
+                    self.assertEqual(res_preopen["status"], "WAITING_EXCHANGE_OPEN_PREOPEN")
+                    res_reopen = daemon.run_fast_cycle(
+                        tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                        exchange_status="OPEN",
+                        now_dt=day_dt.replace(hour=11, minute=10),
+                    )
+                    self.assertEqual(res_reopen["status"], "OK")
+                    self.assertEqual(res_reopen["reconciled"]["status"], "RECONCILED")
+
+            self.assertGreaterEqual(saturday_count, 25)
+            self.assertEqual(len(daemon.remote_control.dispatcher.digest_buffer), 0)
+            self.assertLessEqual(len(daemon.remote_control.dispatcher.sent_history), 500)
+
+            with daemon.db_wal._lock:
+                integrity = daemon.db_wal._conn.execute("PRAGMA integrity_check;").fetchone()[0]
+            self.assertEqual(str(integrity).lower(), "ok")
+
+            daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

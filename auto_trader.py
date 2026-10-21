@@ -411,13 +411,17 @@ class AutoTraderDaemon:
                 "events": [],
             }
 
-        # 0. SQLite WAL のリモート制御コマンドポーリング & 06:00 JST デイリーダイジェスト送信
+        # 0. SQLite WAL のリモート制御コマンドポーリング & 06:00 JST デイリーダイジェスト送信 & WAL チェックポイント
         self.remote_control.poll_and_execute_db_commands(now_dt=now_jst)
         if now_jst.hour >= 6:
             digest_day = now_jst.strftime("%Y-%m-%d")
             if self._last_digest_date != digest_day:
                 self._last_digest_date = digest_day
                 self.notification_dispatcher.flush_daily_digest(now_dt=now_jst)
+                try:
+                    self.db_wal.checkpoint_wal("PASSIVE")
+                except Exception as wal_exc:
+                    logger.warning("日次 WAL チェックポイント警告: %s", wal_exc)
 
         # 0b. 土曜 08:50〜08:55 JST 未約定 BUY 事前クリア
         if is_in_saturday_pre_maintenance_clear_window(now_jst) and not self.pre_maintenance_cleared:
@@ -509,7 +513,28 @@ class AutoTraderDaemon:
                                 "timestamp": now_jst.isoformat(timespec="seconds"),
                             }
                         )
-                        pending_modified = True
+                        exec_size_pre = 0.0
+                        try:
+                            ord_info = self.oco_manager._query_orders_by_id([p_oid]).get(p_oid)
+                            if ord_info is not None:
+                                exec_size_pre = float(ord_info.get("executed_size", 0) or 0)
+                        except Exception:
+                            exec_size_pre = 0.0
+                        if exec_size_pre > 0:
+                            # 部分約定または全約定していた場合は step() で SL_ACTIVE / DUST_QUARANTINED へ処理させる
+                            remaining_pending.append(p_ord)
+                        else:
+                            if self.db_wal is not None:
+                                self.db_wal.upsert_order(
+                                    order_id=p_oid,
+                                    symbol=p_sym,
+                                    side="BUY",
+                                    execution_type="LIMIT",
+                                    state="CANCELED",
+                                    price=str(p_ord.get("limit_price", "0")),
+                                    size=str(p_ord.get("size", "0")),
+                                )
+                            pending_modified = True
                         continue
                 remaining_pending.append(p_ord)
             if pending_modified:
@@ -717,8 +742,11 @@ class AutoTraderDaemon:
                 l4_res = self.circuit_breaker.check_l4_weekly_and_streak(pf, now_dt=now_jst)
                 current_daily_trades = self._get_daily_trade_count(now_jst)
 
+                is_paused_now = bool(self.remote_control.is_paused or pf.get("is_paused", False))
+                self.remote_control.is_paused = is_paused_now
+
                 block_reason = ""
-                if self.remote_control.is_paused:
+                if is_paused_now:
                     block_reason = "[リモートPAUSE中によりHOLDへ自動補正] "
                 elif self.circuit_breaker.l5_kill_switch_latched:
                     block_reason = "[L5ハード・キルスイッチ発動中によりHOLDへ自動補正] "
@@ -1000,24 +1028,29 @@ def main() -> int:
     args = parser.parse_args()
 
     daemon = AutoTraderDaemon(dry_run_notify=args.dry_run_notify)
-    if args.probe_live:
-        res = daemon.live_probe.run_probe()
-        logger.info("Live Probe 完了: %s", res)
-        return 0
-    if args.backtest:
-        logger.info("ConservativeSpotBacktester 準備完了: symbol_rules=%d 銘柄", len(daemon.backtester.symbol_rules))
-        return 0
-    if args.remote_cmd:
-        res = daemon.remote_control.execute_command(args.remote_cmd)
-        logger.info("Remote Control 実行完了: %s", res)
-        return 0
-    if args.once:
-        daemon.run_fast_cycle()
-        daemon.run_radar_and_ai_cycle(force_ai=args.force_ai)
-        return 0
+    try:
+        if args.probe_symbol:
+            daemon.live_probe.probe_symbol = str(args.probe_symbol).strip().upper()
+        if args.probe_live:
+            res = daemon.live_probe.run_probe()
+            logger.info("Live Probe 完了: %s", res)
+            return 0
+        if args.backtest:
+            logger.info("ConservativeSpotBacktester 準備完了: symbol_rules=%d 銘柄", len(daemon.backtester.symbol_rules))
+            return 0
+        if args.remote_cmd:
+            res = daemon.remote_control.execute_command(args.remote_cmd)
+            logger.info("Remote Control 実行完了: %s", res)
+            return 0
+        if args.once:
+            daemon.run_fast_cycle()
+            daemon.run_radar_and_ai_cycle(force_ai=args.force_ai)
+            return 0
 
-    daemon.run_forever()
-    return 0
+        daemon.run_forever()
+        return 0
+    finally:
+        daemon.shutdown()
 
 
 if __name__ == "__main__":

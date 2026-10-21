@@ -283,7 +283,7 @@ class ThreeWayReconciler:
                                 fee_jpy_str=str(ex.get("fee", str(entry_fee_d))),
                                 timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
                             )
-                    else:
+                    elif not self.db_wal.has_execution_for_order(oid):
                         self.db_wal.record_execution_idempotent(
                             execution_id=f"rec_{oid}",
                             order_id=oid,
@@ -555,6 +555,7 @@ class ThreeWayReconciler:
             "elapsed_ms": elapsed_ms,
             "timestamp": now_jst.isoformat(timespec="seconds"),
             "exchange_jpy": float(exchange_jpy),
+            "jpy_diff": float(jpy_diff),
             "actions_taken": actions_taken,
             "discrepancies": discrepancies,
             "orphan_orders_handled": orphan_orders_handled,
