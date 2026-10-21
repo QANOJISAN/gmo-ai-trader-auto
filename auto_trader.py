@@ -42,18 +42,23 @@ from src.database_wal import DatabaseWAL
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import (
     GMOAuthHaltError,
+    GMOMaintenanceError,
     GMOPrivateClient,
     PaperBroker,
     create_broker_client,
 )
 from src.json_utils import write_json_file
+from src.live_probe import GMOCoinLiveProbe
 from src.llm_shadow_evaluator import LLMShadowEvaluator
 from src.notifier import Notifier, build_manual_order_guide
 from src.pseudo_oco_manager import PseudoOCOManager
 from src.radar import TechnicalRadar
 from src.reconciler import ThreeWayReconciler
+from src.regime_filter import MarketRegimeFilter
 from src.remote_control import RemoteControlManager, TieredNotificationDispatcher
 from src.validator import DEFAULT_SYMBOL_RULES, validate_and_adjust_decision
+from src.wfa_backtester import ConservativeSpotBacktester
+from src.ws_hybrid_engine import WSHybridEngine
 
 BASE_DIR = Path(__file__).resolve().parent
 PORTFOLIO_PATH = BASE_DIR / "portfolio.json"
@@ -175,7 +180,11 @@ class AutoTraderDaemon:
         self.db_path = self.base_dir / "v2_state_wal.db"
         self.lock_path = self.base_dir / "v2_daemon.lock"
 
-        self.db_wal = db_wal or DatabaseWAL(self.db_path)
+        self.db_wal = db_wal or DatabaseWAL(
+            self.db_path,
+            portfolio_json_path=self.portfolio_path,
+            auto_sync_files=True,
+        )
         self.execution_mode = (execution_mode or os.getenv("EXECUTION_MODE", "DRY_RUN")).strip().upper()
         self.public_client = public_client or GMOPublicClient()
         self.broker = broker or create_broker_client(
@@ -187,6 +196,7 @@ class AutoTraderDaemon:
         self.notifier = notifier or Notifier()
         self.ai_judge = ai_judge or AIJudge()
         self.radar = radar or TechnicalRadar()
+        self.regime_filter = getattr(self.radar, "regime_filter", None) or MarketRegimeFilter()
         self.dry_run_notify = dry_run_notify
 
         self.fast_loop_sec = int(fast_loop_sec if fast_loop_sec is not None else os.getenv("FAST_LOOP_SEC", "15"))
@@ -235,6 +245,15 @@ class AutoTraderDaemon:
             db_wal=self.db_wal,
             dispatcher=self.notification_dispatcher,
         )
+        self.ws_engine = WSHybridEngine(
+            broker=self.broker,
+            wal_db=self.db_wal,
+        )
+        self.live_probe = GMOCoinLiveProbe(
+            broker=self.broker,
+            capabilities_path=self.base_dir / "capabilities.json",
+        )
+        self.backtester = ConservativeSpotBacktester()
         self.instance_lock = SingleInstanceLock(self.lock_path)
 
         # 内部状態
@@ -248,6 +267,7 @@ class AutoTraderDaemon:
         self.auth_halted: bool = False
         self._daily_trade_date: str = ""
         self._daily_trade_count: int = 0
+        self._last_digest_date: str = ""
 
     def _get_daily_trade_count(self, now_jst: datetime) -> int:
         # GMO取引日基準 (06:00 JST) で日次カウントをリセット
@@ -278,6 +298,21 @@ class AutoTraderDaemon:
                 message=f"認証エラーを検知したため全自動発注を即時停止しました（DRY_RUNへの勝手なフォールバックは禁止）: `{exc}`",
                 now_dt=now_jst,
             )
+        # 臨時・水曜メンテナンスエラー (ERR-5201〜5206 / GMOMaintenanceError) は連続エラーとしてカウントせずメンテスリープへ移行
+        err_text = str(exc)
+        if isinstance(exc, GMOMaintenanceError) or any(
+            code in err_text for code in ("ERR-5201", "ERR-5202", "ERR-5203", "ERR-5204", "ERR-5205", "ERR-5206")
+        ):
+            self.in_maintenance_sleep = True
+            self.circuit_breaker.record_api_error(exc, now_dt=now_jst)
+            logger.info("🔧 GMOコイン臨時・定期メンテナンス応答を検知したため MAINTENANCE_SLEEP へ移行します: %s", exc)
+            return {
+                "consecutive_api_errors": self.consecutive_api_errors,
+                "circuit_breaker_triggered": False,
+                "maintenance_sleep": True,
+                "auth_halted": self.auth_halted,
+                "paused_until": None,
+            }
         self.consecutive_api_errors += 1
         self.circuit_breaker.record_api_error(exc, now_dt=now_jst)
         logger.error(
@@ -376,18 +411,27 @@ class AutoTraderDaemon:
                 "events": [],
             }
 
-        # 0. 土曜 08:50〜08:55 JST 未約定 BUY 事前クリア
+        # 0. SQLite WAL のリモート制御コマンドポーリング & 06:00 JST デイリーダイジェスト送信
+        self.remote_control.poll_and_execute_db_commands(now_dt=now_jst)
+        if now_jst.hour >= 6:
+            digest_day = now_jst.strftime("%Y-%m-%d")
+            if self._last_digest_date != digest_day:
+                self._last_digest_date = digest_day
+                self.notification_dispatcher.flush_daily_digest(now_dt=now_jst)
+
+        # 0b. 土曜 08:50〜08:55 JST 未約定 BUY 事前クリア
         if is_in_saturday_pre_maintenance_clear_window(now_jst) and not self.pre_maintenance_cleared:
             self.clear_pending_buys_before_maintenance(now_dt=now_jst)
 
-        # 1. 土曜メンテナンス枠チェック (08:55〜11:05 JST)
-        if is_in_saturday_maintenance_window(now_jst):
+        # 1. 土曜メンテナンス枠チェック (08:55〜11:05 JST) または 臨時・水曜メンテナンスステータス検知
+        ex_stat_clean = (exchange_status or "").strip().upper()
+        if is_in_saturday_maintenance_window(now_jst) or (not self.in_maintenance_sleep and ex_stat_clean in ("MAINTENANCE", "PREOPEN")):
             if not self.in_maintenance_sleep:
                 self.in_maintenance_sleep = True
-                logger.info("🔧 土曜定期メンテナンス枠 (08:55〜11:05 JST) に入ったため自動スリープを開始します。")
+                logger.info("🔧 取引所メンテナンス枠 (土曜定時または臨時/水曜メンテ) に入ったため自動スリープを開始します。")
                 self.notifier.notify_event(
-                    title="土曜定期メンテナンス自動スリープ開始 (08:55〜11:05 JST)",
-                    message="GMOコイン定期メンテナンス枠のため、11:05 JST まで API 発注・変更を一時休止します。",
+                    title="取引所メンテナンス自動スリープ開始",
+                    message="GMOコインメンテナンス枠のため、再開確認まで API 発注・変更を一時休止します。",
                     level="MAINT",
                     dry_run=self.dry_run_notify,
                 )
@@ -397,10 +441,10 @@ class AutoTraderDaemon:
                 "events": [],
             }
 
-        # メンテナンス明け (11:05 JST 以降) の PREOPEN チェック＆自動照合
+        # メンテナンス明け (11:05 JST 以降 または 臨時メンテ終了後) の PREOPEN チェック＆自動照合
         reconcile_result: Optional[Dict[str, Any]] = None
         if self.in_maintenance_sleep:
-            ex_stat = (exchange_status or "OPEN").strip().upper()
+            ex_stat = ex_stat_clean or "OPEN"
             if ex_stat in ("MAINTENANCE", "PREOPEN"):
                 return {
                     "status": f"WAITING_EXCHANGE_OPEN_{ex_stat}",
@@ -409,7 +453,7 @@ class AutoTraderDaemon:
                 }
             self.in_maintenance_sleep = False
             self.pre_maintenance_cleared = False
-            logger.info("🔧 土曜定期メンテナンス枠が終了 (11:05 JST) したため、資産・注文照合を実行して再開します。")
+            logger.info("🔧 メンテナンス枠が終了したため、資産・注文照合を実行して再開します。")
             reconcile_result = self.reconcile_after_maintenance(now_dt=now_jst)
 
         # APIエラー・サーキットブレーカー一時停止中か確認
@@ -422,7 +466,67 @@ class AutoTraderDaemon:
 
         try:
             current_tickers = tickers if tickers is not None else self.public_client.get_tickers()
-            events = self.oco_manager.step(tickers=current_tickers, now_dt=now_jst)
+
+            # 0.2s Fast Recovery ガーディアン（ノーガード建玉の即時復旧）
+            guardian_events = self.oco_manager.run_fast_recovery_guardian(
+                tickers=current_tickers,
+                now_dt=now_jst,
+            )
+
+            # 板置きのまま滞留している PENDING_BUY の逆選択（毒性フロー）キャンセル判定
+            adverse_cancel_events: List[Dict[str, Any]] = []
+            pf_pre = self.oco_manager.load_portfolio()
+            remaining_pending: List[Dict[str, Any]] = []
+            pending_modified = False
+            for p_ord in pf_pre.get("pending_orders", []) or []:
+                p_sym = str(p_ord.get("symbol", "")).upper()
+                p_oid = str(p_ord.get("order_id", ""))
+                if p_oid and (
+                    p_sym in self.adverse_guard._latest_orderbook
+                    or p_sym in self.adverse_guard._trades_by_symbol
+                ):
+                    cancel_chk = self.adverse_guard.should_cancel_resting_buy_order(
+                        symbol=p_sym,
+                        order_price=float(p_ord.get("limit_price", 0) or 0),
+                        order_size=float(p_ord.get("size", 0) or 0),
+                        atr_5m=float(p_ord.get("atr_5m", 100.0) or 100.0),
+                        now_sec=now_jst.timestamp(),
+                    )
+                    if cancel_chk.get("should_cancel"):
+                        try:
+                            self.broker.cancel_order(p_oid)
+                        except Exception as exc:
+                            logger.warning("逆選択ガードによる待機買い注文取消警告 (order_id=%s): %s", p_oid, exc)
+                        adverse_cancel_events.append(
+                            {
+                                "type": "ADVERSE_SELECTION_RESTING_BUY_CANCELED",
+                                "symbol": p_sym,
+                                "order_id": p_oid,
+                                "reason": ", ".join(cancel_chk.get("cancel_reasons", [])),
+                                "timestamp": now_jst.isoformat(timespec="seconds"),
+                            }
+                        )
+                        pending_modified = True
+                        continue
+                remaining_pending.append(p_ord)
+            if pending_modified:
+                pf_pre["pending_orders"] = remaining_pending
+                self.oco_manager.save_portfolio(pf_pre, now_dt=now_jst)
+
+            step_events = self.oco_manager.step(tickers=current_tickers, now_dt=now_jst)
+            events = guardian_events + adverse_cancel_events + step_events
+
+            # SL 約定イベント発生時は該当銘柄に180分クールダウンを記録
+            for ev in events:
+                if ev.get("type") in (
+                    "SL_EXECUTED",
+                    "BOT_REDUNDANT_SL_EXECUTED",
+                    "SL_PARTIAL_FAK_SWEPT",
+                    "FAST_RECOVERY_MARKET_EXIT",
+                ):
+                    ev_sym = str(ev.get("symbol", "")).upper()
+                    if ev_sym:
+                        self.ai_judge.record_sl_hit_cooldown(ev_sym, now_dt=now_jst)
 
             # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < 8,500円) チェック
             pf_now = self.oco_manager.load_portfolio()
@@ -521,8 +625,24 @@ class AutoTraderDaemon:
 
             # まず最新 Ticker で擬似OCOのステップ評価を実行
             if tickers:
-                self.oco_manager.step(tickers=tickers, now_dt=now_jst)
+                step_evs = self.oco_manager.step(tickers=tickers, now_dt=now_jst)
+                for ev in step_evs:
+                    if ev.get("type") in (
+                        "SL_EXECUTED",
+                        "BOT_REDUNDANT_SL_EXECUTED",
+                        "SL_PARTIAL_FAK_SWEPT",
+                        "FAST_RECOVERY_MARKET_EXIT",
+                    ):
+                        ev_sym = str(ev.get("symbol", "")).upper()
+                        if ev_sym:
+                            self.ai_judge.record_sl_hit_cooldown(ev_sym, now_dt=now_jst)
                 pf = self.oco_manager.load_portfolio()
+
+            # 未評価のシャドー評価レコードがあれば直近ローソク足から MFE/MAE・仮想損益を更新
+            self.shadow_evaluator.evaluate_pending_records(
+                market_summaries=market_summaries,
+                now_dt=now_jst,
+            )
 
             radar_eval = self.radar.evaluate_triggers(
                 market_summaries=market_summaries,
@@ -596,6 +716,64 @@ class AutoTraderDaemon:
                     validated["risk_reward_ratio"] = 0.0
                     validated["reasoning"] = block_reason + str(validated.get("reasoning", ""))
                     action = "HOLD"
+
+            # 逆選択（毒性フロー）3層防御フィルタ (AdverseSelectionGuard) による発注直前チェック
+            if action == "BUY":
+                buy_sym = str(validated.get("symbol", "")).upper()
+                sym_summary = (market_summaries or {}).get(buy_sym, {})
+                ob_data = sym_summary.get("orderbook") or {}
+                trades_data = sym_summary.get("recent_trades") or []
+                now_sec_val = now_jst.timestamp()
+                if ob_data:
+                    self.adverse_guard.record_orderbook(
+                        symbol=buy_sym,
+                        asks=ob_data.get("asks", []),
+                        bids=ob_data.get("bids", []),
+                        timestamp_sec=now_sec_val,
+                    )
+                for tr in trades_data:
+                    self.adverse_guard.record_taker_trade(
+                        symbol=buy_sym,
+                        side=str(tr.get("side", "BUY")),
+                        price=float(tr.get("price", 0) or 0),
+                        size=float(tr.get("size", 0) or 0),
+                        timestamp_sec=float(tr.get("timestamp_sec", now_sec_val)),
+                    )
+                if (
+                    ob_data
+                    or trades_data
+                    or buy_sym in self.adverse_guard._latest_orderbook
+                    or buy_sym in self.adverse_guard._trades_by_symbol
+                ):
+                    atr_5m_val = float(
+                        sym_summary.get("m5_indicators", {}).get("atr_14", 0)
+                        or sym_summary.get("m15_indicators", {}).get("atr_14", 0)
+                        or max(1.0, float(validated.get("limit_price", 100) or 100) * 0.005)
+                    )
+                    guard_res = self.adverse_guard.evaluate_entry_guard(
+                        symbol=buy_sym,
+                        proposed_limit_price=validated.get("limit_price", 0),
+                        atr_5m=atr_5m_val,
+                        now_sec=now_sec_val,
+                    )
+                    validated["adverse_selection_guard"] = guard_res
+                    if not guard_res["allow_entry"]:
+                        validated["action"] = "HOLD"
+                        validated["order_type"] = "NONE"
+                        validated["limit_price"] = 0
+                        validated["size"] = 0
+                        validated["take_profit_price"] = 0
+                        validated["stop_loss_price"] = 0
+                        validated["expected_cost_jpy"] = 0
+                        validated["expected_loss_jpy"] = 0
+                        validated["risk_reward_ratio"] = 0.0
+                        validated["reasoning"] = (
+                            f"[逆選択防御フィルタによりABORT ({', '.join(guard_res['reject_reasons'])})] "
+                            + str(validated.get("reasoning", ""))
+                        )
+                        action = "HOLD"
+                    elif guard_res.get("passive_offset_applied"):
+                        validated["limit_price"] = guard_res["adjusted_limit_price"]
 
             validated["radar_triggers"] = radar_eval["triggers"]
             validated["execution_mode"] = getattr(self.broker, "MODE", self.execution_mode)
@@ -770,9 +948,24 @@ def main() -> int:
     parser.add_argument("--once", action="store_true", help="1サイクルのみ実行して終了する（動作確認用）")
     parser.add_argument("--force-ai", action="store_true", help="レーダー条件に関わらずAI判定を1回強制実行する")
     parser.add_argument("--dry-run-notify", action="store_true", help="Discord/LINEへの外部通知送信をスキップする")
+    parser.add_argument("--probe-live", action="store_true", help="極小ロット実機プローブ検証 (capabilities.json 生成) を実行して終了する")
+    parser.add_argument("--probe-symbol", type=str, default="XRP", help="プローブ検証に使用する銘柄 (既定: XRP)")
+    parser.add_argument("--backtest", action="store_true", help="WFA・Purged/Embargo保守的現物バックテスト検証を実行して終了する")
+    parser.add_argument("--remote-cmd", type=str, default="", help="リモート緊急制御コマンド (PAUSE, RESUME, CANCEL_ENTRIES, FLATTEN_ALL 等) を実行して終了する")
     args = parser.parse_args()
 
     daemon = AutoTraderDaemon(dry_run_notify=args.dry_run_notify)
+    if args.probe_live:
+        res = daemon.live_probe.run_probe()
+        logger.info("Live Probe 完了: %s", res)
+        return 0
+    if args.backtest:
+        logger.info("ConservativeSpotBacktester 準備完了: symbol_rules=%d 銘柄", len(daemon.backtester.symbol_rules))
+        return 0
+    if args.remote_cmd:
+        res = daemon.remote_control.execute_command(args.remote_cmd)
+        logger.info("Remote Control 実行完了: %s", res)
+        return 0
     if args.once:
         daemon.run_fast_cycle()
         daemon.run_radar_and_ai_cycle(force_ai=args.force_ai)

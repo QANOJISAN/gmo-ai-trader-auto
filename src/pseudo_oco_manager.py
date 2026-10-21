@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
@@ -229,6 +230,7 @@ class PseudoOCOManager:
             else self.portfolio_path.parent / "capabilities.json"
         )
         self.stop_change_order_supported: bool = self._load_stop_change_capability()
+        self._lock = threading.RLock()
 
     def _load_stop_change_capability(self) -> bool:
         if self.capabilities_path and self.capabilities_path.exists():
@@ -240,45 +242,47 @@ class PseudoOCOManager:
         return False
 
     def load_portfolio(self) -> Dict[str, Any]:
-        if not self.portfolio_path.exists():
-            default_pf = {
-                "initial_capital_jpy": 10000,
-                "jpy_balance": 10000,
-                "realized_pnl_total_jpy": 0,
-                "total_realized_pnl_jpy": 0,
-                "max_allocation_per_trade_pct": 0.50,
-                "max_concurrent_positions": 2,
-                "target_risk_per_trade_jpy": 150,
-                "max_risk_per_trade_jpy": 200,
-                "drawdown_kill_switch_jpy": 8500,
-                "positions": [],
-                "quarantined_dust": [],
-                "closed_trades": [],
-                "pending_orders": [],
-                "execution_mode": getattr(self.broker, "MODE", "DRY_RUN"),
-                "last_updated": _now_jst().isoformat(timespec="seconds"),
-            }
-            write_json_file(self.portfolio_path, default_pf)
-            return default_pf
-        pf = load_json_file(self.portfolio_path)
-        pf.setdefault("positions", [])
-        pf.setdefault("quarantined_dust", [])
-        pf.setdefault("closed_trades", [])
-        pf.setdefault("pending_orders", [])
-        pf.setdefault("realized_pnl_total_jpy", int(pf.get("total_realized_pnl_jpy", 0) or 0))
-        pf.setdefault("total_realized_pnl_jpy", int(pf.get("realized_pnl_total_jpy", 0) or 0))
-        return pf
+        with self._lock:
+            if not self.portfolio_path.exists():
+                default_pf = {
+                    "initial_capital_jpy": 10000,
+                    "jpy_balance": 10000,
+                    "realized_pnl_total_jpy": 0,
+                    "total_realized_pnl_jpy": 0,
+                    "max_allocation_per_trade_pct": 0.50,
+                    "max_concurrent_positions": 2,
+                    "target_risk_per_trade_jpy": 150,
+                    "max_risk_per_trade_jpy": 200,
+                    "drawdown_kill_switch_jpy": 8500,
+                    "positions": [],
+                    "quarantined_dust": [],
+                    "closed_trades": [],
+                    "pending_orders": [],
+                    "execution_mode": getattr(self.broker, "MODE", "DRY_RUN"),
+                    "last_updated": _now_jst().isoformat(timespec="seconds"),
+                }
+                write_json_file(self.portfolio_path, default_pf)
+                return default_pf
+            pf = load_json_file(self.portfolio_path)
+            pf.setdefault("positions", [])
+            pf.setdefault("quarantined_dust", [])
+            pf.setdefault("closed_trades", [])
+            pf.setdefault("pending_orders", [])
+            pf.setdefault("realized_pnl_total_jpy", int(pf.get("total_realized_pnl_jpy", 0) or 0))
+            pf.setdefault("total_realized_pnl_jpy", int(pf.get("realized_pnl_total_jpy", 0) or 0))
+            return pf
 
     def save_portfolio(self, portfolio: Dict[str, Any], now_dt: Optional[datetime] = None) -> None:
-        now_jst = _now_jst(now_dt)
-        portfolio["last_updated"] = now_jst.isoformat(timespec="seconds")
-        portfolio["execution_mode"] = getattr(self.broker, "MODE", "DRY_RUN")
-        if self.wal_db is not None:
-            self.wal_db.sync_portfolio_to_Sqlite_and_json(
-                portfolio,
-                now_ts_ms=int(now_jst.timestamp() * 1000),
-            )
-        write_json_file(self.portfolio_path, portfolio)
+        with self._lock:
+            now_jst = _now_jst(now_dt)
+            portfolio["last_updated"] = now_jst.isoformat(timespec="seconds")
+            portfolio["execution_mode"] = getattr(self.broker, "MODE", "DRY_RUN")
+            if self.wal_db is not None:
+                self.wal_db.sync_portfolio_to_Sqlite_and_json(
+                    portfolio,
+                    now_ts_ms=int(now_jst.timestamp() * 1000),
+                )
+            write_json_file(self.portfolio_path, portfolio)
 
     # ------------------------------------------------------------------
     # 0.2秒 Fast Recovery ガーディアン (最大3秒 Dead-Man's Timer)
@@ -293,6 +297,14 @@ class PseudoOCOManager:
         0.2秒周期で即座に検知し、最大3.0秒以内に逆指値 `STOP` を再設置（または既にSL水準割れなら成行緊急決済）して
         「ノーガード放置時間 0秒（最大でも3秒未満）」の不変条件を強制する。
         """
+        with self._lock:
+            return self._run_fast_recovery_guardian_unlocked(tickers=tickers, now_dt=now_dt)
+
+    def _run_fast_recovery_guardian_unlocked(
+        self,
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         now_jst = _now_jst(now_dt)
         pf = self.load_portfolio()
         recovered_events: List[Dict[str, Any]] = []
@@ -498,6 +510,15 @@ class PseudoOCOManager:
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
         now_dt: Optional[datetime] = None,
     ) -> Dict[str, Any]:
+        with self._lock:
+            return self._place_new_buy_order_unlocked(decision=decision, tickers=tickers, now_dt=now_dt)
+
+    def _place_new_buy_order_unlocked(
+        self,
+        decision: Dict[str, Any],
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
         now_jst = _now_jst(now_dt)
         now_str = now_jst.isoformat(timespec="seconds")
 
@@ -586,6 +607,14 @@ class PseudoOCOManager:
            - 利確スイッチ (Smart TP): 現在 Bid >= `take_profit_price` で SL取消ロック解除 ➔ 利確売り発注
            - 4段階トレーリング (+1.0R 建値保護 / +1.5R +0.65Rロック / +2.0R シャンデリア追従)
         """
+        with self._lock:
+            return self._step_unlocked(tickers=tickers, now_dt=now_dt)
+
+    def _step_unlocked(
+        self,
+        tickers: Dict[str, Dict[str, Any]],
+        now_dt: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
         now_jst = _now_jst(now_dt)
         events: List[Dict[str, Any]] = []
 
@@ -1235,6 +1264,7 @@ class PseudoOCOManager:
             "cost_jpy": int(cost_jpy_d),
             "proceeds_jpy": net_proceeds_jpy,
             "pnl_jpy": pnl_jpy,
+            "realized_pnl_jpy": pnl_jpy,
             "pnl_pct": round(pnl_pct, 2),
             "reason": reason,
             "buy_order_id": str(pos.get("buy_order_id", "")),
@@ -1256,40 +1286,41 @@ class PseudoOCOManager:
         AI判定の `MODIFY` に基づき、既存の SL 注文を新しい SL 逆指値へ更新する。
         ※ SL の引き下げ（`new_sl < old_sl`）は100%拒絶する不変条件を強制。
         """
-        now_jst = _now_jst(now_dt)
-        sym = symbol.strip().upper()
-        pf = self.load_portfolio()
+        with self._lock:
+            now_jst = _now_jst(now_dt)
+            sym = symbol.strip().upper()
+            pf = self.load_portfolio()
 
-        for pos in pf.get("positions", []):
-            if str(pos.get("symbol", "")).upper() != sym:
-                continue
-            old_sl_id = str(pos.get("sl_order_id", "") or "")
-            old_sl = float(pos.get("stop_loss_price", 0) or 0)
-            size = float(pos.get("size", 0) or 0)
+            for pos in pf.get("positions", []):
+                if str(pos.get("symbol", "")).upper() != sym:
+                    continue
+                old_sl_id = str(pos.get("sl_order_id", "") or "")
+                old_sl = float(pos.get("stop_loss_price", 0) or 0)
+                size = float(pos.get("size", 0) or 0)
 
-            # SL 引き下げは 100% 拒絶
-            effective_sl = max(float(new_sl), old_sl) if old_sl > 0 else float(new_sl)
-            if effective_sl > 0 and abs(effective_sl - old_sl) > 1e-9:
-                new_sl_id = self._replace_or_change_stop_order(
-                    symbol=sym,
-                    old_sl_order_id=old_sl_id,
-                    size=size,
-                    new_sl_price=effective_sl,
-                )
-                pos["sl_order_id"] = new_sl_id
-                pos["stop_loss_price"] = effective_sl
-                pos["sl_price"] = effective_sl
-                if effective_sl >= float(pos.get("entry_price", 0) or 0):
-                    pos["breakeven_locked"] = True
+                # SL 引き下げは 100% 拒絶
+                effective_sl = max(float(new_sl), old_sl) if old_sl > 0 else float(new_sl)
+                if effective_sl > 0 and abs(effective_sl - old_sl) > 1e-9:
+                    new_sl_id = self._replace_or_change_stop_order(
+                        symbol=sym,
+                        old_sl_order_id=old_sl_id,
+                        size=size,
+                        new_sl_price=effective_sl,
+                    )
+                    pos["sl_order_id"] = new_sl_id
+                    pos["stop_loss_price"] = effective_sl
+                    pos["sl_price"] = effective_sl
+                    if effective_sl >= float(pos.get("entry_price", 0) or 0):
+                        pos["breakeven_locked"] = True
 
-            if new_tp > 0:
-                pos["take_profit_price"] = float(new_tp)
-                pos["tp_price"] = float(new_tp)
+                if new_tp > 0:
+                    pos["take_profit_price"] = float(new_tp)
+                    pos["tp_price"] = float(new_tp)
 
-            self.save_portfolio(pf, now_dt=now_jst)
-            return dict(pos)
+                self.save_portfolio(pf, now_dt=now_jst)
+                return dict(pos)
 
-        return None
+            return None
 
     def close_position_immediately(
         self,
@@ -1297,36 +1328,37 @@ class PseudoOCOManager:
         reason: str = "AI_SELL",
         now_dt: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
-        now_jst = _now_jst(now_dt)
-        sym = symbol.strip().upper()
-        pf = self.load_portfolio()
-        target_idx: Optional[int] = None
+        with self._lock:
+            now_jst = _now_jst(now_dt)
+            sym = symbol.strip().upper()
+            pf = self.load_portfolio()
+            target_idx: Optional[int] = None
 
-        for idx, pos in enumerate(pf.get("positions", [])):
-            if str(pos.get("symbol", "")).upper() == sym:
-                target_idx = idx
-                break
+            for idx, pos in enumerate(pf.get("positions", [])):
+                if str(pos.get("symbol", "")).upper() == sym:
+                    target_idx = idx
+                    break
 
-        if target_idx is None:
-            return None
+            if target_idx is None:
+                return None
 
-        pos = pf["positions"].pop(target_idx)
-        closed_record = self._execute_atomic_market_exit(
-            pf=pf,
-            pos=pos,
-            reason=reason,
-            now_jst=now_jst,
-        )
-        self.save_portfolio(pf, now_dt=now_jst)
+            pos = pf["positions"].pop(target_idx)
+            closed_record = self._execute_atomic_market_exit(
+                pf=pf,
+                pos=pos,
+                reason=reason,
+                now_jst=now_jst,
+            )
+            self.save_portfolio(pf, now_dt=now_jst)
 
-        self.notifier.notify_event(
-            title=f"AI判定によるポジション決済完了 ({reason}): {sym}",
-            message=(
-                f"・注文ID: `{closed_record.get('exit_order_id', '')}`\n"
-                f"・取得単価: {format_price_jpy(pos.get('entry_price', 0))} 円 ➔ 決済単価: {format_price_jpy(closed_record['exit_price'])} 円\n"
-                f"・確定損益: **{closed_record['pnl_jpy']:+,} 円 ({closed_record['pnl_pct']:+.2f}%)**"
-            ),
-            level="INFO",
-            dry_run=self.dry_run_notify,
-        )
-        return closed_record
+            self.notifier.notify_event(
+                title=f"AI判定によるポジション決済完了 ({reason}): {sym}",
+                message=(
+                    f"・注文ID: `{closed_record.get('exit_order_id', '')}`\n"
+                    f"・取得単価: {format_price_jpy(pos.get('entry_price', 0))} 円 ➔ 決済単価: {format_price_jpy(closed_record['exit_price'])} 円\n"
+                    f"・確定損益: **{closed_record['pnl_jpy']:+,} 円 ({closed_record['pnl_pct']:+.2f}%)**"
+                ),
+                level="INFO",
+                dry_run=self.dry_run_notify,
+            )
+            return closed_record

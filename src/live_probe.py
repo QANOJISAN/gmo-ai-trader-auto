@@ -140,23 +140,42 @@ class GMOCoinLiveProbe:
                 except Exception:
                     capabilities["stop_change_order_supported"] = False
 
-            # 3. cancelBefore=true パラメータ検証
+            # 3. cancelOrder によるロック即時解放計測 ＆ cancelBefore=true の成行売り (MARKET/FAK/SELL) 専属制約検証
             try:
-                cb_res = self.broker.place_order(
+                lock_ord = self.broker.place_order(
                     symbol=self.probe_symbol,
                     side="BUY",
                     execution_type="LIMIT",
                     size=self.probe_size,
                     price=self.deep_limit_price,
                     time_in_force="SOK",
-                    cancel_before=True,
                 )
-                oid_cb = str(cb_res.get("order_id", ""))
-                if oid_cb:
-                    created_order_ids.append(oid_cb)
-                    capabilities["cancel_before_supported"] = True
+                oid_lock = str(lock_ord.get("order_id", ""))
+                if oid_lock:
+                    created_order_ids.append(oid_lock)
+                    self.broker.cancel_order(oid_lock)
+                    created_order_ids.remove(oid_lock)
+                    if oid_lock not in capabilities["cleaned_order_ids"]:
+                        capabilities["cleaned_order_ids"].append(oid_lock)
+                # BUY LIMIT に cancelBefore=true を誤付与した場合は仕様通り拒否されることを確認
+                invalid_cb_rejected = False
+                try:
+                    self.broker.place_order(
+                        symbol=self.probe_symbol,
+                        side="BUY",
+                        execution_type="LIMIT",
+                        size=self.probe_size,
+                        price=self.deep_limit_price,
+                        time_in_force="SOK",
+                        cancel_before=True,
+                    )
+                except Exception:
+                    invalid_cb_rejected = True
+                capabilities["cancel_before_supported"] = bool(oid_lock and invalid_cb_rejected)
+                capabilities["cancel_before_market_fak_sell_only_enforced"] = invalid_cb_rejected
             except Exception:
                 capabilities["cancel_before_supported"] = False
+                capabilities["cancel_before_market_fak_sell_only_enforced"] = False
 
             # 4. ws-auth POST / PUT / DELETE 検証
             if (

@@ -232,3 +232,43 @@ class LLMShadowEvaluator:
             "counterfactual_edge_jpy": counterfactual_edge_jpy,
             "veto_avoided_losses_count": veto_avoided_sl_count,
         }
+
+    def evaluate_pending_records(
+        self,
+        market_summaries: Dict[str, Dict[str, Any]],
+        now_dt: Optional[datetime] = None,
+    ) -> int:
+        """
+        デーモンの定期サイクルから呼び出され、未評価レコードの4h/12h/24h MFE/MAE・仮想損益を
+        直近の1時間足 (または15分足) バーから自動更新する。
+        """
+        updated_count = 0
+        for eval_id, rec in list(self.records.items()):
+            if rec.get("outcome_24h") not in (None, "PENDING"):
+                continue
+            sym = str(rec.get("symbol", "")).upper()
+            summary = (market_summaries or {}).get(sym, {})
+            klines = summary.get("klines_1h") or summary.get("klines_15m") or []
+            if not klines:
+                continue
+            bars_24h = [
+                {
+                    "high": float(k.get("high", k.get("close", 0)) or 0),
+                    "low": float(k.get("low", k.get("close", 0)) or 0),
+                    "close": float(k.get("close", 0) or 0),
+                }
+                for k in klines[-24:]
+                if float(k.get("close", 0) or 0) > 0
+            ]
+            if not bars_24h:
+                continue
+            bars_4h = bars_24h[:4]
+            bars_12h = bars_24h[:12]
+            self.update_with_horizon_bars(
+                eval_id=eval_id,
+                bars_4h=bars_4h,
+                bars_12h=bars_12h,
+                bars_24h=bars_24h,
+            )
+            updated_count += 1
+        return updated_count

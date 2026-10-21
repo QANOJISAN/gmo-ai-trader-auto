@@ -45,6 +45,7 @@ from src.live_probe import GMOCoinLiveProbe
 from src.llm_shadow_evaluator import LLMShadowEvaluator
 from src.pseudo_oco_manager import (
     PseudoOCOManager,
+    calculate_breakeven_sl_price,
     compute_four_stage_trailing_sl,
 )
 from src.radar import TechnicalRadar, quantize_order_params
@@ -1173,6 +1174,145 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             self.assertEqual(reg_res["regime"], "RISK_OFF_CRASH")
             self.assertFalse(reg_res["allow_new_buy"])
             self.assertEqual(len(daemon.oco_manager.load_portfolio()["positions"]), 1)
+
+    def test_round1_master_audit_regressions(self) -> None:
+        """第1回徹底総合監査 (Round 1 Master Comprehensive Audit) 検出10項目 (F-01〜F-10) のリグレッション検証"""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            ex = ChaosMockExchange(tmp_dir, wal_db=daemon.db_wal)
+            daemon.broker = ex
+            daemon.oco_manager.broker = ex
+            daemon.reconciler.broker = ex
+            daemon.live_probe.broker = ex
+
+            # [F-01] 全11モジュールの配線 & DatabaseWAL(auto_sync_files=True) 確認
+            self.assertIsNotNone(daemon.ws_engine)
+            self.assertIsNotNone(daemon.live_probe)
+            self.assertIsNotNone(daemon.backtester)
+            self.assertTrue(daemon.db_wal.auto_sync_files)
+
+            # [F-02] cancel_before=True は SELL + MARKET + FAK のみ許可され、BUY/LIMIT では GMOPrivateAPIError となること
+            with self.assertRaises(GMOPrivateAPIError):
+                ex.place_order(
+                    symbol="XRP",
+                    side="BUY",
+                    execution_type="LIMIT",
+                    size=1,
+                    price=80.0,
+                    time_in_force="SOK",
+                    cancel_before=True,
+                )
+            probe_res = daemon.live_probe.run_probe()
+            self.assertTrue(probe_res["cancel_before_market_fak_sell_only_enforced"])
+
+            # [F-03] AdverseSelectionGuard の PASSIVE_OFFSET が Best Bid 基準で max(1_tick, 0.15 * atr_5m * |tfi_60s|) を引くこと
+            guard = AdverseSelectionGuard()
+            now_sec = 1_760_000_000.0
+            guard.record_orderbook(
+                symbol="BTC",
+                asks=[{"price": 10_000_100, "size": 1.0}],
+                bids=[{"price": 10_000_000, "size": 1.0}],
+                timestamp_sec=now_sec,
+            )
+            guard.record_taker_trade("BTC", "SELL", 10_000_000, 0.60, timestamp_sec=now_sec)
+            guard.record_taker_trade("BTC", "BUY", 10_000_100, 0.40, timestamp_sec=now_sec)
+            # TFI = (0.40 - 0.60) / 1.0 = -0.20 (-0.25 < TFI < -0.05 の PASSIVE_OFFSET 領域)
+            # 0.15 * 20000 * 0.20 = 600 円オフセット
+            passive_res = guard.evaluate_entry_guard(
+                symbol="BTC",
+                proposed_limit_price=10_000_500,  # Best Bid (10,000,000) より高い提案価格でも Best Bid 基準へ補正
+                atr_5m=20_000.0,
+                now_sec=now_sec,
+            )
+            self.assertTrue(passive_res["allow_entry"])
+            self.assertTrue(passive_res["passive_offset_applied"])
+            self.assertEqual(passive_res["adjusted_limit_price"], 10_000_000 - 600)
+
+            # [F-04] compute_four_stage_trailing_sl の4段階遷移 & calculate_breakeven_sl_price の 0.15R オプション検証
+            st1, sl1, upd1 = compute_four_stage_trailing_sl(
+                entry_price=100_000,
+                current_bid=102_200,
+                highest_bid=102_200,
+                current_sl=98_000,
+                one_r_dist=2_000,
+                symbol="SOL",
+            )
+            self.assertEqual(st1, 1)
+            self.assertTrue(upd1)
+            self.assertEqual(sl1, 100_200)
+            be_with_r = calculate_breakeven_sl_price(100_000, "SOL", one_r_distance=2_000)
+            self.assertEqual(be_with_r, 100_300)
+
+            # [F-05 & F-06] PseudoOCOManager で SL 約定時に realized_pnl_jpy が記録され、
+            # L3/L4 サーキットブレーカーと AIJudge 180分クールダウンに連動すること
+            t0 = datetime(2026, 10, 26, 7, 0, 0, tzinfo=JST)
+            daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000,
+                    "size": 0.1,
+                    "take_profit_price": 48000,
+                    "stop_loss_price": 40500,
+                },
+                tickers={"BCH": {"ask": 44100, "bid": 44050, "last": 44050}},
+                now_dt=t0,
+            )
+            # 約定させる (44,000円 × 0.1 BCH = 4,400円 <= 10,000円口座)
+            daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 43950, "bid": 43940, "last": 43945}},
+                now_dt=t0 + timedelta(seconds=10),
+            )
+            # SL ヒットさせる (40,500円決済 -> -350円損失 <= -300円の L3 日次損失制限到達)
+            fast_sl_res = daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 40450, "bid": 40400, "last": 40400}},
+                now_dt=t0 + timedelta(seconds=25),
+            )
+            self.assertTrue(any(e["type"] == "SL_EXECUTED" for e in fast_sl_res["events"]))
+            # AIJudge の同一銘柄 SL クールダウンが自動で記録されていること
+            cd_blocked, _ = daemon.ai_judge.is_symbol_on_sl_cooldown("BCH", now_dt=t0 + timedelta(minutes=30))
+            self.assertTrue(cd_blocked)
+            # L3 日次損失制限が closed_trades の損失を検知してブロックすること
+            pf_after_sl = daemon.oco_manager.load_portfolio()
+            l3_chk = daemon.circuit_breaker.check_l3_daily_loss(pf_after_sl, now_dt=t0 + timedelta(minutes=30))
+            self.assertTrue(l3_chk["blocked"])
+            self.assertLessEqual(l3_chk["daily_realized_pnl_jpy"], -300.0)
+
+            # [F-07] 06:00〜06:15 JST の +25円 手数料端数返金が FEE_REFUND_ADJUSTMENT として自動吸収されること
+            pf_0605 = daemon.oco_manager.load_portfolio()
+            base_jpy = int(pf_0605["jpy_balance"])
+            st_ex = ex._ensure_state_file()
+            st_ex["jpy_balance"] = float(base_jpy + 25)
+            ex._save_state(st_ex)
+            rec_25 = daemon.reconciler.reconcile(now_dt=datetime(2026, 10, 27, 6, 5, 0, tzinfo=JST))
+            self.assertEqual(rec_25["status"], "RECONCILED")
+            self.assertEqual(rec_25["fee_adjustment_applied"]["adjustment_jpy"], 25)
+
+            # [F-08 & F-09 & F-10] 臨時メンテ ERR-5201 非カウント、run_v2_daemon.ps1 ロック分離、DBコマンドポーリング
+            daemon.consecutive_api_errors = 0
+            err_info = daemon.record_api_error(Exception("GMO API Error ERR-5201: MAINTENANCE"), now_dt=t0)
+            self.assertEqual(err_info["consecutive_api_errors"], 0)
+            self.assertTrue(err_info["maintenance_sleep"])
+
+            ps1_text = (Path(__file__).resolve().parent.parent / "run_v2_daemon.ps1").read_text(encoding="utf-8")
+            self.assertIn("v2_launcher.lock", ps1_text)
+            self.assertNotIn('$LockFile = Join-Path $ProjectDir "v2_daemon.lock"', ps1_text)
+
+            daemon.db_wal.register_control_command(
+                nonce="poll_pause_001",
+                command="PAUSE",
+                actor_id=daemon.remote_control.allowed_owner_discord_id,
+                require_confirm=False,
+                now_dt=t0,
+            )
+            polled = daemon.remote_control.poll_and_execute_db_commands(now_dt=t0)
+            self.assertEqual(len(polled), 1)
+            self.assertTrue(daemon.remote_control.is_paused)
 
 
 if __name__ == "__main__":

@@ -312,11 +312,18 @@ class AdverseSelectionGuard:
         prop_dec = round_to_step(_to_decimal(proposed_limit_price), tick_size, rounding=ROUND_DOWN)
         passive_offset_applied = False
 
-        # 軽度売り圧力時 (-0.25 < TFI_60s < -0.05) は最良買気配の先頭に並ばずパッシブ・オフセットを適用
+        # 軽度売り圧力時 (-0.25 < TFI_60s < -0.05) は最良買気配 (Best Bid) を基準に
+        # Bid - max(1_tick, quantize_tick(0.15 * atr_5m * abs(tfi_60s))) のパッシブ・オフセットを適用
         if not reject_reasons and (-0.25 < l2["tfi_60s"] < -0.05):
             best_bid_d = _to_decimal(l1.get("best_bid", prop_dec) or prop_dec)
-            offset_d = max(tick_size * Decimal("2"), _to_decimal(atr_5m) * Decimal("0.25"))
-            passive_target = round_to_step(min(prop_dec, best_bid_d) - offset_d, tick_size, rounding=ROUND_DOWN)
+            best_ask_d = _to_decimal(l1.get("best_ask", 0) or 0)
+            anchor_bid_d = min(prop_dec, best_bid_d) if best_bid_d > Decimal("0") else prop_dec
+            if best_ask_d > tick_size:
+                anchor_bid_d = min(anchor_bid_d, best_ask_d - tick_size)
+            raw_dyn_offset = Decimal("0.15") * _to_decimal(atr_5m) * _to_decimal(abs(l2["tfi_60s"]))
+            quantized_dyn_offset = round_to_step(raw_dyn_offset, tick_size, rounding=ROUND_DOWN)
+            offset_d = max(tick_size, quantized_dyn_offset)
+            passive_target = round_to_step(anchor_bid_d - offset_d, tick_size, rounding=ROUND_DOWN)
             if passive_target > Decimal("0") and passive_target < prop_dec:
                 prop_dec = passive_target
                 passive_offset_applied = True

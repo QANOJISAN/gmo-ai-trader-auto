@@ -735,6 +735,12 @@ class GMOPrivateClient:
         else:
             tif = "FAS"
 
+        if cancel_before and not (side_up == "SELL" and exec_up == "MARKET" and tif == "FAK"):
+            raise GMOPrivateAPIError(
+                f"GMO公式API仕様違反: cancelBefore=true は現物の成行売り (side=SELL, executionType=MARKET, timeInForce=FAK) のみ使用可能です "
+                f"(指定値: side={side_up}, executionType={exec_up}, timeInForce={tif})"
+            )
+
         prio = 1 if (side_up == "SELL" and (exec_up in ("STOP", "MARKET") or cancel_before)) else 4
         price_dec = round_to_step(_to_decimal(price or 0), tick_size, rounding=ROUND_DOWN) if price is not None else Decimal("0")
         adjust_count = 0
@@ -1171,8 +1177,13 @@ class PaperBroker:
             else Decimal("0")
         )
 
-        # cancel_before=True が指定された場合、当該銘柄の既存の有効注文を原子的にキャンセルしてロックを解除する
+        # cancel_before=True が指定された場合、GMO公式仕様 (SELL + MARKET + FAK 限定) を検証した上で既存有効注文を原子的にキャンセルする
         if cancel_before:
+            if not (side_up == "SELL" and exec_up == "MARKET" and tif == "FAK"):
+                raise GMOPrivateAPIError(
+                    f"GMO公式API仕様違反: cancelBefore=true は現物の成行売り (side=SELL, executionType=MARKET, timeInForce=FAK) のみ使用可能です "
+                    f"(指定値: side={side_up}, executionType={exec_up}, timeInForce={tif})"
+                )
             self.cancel_bulk_order([sym], side=side_up)
 
         balances = self.get_jpy_and_spot_balances()

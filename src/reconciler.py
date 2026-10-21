@@ -68,13 +68,13 @@ class ThreeWayReconciler:
         notifier: Optional[Any] = None,
         symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
         jpy_discrepancy_threshold: float = 50.0,
-        fee_adjustment_max_jpy: float = 10.0,
+        fee_adjustment_max_jpy: float = 50.0,
         cancel_orphan_orders: bool = True,
         dry_run_notify: bool = False,
     ) -> None:
         self.broker = broker
         self.oco_manager = oco_manager
-        self.db_wal = db_wal or getattr(oco_manager, "db_wal", None)
+        self.db_wal = db_wal or getattr(oco_manager, "db_wal", None) or getattr(oco_manager, "wal_db", None)
         self.notifier = notifier or getattr(oco_manager, "notifier", None)
         self.symbol_rules = {**DEFAULT_SYMBOL_RULES, **(symbol_rules or getattr(oco_manager, "symbol_rules", {}) or {})}
         self.jpy_discrepancy_threshold = float(jpy_discrepancy_threshold)
@@ -94,6 +94,17 @@ class ThreeWayReconciler:
         """
         3者照合を実行し、孤児注文・幽霊注文・裸ポジション・06:00端数調整を処理する。
         """
+        lock = getattr(self.oco_manager, "_lock", None)
+        if lock is not None:
+            with lock:
+                return self._reconcile_unlocked(now_dt=now_dt, default_sl_pct=default_sl_pct)
+        return self._reconcile_unlocked(now_dt=now_dt, default_sl_pct=default_sl_pct)
+
+    def _reconcile_unlocked(
+        self,
+        now_dt: Optional[datetime] = None,
+        default_sl_pct: float = 0.035,
+    ) -> Dict[str, Any]:
         t_start = time.monotonic()
         now_jst = _now_jst(now_dt)
         pf = self.oco_manager.load_portfolio()

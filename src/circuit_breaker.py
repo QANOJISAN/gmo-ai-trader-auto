@@ -313,7 +313,7 @@ class MultiTierCircuitBreaker:
         realized_today = Decimal("0")
         for trade in portfolio.get("closed_trades", []) or []:
             closed_at_str = str(trade.get("closed_at", "")).strip()
-            pnl_val = _to_decimal(trade.get("realized_pnl_jpy", 0))
+            pnl_val = _to_decimal(trade.get("realized_pnl_jpy", trade.get("pnl_jpy", 0)))
             if closed_at_str:
                 try:
                     c_dt = _now_jst(datetime.fromisoformat(closed_at_str))
@@ -370,7 +370,7 @@ class MultiTierCircuitBreaker:
         # 直近の連敗数をカウント
         streak = 0
         for trade in reversed(closed_trades):
-            pnl = _to_decimal(trade.get("realized_pnl_jpy", 0))
+            pnl = _to_decimal(trade.get("realized_pnl_jpy", trade.get("pnl_jpy", 0)))
             if pnl < Decimal("0"):
                 streak += 1
             else:
@@ -381,7 +381,7 @@ class MultiTierCircuitBreaker:
         week_cutoff = now_jst - timedelta(days=7)
         weekly_pnl = Decimal("0")
         for trade in closed_trades:
-            pnl = _to_decimal(trade.get("realized_pnl_jpy", 0))
+            pnl = _to_decimal(trade.get("realized_pnl_jpy", trade.get("pnl_jpy", 0)))
             closed_at_str = str(trade.get("closed_at", "")).strip()
             if closed_at_str:
                 try:

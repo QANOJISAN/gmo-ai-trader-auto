@@ -27,7 +27,7 @@
    - 4段階トレーリング SL（`+1.0R` 建値微益ロック、`+1.5R` $+0.65R$ ロック、`+2.0R` シャンデリア追従＋$0.20R$ ヒステリシス）。
 6. **3-Way Reconciliation（3者照合・自己修復）＆ 06:00 JST 手数料端数調整吸収（[`src/reconciler.py`](file:///e:/gmo-ai-trader-auto/src/reconciler.py)）**
    - 孤児注文（Orphan Orders）・幽霊注文（Ghost Orders）・裸の現物ポジション（Naked Positions）を検知し自動修復。
-   - 毎朝 `06:00〜06:15 JST` の `±1〜10円` 以内の日本円残高差分を `FEE_REFUND_ADJUSTMENT` として自動吸収し、それ以外の `> 50円` 異常乖離は `DEGRADED_RECONCILING` へ移行して新規発注をロック。
+   - 毎朝 `06:00〜06:15 JST` の `±1〜50円` 以内の日本円残高差分を `FEE_REFUND_ADJUSTMENT` として自動吸収し、それ以外の `> 50円` 異常乖離は `DEGRADED_RECONCILING` へ移行して新規発注をロック。
 7. **4段階銘柄スクリーニングゲート ＆ BTCマクロレジーム・ヒステリシス（[`src/radar.py`](file:///e:/gmo-ai-trader-auto/src/radar.py), [`src/regime_filter.py`](file:///e:/gmo-ai-trader-auto/src/regime_filter.py)）**
    - Gate 0（ステーブルコイン除外）、Gate 1（Decimal 文字列量子化）、Gate 2（流動性・スプレッド審査）、Gate 3（1万円口座リスク予算＆最小ロットSL距離審査）。
    - BTC レジームフィルタ（`RISK_OFF_CRASH` 検知時の新規 BUY 即時遮断・待機 BUY 一括取消・解除後2時間ヒステリシス冷却）。

@@ -1,7 +1,10 @@
 param(
     [switch]$Once,
     [switch]$ForceAi,
-    [switch]$DryRunNotify
+    [switch]$DryRunNotify,
+    [switch]$ProbeLive,
+    [switch]$Backtest,
+    [string]$RemoteCmd = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +22,8 @@ if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 }
 
-$LockFile = Join-Path $ProjectDir "v2_daemon.lock"
+# Use v2_launcher.lock for the PowerShell wrapper so it does not collide with Python's SingleInstanceLock(v2_daemon.lock)
+$LockFile = Join-Path $ProjectDir "v2_launcher.lock"
 if (Test-Path -LiteralPath $LockFile) {
     $ExistingPidText = ""
     try {
@@ -74,6 +78,16 @@ try {
     }
     if ($DryRunNotify) {
         $ArgsList += "--dry-run-notify"
+    }
+    if ($ProbeLive) {
+        $ArgsList += "--probe-live"
+    }
+    if ($Backtest) {
+        $ArgsList += "--backtest"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RemoteCmd)) {
+        $ArgsList += "--remote-cmd"
+        $ArgsList += $RemoteCmd
     }
 
     & $PythonExe @ArgsList

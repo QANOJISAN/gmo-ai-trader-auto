@@ -458,3 +458,36 @@ class RemoteControlManager:
             "closed_trades": closed_trades,
             "timestamp": now_jst.isoformat(timespec="seconds"),
         }
+
+    def poll_and_execute_db_commands(
+        self,
+        now_dt: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        SQLite WAL の `control_commands` テーブルに CLI / 外部連携から登録された
+        `PENDING` コマンドをポーリングして実行する。
+        """
+        if self.db_wal is None:
+            return []
+        now_jst = _now_jst(now_dt)
+        executed_results: List[Dict[str, Any]] = []
+        rows = self.db_wal.fetch_pending_control_commands()
+        for r in rows:
+            nonce = str(r.get("nonce", ""))
+            cmd = str(r.get("command", "")).strip().upper()
+            actor = str(r.get("requested_by", "") or "")
+            try:
+                if cmd == "PAUSE":
+                    res = self.pause_new_entries(actor_id=actor, now_dt=now_jst)
+                elif cmd == "RESUME":
+                    res = self.resume_new_entries(actor_id=actor, now_dt=now_jst)
+                elif cmd == "CANCEL_ENTRIES":
+                    res = self.cancel_pending_entries_only(actor_id=actor, now_dt=now_jst)
+                else:
+                    continue
+                self.db_wal.confirm_and_execute_command(nonce=nonce, actor_id=actor, now_dt=now_jst)
+                self._consumed_nonces.add(nonce)
+                executed_results.append(res)
+            except Exception as exc:
+                logger.warning("control_commands ポーリング実行スキップ (nonce=%s, cmd=%s): %s", nonce, cmd, exc)
+        return executed_results
