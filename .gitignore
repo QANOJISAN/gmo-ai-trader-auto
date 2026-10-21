@@ -1,0 +1,27 @@
+# 環境変数・秘密情報
+.env
+.env.*
+!.env.example
+
+# 実行ログ・デーモンロック・ペーパートレード一時注文
+logs/
+*.log
+*.lock
+v2_daemon.lock
+paper_orders.json
+daemon_state.json
+
+# Python キャッシュ・仮想環境
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# OS・エディタ生成ファイル
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

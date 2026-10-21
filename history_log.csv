@@ -1,0 +1,1 @@
+timestamp,action,symbol,order_type,limit_price,size,take_profit_price,stop_loss_price,expected_cost_jpy,expected_loss_jpy,risk_reward_ratio,confidence,provider,jpy_balance,open_positions_count,reasoning

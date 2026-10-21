@@ -1,0 +1,16 @@
+{
+  "initial_capital_jpy": 10000,
+  "jpy_balance": 10000,
+  "realized_pnl_total_jpy": 0,
+  "total_realized_pnl_jpy": 0,
+  "max_allocation_per_trade_pct": 0.5,
+  "max_concurrent_positions": 2,
+  "target_risk_per_trade_jpy": 150,
+  "max_risk_per_trade_jpy": 200,
+  "drawdown_kill_switch_jpy": 8500,
+  "positions": [],
+  "closed_trades": [],
+  "pending_orders": [],
+  "execution_mode": "DRY_RUN",
+  "last_updated": "2026-10-21T19:10:00+09:00"
+}
