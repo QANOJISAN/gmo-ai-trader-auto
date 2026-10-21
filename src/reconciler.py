@@ -283,15 +283,18 @@ class ThreeWayReconciler:
                                 fee_jpy_str=str(ex.get("fee", str(entry_fee_d))),
                                 timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
                             )
-                    elif not self.db_wal.has_execution_for_order(oid):
+                    recorded_sz = self.db_wal.get_executed_size_for_order(oid) if hasattr(self.db_wal, "get_executed_size_for_order") else (filled_size_dec if self.db_wal.has_execution_for_order(oid) else Decimal("0"))
+                    if recorded_sz + Decimal("1e-12") < filled_size_dec:
+                        residual_sz = filled_size_dec - recorded_sz
+                        residual_fee = (entry_fee_d * residual_sz / filled_size_dec).quantize(Decimal("0.01")) if filled_size_dec > Decimal("0") else entry_fee_d
                         self.db_wal.record_execution_idempotent(
-                            execution_id=f"rec_{oid}",
+                            execution_id=f"rec_{oid}_{format_decimal_plain(filled_size_dec)}",
                             order_id=oid,
                             symbol=sym,
                             side="BUY",
                             price_str=str(fill_price),
-                            size_str=format_decimal_plain(filled_size_dec),
-                            fee_jpy_str=str(entry_fee_d),
+                            size_str=format_decimal_plain(residual_sz),
+                            fee_jpy_str=str(residual_fee),
                             timestamp_str=now_jst.isoformat(timespec="seconds"),
                         )
                     self.db_wal.upsert_order(
@@ -337,23 +340,41 @@ class ThreeWayReconciler:
         # ------------------------------------------------------------------
         # 3. 保有ポジションの SL 生存確認 ＆ 取引所現物残高の裸ポジション (Naked Position) 保護
         # ------------------------------------------------------------------
-        positions_by_sym: Dict[str, Dict[str, Any]] = {
-            str(p.get("symbol", "")).upper(): p for p in (pf.get("positions", []) or [])
-        }
+        raw_positions: List[Dict[str, Any]] = list(pf.get("positions", []) or [])
+        quarantined_dust_by_sym: Dict[str, Decimal] = {}
+        for d_entry in (pf.get("quarantined_dust", []) or []):
+            d_sym = str(d_entry.get("symbol", "")).strip().upper()
+            if d_sym:
+                quarantined_dust_by_sym[d_sym] = (
+                    quarantined_dust_by_sym.get(d_sym, Decimal("0"))
+                    + _to_decimal(d_entry.get("size", 0))
+                )
 
-        # 3a. 既存ローカルポジションの SL 確認
+        # 3a. 既存ローカルポジションの SL 確認（同一銘柄で DUST_QUARANTINED と PROTECTED が共存しても上書きしない）
         remaining_positions: List[Dict[str, Any]] = []
-        for sym, pos in list(positions_by_sym.items()):
-            sl_oid = str(pos.get("sl_order_id", "") or "")
+        for pos in raw_positions:
+            sym = str(pos.get("symbol", "")).strip().upper()
+            pos_state = str(pos.get("state", "")).strip().upper()
             size_dec = _to_decimal(pos.get("size", 0))
-            sl_price = float(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
-            entry_price = float(pos.get("entry_price", 0) or 0)
             rule = self.symbol_rules.get(sym, {})
             min_size_dec = _to_decimal(rule.get("min_order_size", "0.0001"))
+
+            if pos_state == "DUST_QUARANTINED":
+                if sym not in quarantined_dust_by_sym:
+                    quarantined_dust_by_sym[sym] = size_dec
+                remaining_positions.append(pos)
+                continue
+
+            sl_oid = str(pos.get("sl_order_id", "") or "")
+            sl_price = float(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
+            entry_price = float(pos.get("entry_price", 0) or 0)
 
             if size_dec < min_size_dec:
                 pos["state"] = "DUST_QUARANTINED"
                 dust_quarantined.append(sym)
+                quarantined_dust_by_sym[sym] = (
+                    quarantined_dust_by_sym.get(sym, Decimal("0")) + size_dec
+                )
                 remaining_positions.append(pos)
                 continue
 
@@ -363,10 +384,11 @@ class ThreeWayReconciler:
                     actions_taken.append(f"{sym}: 照合中にSL約定済みを検知 (order_id={sl_oid})")
                     continue
 
-                # SLが消失していた場合は 0.5秒以内に再発注
+                # SLが消失していた場合は 0.5秒以内に再発注（隔離済み端数分は差し引いて保護数量を算出）
                 spot_info = spot_assets.get(sym, {})
                 actual_amt = _to_decimal(spot_info.get("amount", spot_info.get("available", size_dec)))
-                protect_size = min(size_dec, actual_amt) if actual_amt > Decimal("0") else size_dec
+                net_amt = max(Decimal("0"), actual_amt - quarantined_dust_by_sym.get(sym, Decimal("0")))
+                protect_size = min(size_dec, net_amt) if net_amt > Decimal("0") else size_dec
                 if protect_size >= min_size_dec:
                     if sl_price <= 0 and entry_price > 0:
                         sl_price = float(round_to_step(Decimal(str(entry_price)) * Decimal(str(1.0 - default_sl_pct)), _to_decimal(rule.get("tick_size", "1"))))
@@ -387,14 +409,19 @@ class ThreeWayReconciler:
                         )
             remaining_positions.append(pos)
 
-        # 3b. 取引所に現物残高があるのにローカル `positions` に存在しない「完全な裸ポジション」の検知と0.5秒以内保護
-        local_syms = {str(p.get("symbol", "")).upper() for p in remaining_positions}
-        quarantined_syms = {str(d.get("symbol", "")).upper() for d in (pf.get("quarantined_dust", []) or [])}
+        # 3b. 取引所に現物残高があるのにローカル有効 `positions` に存在しない「完全な裸ポジション」の検知と0.5秒以内保護
+        active_local_syms = {
+            str(p.get("symbol", "")).strip().upper()
+            for p in remaining_positions
+            if str(p.get("state", "")).strip().upper() != "DUST_QUARANTINED"
+        }
+        quarantined_syms = set(quarantined_dust_by_sym.keys())
         for sym, asset_info in spot_assets.items():
             sym_up = sym.strip().upper()
-            if sym_up == "JPY" or sym_up in local_syms:
+            if sym_up == "JPY" or sym_up in active_local_syms:
                 continue
-            amt_dec = _to_decimal(asset_info.get("amount", asset_info.get("available", 0)))
+            total_amt_dec = _to_decimal(asset_info.get("amount", asset_info.get("available", 0)))
+            amt_dec = max(Decimal("0"), total_amt_dec - quarantined_dust_by_sym.get(sym_up, Decimal("0")))
             if amt_dec <= Decimal("0"):
                 continue
 
@@ -421,6 +448,8 @@ class ThreeWayReconciler:
                 }
                 remaining_positions.append(dust_pos)
                 dust_quarantined.append(sym_up)
+                quarantined_dust_by_sym[sym_up] = amt_dec
+                quarantined_syms.add(sym_up)
                 actions_taken.append(f"{sym_up}: 最小ロット未満の端数残高 ({format_decimal_plain(amt_dec)}) を DUST_QUARANTINED に隔離")
                 continue
 
@@ -480,6 +509,7 @@ class ThreeWayReconciler:
                 "opened_at": now_jst.isoformat(timespec="seconds"),
             }
             remaining_positions.append(recovered_pos)
+            active_local_syms.add(sym_up)
             if self.db_wal is not None:
                 self.db_wal.upsert_position(
                     symbol=sym_up,

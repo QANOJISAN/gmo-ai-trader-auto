@@ -194,6 +194,15 @@ def compute_four_stage_trailing_sl(
     return stage, out_price, bool(should_upd)
 
 
+class _StopOrderAlreadyExecutedError(Exception):
+    """STOP注文の取消・変更直前に、取引所側で既にEXECUTEDになっていたことを示す内部例外"""
+
+    def __init__(self, order_id: str, order_info: Dict[str, Any]) -> None:
+        super().__init__(f"STOP order already executed: {order_id}")
+        self.order_id = order_id
+        self.order_info = order_info
+
+
 class PseudoOCOManager:
     """現物API向け WAL意図ログ付き8状態ステートマシン・原子的決済・4段階トレーリング管理エンジン"""
 
@@ -351,6 +360,10 @@ class PseudoOCOManager:
         remaining_positions: List[Dict[str, Any]] = []
         for pos in pf.get("positions", []):
             sym = str(pos.get("symbol", "")).upper()
+            pos_state = str(pos.get("state", "")).strip().upper()
+            if pos_state == "DUST_QUARANTINED":
+                remaining_positions.append(pos)
+                continue
             size = float(pos.get("size", 0) or 0)
             sl_oid = str(pos.get("sl_order_id", "") or "")
             sl_price = float(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
@@ -421,9 +434,18 @@ class PseudoOCOManager:
                     )
                     changed = True
                 except InsufficientAvailableAssetError:
-                    # 既に別注文でロックされているか部分売却済みの場合は実残高を確認して調整
+                    # 既に別注文でロックされているか部分売却済みの場合は実残高（隔離済み端数を除く）を確認して調整
                     balances = self.broker.get_jpy_and_spot_balances()
-                    avail = float(balances["spot_assets"].get(sym, {}).get("available", 0.0) or 0.0)
+                    raw_avail = _to_decimal(balances["spot_assets"].get(sym, {}).get("available", 0.0) or 0.0)
+                    existing_dust = sum(
+                        (
+                            _to_decimal(d.get("size", 0))
+                            for d in (pf.get("quarantined_dust", []) or [])
+                            if str(d.get("symbol", "")).strip().upper() == sym
+                        ),
+                        Decimal("0"),
+                    )
+                    avail = float(max(Decimal("0"), min(_to_decimal(size), raw_avail - existing_dust)))
                     if avail >= min_size:
                         sl_order = self.broker.place_order(
                             symbol=sym,
@@ -493,7 +515,17 @@ class PseudoOCOManager:
                     pass
             balances = self.broker.get_jpy_and_spot_balances()
             spot_info = balances["spot_assets"].get(sym, {})
-            actual_avail = float(spot_info.get("available", spot_info.get("amount", 0.0)) or 0.0)
+            raw_avail_d = _to_decimal(spot_info.get("available", spot_info.get("amount", 0.0)) or 0.0)
+            existing_dust_d = sum(
+                (
+                    _to_decimal(d.get("size", 0))
+                    for d in (pf.get("quarantined_dust", []) or [])
+                    if str(d.get("symbol", "")).strip().upper() == sym
+                ),
+                Decimal("0"),
+            )
+            net_avail_d = max(Decimal("0"), raw_avail_d - existing_dust_d)
+            actual_avail = float(net_avail_d)
             if actual_avail < min_size:
                 if actual_avail > 0:
                     pf.setdefault("quarantined_dust", []).append(
@@ -856,6 +888,9 @@ class PseudoOCOManager:
         remaining_positions: List[Dict[str, Any]] = []
         for pos in pf.get("positions", []):
             sym = str(pos.get("symbol", "")).upper()
+            if str(pos.get("state", "")).strip().upper() == "DUST_QUARANTINED":
+                remaining_positions.append(pos)
+                continue
             size = float(pos.get("size", 0) or 0)
             entry_price = float(pos.get("entry_price", 0) or 0)
             tp_price = float(pos.get("take_profit_price") or pos.get("tp_price") or 0)
@@ -1069,8 +1104,54 @@ class PseudoOCOManager:
             # 2) 利確スイッチ (TP Execution): 現在 Bid >= take_profit_price
             if tp_price > 0 and current_bid >= tp_price:
                 if sl_order_id:
-                    self.broker.cancel_order(sl_order_id)
+                    sl_already_executed = False
+                    sl_exec_price = sl_price
+                    try:
+                        cancel_res = self.broker.cancel_order(sl_order_id)
+                        if isinstance(cancel_res, dict) and str(cancel_res.get("status", "")).upper() == "EXECUTED":
+                            sl_already_executed = True
+                            sl_exec_price = float(
+                                cancel_res.get("executed_price") or cancel_res.get("price") or sl_price
+                            )
+                    except Exception:
+                        rechecked_sl = self.broker.get_orders([sl_order_id])
+                        if rechecked_sl and str(rechecked_sl[0].get("status", "")).upper() == "EXECUTED":
+                            sl_already_executed = True
+                            sl_exec_price = float(
+                                rechecked_sl[0].get("executed_price") or rechecked_sl[0].get("price") or sl_price
+                            )
 
+                    if sl_already_executed:
+                        close_reason = "BREAKEVEN_SL" if pos.get("breakeven_locked") else "SL"
+                        closed_record = self._record_closed_trade(
+                            pf=pf,
+                            pos=pos,
+                            exit_price=sl_exec_price,
+                            exit_order_id=sl_order_id,
+                            reason=close_reason,
+                            is_maker=False,
+                            now_jst=now_jst,
+                        )
+                        events.append(
+                            {
+                                "type": "SL_EXECUTED",
+                                "symbol": sym,
+                                "order_id": sl_order_id,
+                                "exit_price": sl_exec_price,
+                                "pnl_jpy": closed_record["pnl_jpy"],
+                                "reason": close_reason,
+                                "timestamp": now_jst.isoformat(timespec="seconds"),
+                            }
+                        )
+                        pf_changed = True
+                        continue
+
+                    pos["sl_order_id"] = ""
+                    pos["state"] = "UNPROTECTED_HOLD"
+                    pf_changed = True
+
+                tp_limit_oid = ""
+                extra_tp_oids: List[str] = []
                 tp_order = self.broker.place_order(
                     symbol=sym,
                     side="SELL",
@@ -1079,19 +1160,37 @@ class PseudoOCOManager:
                     price=tp_price,
                     time_in_force="FAS",
                 )
+                tp_limit_oid = str(tp_order.get("order_id", ""))
                 if str(tp_order.get("status", "")).upper() != "EXECUTED":
                     try:
-                        self.broker.cancel_order(tp_order["order_id"])
+                        self.broker.cancel_order(tp_limit_oid)
                     except Exception:
                         pass
-                    tp_order = self.broker.place_order(
-                        symbol=sym,
-                        side="SELL",
-                        execution_type="MARKET",
-                        size=size,
-                        time_in_force="FAK",
-                        cancel_before=True,
+                    rechecked_tp = self.broker.get_orders([tp_limit_oid]) if tp_limit_oid else []
+                    tp_exec_d = _to_decimal(
+                        (rechecked_tp[0].get("executed_size", tp_order.get("executed_size", 0)) if rechecked_tp else tp_order.get("executed_size", 0)) or 0
                     )
+                    rem_tp_d = max(Decimal("0"), _to_decimal(size) - tp_exec_d)
+                    if rem_tp_d >= _to_decimal(min_order_size):
+                        mkt_tp_order = self.broker.place_order(
+                            symbol=sym,
+                            side="SELL",
+                            execution_type="MARKET",
+                            size=float(rem_tp_d),
+                            time_in_force="FAK",
+                            cancel_before=True,
+                        )
+                        if tp_exec_d > Decimal("0") and tp_limit_oid:
+                            extra_tp_oids.append(tp_limit_oid)
+                            tp_limit_px_d = _to_decimal(tp_order.get("executed_price") or tp_order.get("price") or tp_price)
+                            mkt_px_d = _to_decimal(mkt_tp_order.get("executed_price") or mkt_tp_order.get("price") or current_bid or tp_price)
+                            mkt_exec_d = _to_decimal(mkt_tp_order.get("executed_size") or rem_tp_d)
+                            tot_tp_d = tp_exec_d + mkt_exec_d
+                            if tot_tp_d > Decimal("0"):
+                                mkt_tp_order["executed_price"] = float(
+                                    (tp_exec_d * tp_limit_px_d + mkt_exec_d * mkt_px_d) / tot_tp_d
+                                )
+                        tp_order = mkt_tp_order
 
                 exit_price = float(
                     tp_order.get("executed_price")
@@ -1099,7 +1198,10 @@ class PseudoOCOManager:
                     or current_bid
                     or tp_price
                 )
-                is_maker_tp = str(tp_order.get("execution_type", "LIMIT")).upper() == "LIMIT"
+                is_maker_tp = (
+                    str(tp_order.get("execution_type", "LIMIT")).upper() == "LIMIT"
+                    and not extra_tp_oids
+                )
                 closed_record = self._record_closed_trade(
                     pf=pf,
                     pos=pos,
@@ -1108,6 +1210,7 @@ class PseudoOCOManager:
                     reason="TP",
                     is_maker=is_maker_tp,
                     now_jst=now_jst,
+                    extra_order_ids=extra_tp_oids if extra_tp_oids else None,
                 )
                 events.append(
                     {
@@ -1168,12 +1271,53 @@ class PseudoOCOManager:
             if should_update_sl and float(target_sl_price) > float(sl_price) and current_bid > float(target_sl_price):
                 old_sl_id = sl_order_id
                 pos["state"] = "MODIFYING_STOP_INTENT"
-                new_sl_order_id = self._replace_or_change_stop_order(
-                    symbol=sym,
-                    old_sl_order_id=old_sl_id,
-                    size=size,
-                    new_sl_price=target_sl_price,
-                )
+                try:
+                    new_sl_order_id = self._replace_or_change_stop_order(
+                        symbol=sym,
+                        old_sl_order_id=old_sl_id,
+                        size=size,
+                        new_sl_price=target_sl_price,
+                    )
+                except _StopOrderAlreadyExecutedError as sl_exec_err:
+                    ord_info = sl_exec_err.order_info or {}
+                    sl_exec_price = float(
+                        ord_info.get("executed_price") or ord_info.get("price") or sl_price
+                    )
+                    close_reason = "BREAKEVEN_SL" if pos.get("breakeven_locked") else "SL"
+                    closed_record = self._record_closed_trade(
+                        pf=pf,
+                        pos=pos,
+                        exit_price=sl_exec_price,
+                        exit_order_id=old_sl_id,
+                        reason=close_reason,
+                        is_maker=False,
+                        now_jst=now_jst,
+                    )
+                    events.append(
+                        {
+                            "type": "SL_EXECUTED",
+                            "symbol": sym,
+                            "order_id": old_sl_id,
+                            "exit_price": sl_exec_price,
+                            "pnl_jpy": closed_record["pnl_jpy"],
+                            "reason": close_reason,
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+                    pf_changed = True
+                    continue
+                except Exception as exc:
+                    logger.error(
+                        "トレーリングSL更新中に例外が発生したため UNPROTECTED_HOLD として保存します (%s): %s",
+                        sym,
+                        exc,
+                    )
+                    pos["sl_order_id"] = ""
+                    pos["state"] = "UNPROTECTED_HOLD"
+                    pf_changed = True
+                    remaining_positions.append(pos)
+                    continue
+
                 pos["stop_loss_price"] = target_sl_price
                 pos["sl_price"] = target_sl_price
                 pos["sl_order_id"] = new_sl_order_id
@@ -1228,6 +1372,7 @@ class PseudoOCOManager:
         `capabilities.json` の `stop_change_order_supported` が `True` かつ PaperBroker でない場合は
         `change_order` を試行し、失敗時または `False`（既定）時は確実に
         `cancel_order(old_sl_order_id)` ➔ `place_order(STOP, new_sl_price)` で置き換える。
+        ※ 直前に取引所側で `old_sl_order_id` が既に `EXECUTED` となっていた場合は `_StopOrderAlreadyExecutedError` を送出する。
         """
         intent_id: Optional[str] = None
         if self.wal_db is not None:
@@ -1249,10 +1394,29 @@ class PseudoOCOManager:
                     self.wal_db.update_intent_state(intent_id, "COMMITTED", order_id=new_id)
                 return new_id
             except Exception as exc:
+                rechecked = self.broker.get_orders([old_sl_order_id])
+                if rechecked and str(rechecked[0].get("status", "")).upper() == "EXECUTED":
+                    if self.wal_db is not None and intent_id:
+                        self.wal_db.update_intent_state(intent_id, "REJECTED", order_id=old_sl_order_id)
+                    raise _StopOrderAlreadyExecutedError(old_sl_order_id, rechecked[0]) from exc
                 logger.info("STOP changeOrder 非対応または失敗のため cancel+place へフォールバックします: %s", exc)
 
         if old_sl_order_id:
-            self.broker.cancel_order(old_sl_order_id)
+            try:
+                cancel_res = self.broker.cancel_order(old_sl_order_id)
+                if isinstance(cancel_res, dict) and str(cancel_res.get("status", "")).upper() == "EXECUTED":
+                    if self.wal_db is not None and intent_id:
+                        self.wal_db.update_intent_state(intent_id, "REJECTED", order_id=old_sl_order_id)
+                    raise _StopOrderAlreadyExecutedError(old_sl_order_id, cancel_res)
+            except _StopOrderAlreadyExecutedError:
+                raise
+            except Exception as exc:
+                rechecked = self.broker.get_orders([old_sl_order_id])
+                if rechecked and str(rechecked[0].get("status", "")).upper() == "EXECUTED":
+                    if self.wal_db is not None and intent_id:
+                        self.wal_db.update_intent_state(intent_id, "REJECTED", order_id=old_sl_order_id)
+                    raise _StopOrderAlreadyExecutedError(old_sl_order_id, rechecked[0]) from exc
+                raise
 
         new_sl_order = self.broker.place_order(
             symbol=symbol,
@@ -1277,42 +1441,147 @@ class PseudoOCOManager:
         is_maker: bool,
     ) -> tuple[Decimal, Decimal, Decimal, Decimal, List[Dict[str, Any]]]:
         """
-        `get_latest_executions(symbol)` から対象注文ID群に一致する実約定リストを取得し、
+        `get_latest_executions(symbol)`（および必要に応じ `get_executions(order_id=...)`）から
+        対象注文ID群に一致する実約定リストを取得し、複数回部分約定（Multi-Fill）時も漏れなく合算して
         加重平均約定単価・実約定数量・約定代金・実手数料（または料率計算値）を返す。
         """
         sym = symbol.strip().upper()
         rule = self.symbol_rules.get(sym, {})
         default_fee_rate = _to_decimal(rule.get("maker_fee", "-0.0001") if is_maker else rule.get("taker_fee", "0.0005"))
-        target_ids = {str(oid).strip() for oid in order_ids if str(oid).strip() and str(oid).strip() != "ALREADY_FILLED_OR_DUST"}
-        matched: List[Dict[str, Any]] = []
-        if target_ids:
+        target_ids = [
+            str(oid).strip()
+            for oid in order_ids
+            if str(oid).strip() and str(oid).strip() != "ALREADY_FILLED_OR_DUST"
+        ]
+        target_id_set = set(target_ids)
+        matched_by_eid: Dict[str, Dict[str, Any]] = {}
+        matched_no_eid: List[Dict[str, Any]] = []
+
+        if target_id_set:
             try:
                 recent = self.broker.get_latest_executions(sym, count=100)
-                matched = [
-                    e for e in (recent or []) if str(e.get("order_id", "")).strip() in target_ids
-                ]
+                for e in recent or []:
+                    if str(e.get("order_id", "")).strip() in target_id_set:
+                        eid = str(e.get("execution_id", "")).strip()
+                        if eid:
+                            matched_by_eid[eid] = e
+                        else:
+                            matched_no_eid.append(e)
             except Exception:
-                matched = []
+                pass
 
+            curr_matched_sz = sum(
+                (_to_decimal(e.get("size", 0)) for e in list(matched_by_eid.values()) + matched_no_eid),
+                Decimal("0"),
+            )
+            if (fallback_size <= Decimal("0") or curr_matched_sz < fallback_size) and hasattr(self.broker, "get_executions"):
+                for oid in target_ids:
+                    try:
+                        by_oid = self.broker.get_executions(order_id=oid)
+                        for e in by_oid or []:
+                            eid = str(e.get("execution_id", "")).strip()
+                            if eid:
+                                matched_by_eid[eid] = e
+                            else:
+                                matched_no_eid.append(e)
+                    except Exception:
+                        pass
+
+        matched: List[Dict[str, Any]] = list(matched_by_eid.values()) + matched_no_eid
         if matched:
             exec_sz_d = sum((_to_decimal(e.get("size", 0)) for e in matched), Decimal("0"))
-            if exec_sz_d > Decimal("0") and (fallback_size <= Decimal("0") or exec_sz_d <= fallback_size):
-                notional_d = sum(
+            if exec_sz_d > Decimal("0"):
+                matched_notional_d = sum(
                     (_to_decimal(e.get("price", 0)) * _to_decimal(e.get("size", 0)) for e in matched),
                     Decimal("0"),
                 )
-                avg_px_d = notional_d / exec_sz_d
                 if any("fee" in e for e in matched):
-                    fee_d = sum((_to_decimal(e.get("fee", 0)) for e in matched), Decimal("0")).quantize(
-                        Decimal("0.01"), rounding=ROUND_HALF_UP
-                    )
+                    matched_fee_d = sum((_to_decimal(e.get("fee", 0)) for e in matched), Decimal("0"))
                 else:
-                    fee_d = (notional_d * default_fee_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                return avg_px_d, fallback_size if fallback_size > Decimal("0") else exec_sz_d, notional_d, fee_d, matched
+                    matched_fee_d = matched_notional_d * default_fee_rate
+
+                if fallback_size > exec_sz_d:
+                    # 一部のみ実約定明細が見つかり、残余数量がある場合は残余分を fallback_price で補完合算
+                    rem_sz_d = fallback_size - exec_sz_d
+                    rem_notional_d = fallback_price * rem_sz_d
+                    rem_fee_d = rem_notional_d * default_fee_rate
+                    tot_sz_d = fallback_size
+                    tot_notional_d = matched_notional_d + rem_notional_d
+                    tot_fee_d = (matched_fee_d + rem_fee_d).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                    avg_px_d = tot_notional_d / tot_sz_d
+                    return avg_px_d, tot_sz_d, tot_notional_d, tot_fee_d, matched
+
+                avg_px_d = matched_notional_d / exec_sz_d
+                fee_d = matched_fee_d.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                return avg_px_d, fallback_size if fallback_size > Decimal("0") else exec_sz_d, matched_notional_d, fee_d, matched
 
         notional_d = fallback_price * fallback_size
         fee_d = (notional_d * default_fee_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         return fallback_price, fallback_size, notional_d, fee_d, matched
+
+    def _record_executions_to_wal(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        primary_order_id: str,
+        all_order_ids: List[str],
+        total_size_d: Decimal,
+        avg_price_d: Decimal,
+        total_fee_d: Decimal,
+        matched_execs: List[Dict[str, Any]],
+        fallback_prefix: str,
+        now_jst: datetime,
+    ) -> None:
+        """
+        複数回部分約定（Multi-Fill）を含む全約定を SQLite `executions` テーブルへ漏れなく記録する。
+        1) `matched_execs` に含まれる各 `execution_id` を個別にべき等記録。
+        2) `get_executed_size_for_order` で記録済み約定数量合計を照合し、万一 `total_size_d` に満たない未記録残余分があれば
+           その差分数量 (`rem_sz_d`) を補完レコードとして確実に記録する。
+        """
+        if self.wal_db is None or not primary_order_id or primary_order_id == "ALREADY_FILLED_OR_DUST":
+            return
+
+        for ex in matched_execs or []:
+            eid = str(ex.get("execution_id", "")).strip()
+            ex_oid = str(ex.get("order_id", primary_order_id)).strip() or primary_order_id
+            if eid:
+                self.wal_db.record_execution_idempotent(
+                    execution_id=eid,
+                    order_id=ex_oid,
+                    symbol=symbol,
+                    side=side,
+                    price_str=format_decimal_plain(ex.get("price", avg_price_d)),
+                    size_str=format_decimal_plain(ex.get("size", total_size_d)),
+                    fee_jpy_str=format_decimal_plain(ex.get("fee", 0)),
+                    timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
+                )
+
+        check_oids = [oid for oid in (all_order_ids or [primary_order_id]) if oid and oid != "ALREADY_FILLED_OR_DUST"]
+        recorded_sz_d = sum(
+            (self.wal_db.get_executed_size_for_order(oid) for oid in check_oids),
+            Decimal("0"),
+        )
+        rem_sz_d = total_size_d - recorded_sz_d
+        if rem_sz_d > Decimal("0"):
+            ratio = (rem_sz_d / total_size_d) if total_size_d > Decimal("0") else Decimal("1")
+            rem_fee_d = (total_fee_d * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            rem_sat = int((rem_sz_d * Decimal("100000000")).to_integral_value(rounding=ROUND_HALF_UP))
+            exec_id = (
+                f"{fallback_prefix}_{primary_order_id}"
+                if recorded_sz_d == Decimal("0")
+                else f"{fallback_prefix}_{primary_order_id}_rem_{rem_sat}"
+            )
+            self.wal_db.record_execution_idempotent(
+                execution_id=exec_id,
+                order_id=primary_order_id,
+                symbol=symbol,
+                side=side,
+                price_str=format_decimal_plain(avg_price_d),
+                size_str=format_decimal_plain(rem_sz_d),
+                fee_jpy_str=format_decimal_plain(rem_fee_d),
+                timestamp_str=now_jst.isoformat(timespec="seconds"),
+            )
 
     def _activate_position_with_sl(
         self,
@@ -1388,31 +1657,18 @@ class PseudoOCOManager:
                     executed_size=size_d,
                     now_ts_ms=ts_ms,
                 )
-                if matched_execs:
-                    for ex in matched_execs:
-                        eid = str(ex.get("execution_id", "")).strip()
-                        if eid:
-                            self.wal_db.record_execution_idempotent(
-                                execution_id=eid,
-                                order_id=buy_oid,
-                                symbol=sym,
-                                side="BUY",
-                                price_str=format_decimal_plain(ex.get("price", price_d)),
-                                size_str=format_decimal_plain(ex.get("size", size_d)),
-                                fee_jpy_str=format_decimal_plain(ex.get("fee", entry_fee_d)),
-                                timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
-                            )
-                elif not self.wal_db.has_execution_for_order(buy_oid):
-                    self.wal_db.record_execution_idempotent(
-                        execution_id=f"exec_buy_{buy_oid}",
-                        order_id=buy_oid,
-                        symbol=sym,
-                        side="BUY",
-                        price_str=format_decimal_plain(price_d),
-                        size_str=format_decimal_plain(size_d),
-                        fee_jpy_str=format_decimal_plain(entry_fee_d),
-                        timestamp_str=now_jst.isoformat(timespec="seconds"),
-                    )
+                self._record_executions_to_wal(
+                    symbol=sym,
+                    side="BUY",
+                    primary_order_id=buy_oid,
+                    all_order_ids=[buy_oid],
+                    total_size_d=size_d,
+                    avg_price_d=price_d,
+                    total_fee_d=entry_fee_d,
+                    matched_execs=matched_execs,
+                    fallback_prefix="exec_buy",
+                    now_jst=now_jst,
+                )
             if pos_entry["sl_order_id"]:
                 self.wal_db.upsert_order(
                     order_id=pos_entry["sl_order_id"],
@@ -1504,31 +1760,18 @@ class PseudoOCOManager:
                     executed_size=size_d,
                     now_ts_ms=ts_ms,
                 )
-                if matched_execs:
-                    for ex in matched_execs:
-                        eid = str(ex.get("execution_id", "")).strip()
-                        if eid:
-                            self.wal_db.record_execution_idempotent(
-                                execution_id=eid,
-                                order_id=oid,
-                                symbol=sym,
-                                side="BUY",
-                                price_str=format_decimal_plain(ex.get("price", price_d)),
-                                size_str=format_decimal_plain(ex.get("size", size_d)),
-                                fee_jpy_str=format_decimal_plain(ex.get("fee", entry_fee_d)),
-                                timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
-                            )
-                elif not self.wal_db.has_execution_for_order(oid):
-                    self.wal_db.record_execution_idempotent(
-                        execution_id=f"exec_buy_dust_{oid}",
-                        order_id=oid,
-                        symbol=sym,
-                        side="BUY",
-                        price_str=format_decimal_plain(price_d),
-                        size_str=format_decimal_plain(size_d),
-                        fee_jpy_str=format_decimal_plain(entry_fee_d),
-                        timestamp_str=now_jst.isoformat(timespec="seconds"),
-                    )
+                self._record_executions_to_wal(
+                    symbol=sym,
+                    side="BUY",
+                    primary_order_id=oid,
+                    all_order_ids=[oid],
+                    total_size_d=size_d,
+                    avg_price_d=price_d,
+                    total_fee_d=entry_fee_d,
+                    matched_execs=matched_execs,
+                    fallback_prefix="exec_buy_dust",
+                    now_jst=now_jst,
+                )
             self.wal_db.quarantine_dust_position(sym, float(size_d), float(price_d))
 
         return {
@@ -1615,31 +1858,18 @@ class PseudoOCOManager:
                     executed_size=size_d,
                     now_ts_ms=ts_ms,
                 )
-            if matched_execs:
-                for ex in matched_execs:
-                    eid = str(ex.get("execution_id", "")).strip()
-                    if eid:
-                        self.wal_db.record_execution_idempotent(
-                            execution_id=eid,
-                            order_id=str(ex.get("order_id", e_oid)),
-                            symbol=sym,
-                            side="SELL",
-                            price_str=format_decimal_plain(ex.get("price", exit_d)),
-                            size_str=format_decimal_plain(ex.get("size", size_d)),
-                            fee_jpy_str=format_decimal_plain(ex.get("fee", exit_fee_d)),
-                            timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
-                        )
-            elif not any(self.wal_db.has_execution_for_order(oid) for oid in (all_exit_oids or [e_oid])):
-                self.wal_db.record_execution_idempotent(
-                    execution_id=f"exec_sell_{e_oid}",
-                    order_id=e_oid,
-                    symbol=sym,
-                    side="SELL",
-                    price_str=format_decimal_plain(exit_d),
-                    size_str=format_decimal_plain(size_d),
-                    fee_jpy_str=format_decimal_plain(exit_fee_d),
-                    timestamp_str=now_jst.isoformat(timespec="seconds"),
-                )
+            self._record_executions_to_wal(
+                symbol=sym,
+                side="SELL",
+                primary_order_id=e_oid,
+                all_order_ids=all_exit_oids or [e_oid],
+                total_size_d=size_d,
+                avg_price_d=exit_d,
+                total_fee_d=exit_fee_d,
+                matched_execs=matched_execs,
+                fallback_prefix="exec_sell",
+                now_jst=now_jst,
+            )
             self.wal_db.upsert_position(
                 symbol=sym,
                 state="CLOSED",
@@ -1670,8 +1900,10 @@ class PseudoOCOManager:
             sym = symbol.strip().upper()
             pf = self.load_portfolio()
 
-            for pos in pf.get("positions", []):
+            for idx, pos in enumerate(list(pf.get("positions", []))):
                 if str(pos.get("symbol", "")).upper() != sym:
+                    continue
+                if str(pos.get("state", "")).strip().upper() == "DUST_QUARANTINED":
                     continue
                 old_sl_id = str(pos.get("sl_order_id", "") or "")
                 old_sl = float(pos.get("stop_loss_price", 0) or 0)
@@ -1680,12 +1912,31 @@ class PseudoOCOManager:
                 # SL 引き下げは 100% 拒絶
                 effective_sl = max(float(new_sl), old_sl) if old_sl > 0 else float(new_sl)
                 if effective_sl > 0 and abs(effective_sl - old_sl) > 1e-9:
-                    new_sl_id = self._replace_or_change_stop_order(
-                        symbol=sym,
-                        old_sl_order_id=old_sl_id,
-                        size=size,
-                        new_sl_price=effective_sl,
-                    )
+                    try:
+                        new_sl_id = self._replace_or_change_stop_order(
+                            symbol=sym,
+                            old_sl_order_id=old_sl_id,
+                            size=size,
+                            new_sl_price=effective_sl,
+                        )
+                    except _StopOrderAlreadyExecutedError as sl_exec_err:
+                        ord_info = sl_exec_err.order_info or {}
+                        sl_exec_price = float(
+                            ord_info.get("executed_price") or ord_info.get("price") or old_sl
+                        )
+                        pf["positions"].pop(idx)
+                        close_reason = "BREAKEVEN_SL" if pos.get("breakeven_locked") else "SL"
+                        closed = self._record_closed_trade(
+                            pf=pf,
+                            pos=pos,
+                            exit_price=sl_exec_price,
+                            exit_order_id=old_sl_id,
+                            reason=close_reason,
+                            is_maker=False,
+                            now_jst=now_jst,
+                        )
+                        self.save_portfolio(pf, now_dt=now_jst)
+                        return closed
                     pos["sl_order_id"] = new_sl_id
                     pos["stop_loss_price"] = effective_sl
                     pos["sl_price"] = effective_sl
@@ -1714,9 +1965,12 @@ class PseudoOCOManager:
             target_idx: Optional[int] = None
 
             for idx, pos in enumerate(pf.get("positions", [])):
-                if str(pos.get("symbol", "")).upper() == sym:
-                    target_idx = idx
-                    break
+                if str(pos.get("symbol", "")).upper() != sym:
+                    continue
+                if str(pos.get("state", "")).strip().upper() == "DUST_QUARANTINED":
+                    continue
+                target_idx = idx
+                break
 
             if target_idx is None:
                 return None

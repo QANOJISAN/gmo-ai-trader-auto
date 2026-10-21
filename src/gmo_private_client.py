@@ -500,7 +500,30 @@ class GMOPrivateClient:
     def get_trading_volume(self) -> Dict[str, Any]:
         """取引高・手数料率情報を取得する (`GET /private/v1/account/tradingVolume`, Priority 4)"""
         data = self._request("GET", "/private/v1/account/tradingVolume", priority=4)
-        return data if isinstance(data, dict) else {}
+        if not isinstance(data, dict):
+            return {"jpyVolume": "0", "jpy_volume": "0", "tierLevel": 1, "tier_level": 1, "limit": []}
+        out = dict(data)
+        jpy_vol = str(out.get("jpyVolume", out.get("jpy_volume", "0")))
+        tier_lvl = int(out.get("tierLevel", out.get("tier_level", 1)) or 1)
+        out["jpyVolume"] = jpy_vol
+        out["jpy_volume"] = jpy_vol
+        out["tierLevel"] = tier_lvl
+        out["tier_level"] = tier_lvl
+        raw_limits = out.get("limit", [])
+        norm_limits: List[Dict[str, Any]] = []
+        if isinstance(raw_limits, list):
+            for lim in raw_limits:
+                if isinstance(lim, dict):
+                    item = dict(lim)
+                    mf = str(item.get("makerFee", item.get("maker_fee", "0")))
+                    tf = str(item.get("takerFee", item.get("taker_fee", "0")))
+                    item["makerFee"] = mf
+                    item["maker_fee"] = mf
+                    item["takerFee"] = tf
+                    item["taker_fee"] = tf
+                    norm_limits.append(item)
+        out["limit"] = norm_limits
+        return out
 
     def create_ws_auth_token(self) -> str:
         """Private WebSocket 認証トークンを新規発行する (`POST /private/v1/ws-auth`, Priority 3)"""
@@ -594,21 +617,26 @@ class GMOPrivateClient:
         return results
 
     def get_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> List[Dict[str, Any]]:
-        """注文ID指定で注文情報を取得する (`GET /private/v1/orders`, Priority 3)"""
+        """注文ID指定で注文情報を取得する (`GET /private/v1/orders`, Priority 3, 10件ずつチャンク処理)"""
         if isinstance(order_ids, (str, int)):
-            id_list = [str(order_ids)]
+            id_list = [str(order_ids)] if str(order_ids).strip() else []
         else:
             id_list = [str(x) for x in order_ids if str(x).strip()]
         if not id_list:
             return []
-        data = self._request(
-            "GET",
-            "/private/v1/orders",
-            params={"orderId": ",".join(id_list[:10])},
-            priority=3,
-        )
-        raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        return [self._normalize_order_dict(item) for item in raw_list]
+        results: List[Dict[str, Any]] = []
+        for idx in range(0, len(id_list), 10):
+            chunk = id_list[idx : idx + 10]
+            data = self._request(
+                "GET",
+                "/private/v1/orders",
+                params={"orderId": ",".join(chunk)},
+                priority=3,
+            )
+            raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for item in raw_list:
+                results.append(self._normalize_order_dict(item))
+        return results
 
     def change_order(
         self,
@@ -625,31 +653,44 @@ class GMOPrivateClient:
         if losscut_price is not None and _to_decimal(losscut_price) > 0:
             body["losscutPrice"] = format_decimal_plain(losscut_price)
         self._request("POST", "/private/v1/changeOrder", body=body, priority=2)
+        oid_str = str(order_id)
         return {
-            "order_id": str(order_id),
+            "order_id": oid_str,
+            "orderId": oid_str,
             "price": float(_to_decimal(price)),
             "status": "CHANGED",
             "order_status": "ORDERED",
+            "orderStatus": "ORDERED",
         }
 
     def cancel_order(self, order_id: Union[str, int], now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """単一注文をキャンセルする (`POST /private/v1/cancelOrder`, Priority 2)"""
         oid = int(order_id) if str(order_id).isdigit() else order_id
         self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid}, priority=2)
-        return {"order_id": str(order_id), "status": "CANCELED"}
+        oid_str = str(order_id)
+        return {"order_id": oid_str, "orderId": oid_str, "status": "CANCELED", "orderStatus": "CANCELED"}
 
     def cancel_orders(self, order_ids: List[Union[str, int]]) -> Dict[str, Any]:
         """複数注文（最大10件ずつ）を一括キャンセルする (`POST /private/v1/cancelOrders`, Priority 2)"""
         normalized_ids = [int(x) if str(x).isdigit() else x for x in order_ids if str(x).strip()]
         if not normalized_ids:
             return {"success": [], "failed": []}
-        data = self._request(
-            "POST",
-            "/private/v1/cancelOrders",
-            body={"orderIds": normalized_ids[:10]},
-            priority=2,
-        )
-        return data if isinstance(data, dict) else {"success": normalized_ids[:10], "failed": []}
+        all_success: List[Any] = []
+        all_failed: List[Any] = []
+        for idx in range(0, len(normalized_ids), 10):
+            chunk = normalized_ids[idx : idx + 10]
+            data = self._request(
+                "POST",
+                "/private/v1/cancelOrders",
+                body={"orderIds": chunk},
+                priority=2,
+            )
+            if isinstance(data, dict):
+                all_success.extend(data.get("success", []))
+                all_failed.extend(data.get("failed", []))
+            else:
+                all_success.extend(chunk)
+        return {"success": all_success, "failed": all_failed}
 
     def cancel_bulk_order(
         self,
@@ -689,22 +730,29 @@ class GMOPrivateClient:
             priority=3,
         )
         raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-        out: List[Dict[str, Any]] = []
-        for item in raw_list:
-            out.append(
-                {
-                    "execution_id": str(item.get("executionId", item.get("execution_id", ""))),
-                    "order_id": str(item.get("orderId", item.get("order_id", ""))),
-                    "symbol": str(item.get("symbol", sym_up)).upper(),
-                    "side": str(item.get("side", "")).upper(),
-                    "execution_type": str(item.get("executionType", item.get("execution_type", ""))).upper(),
-                    "size": float(item.get("size", 0) or 0),
-                    "price": float(item.get("price", 0) or 0),
-                    "fee": float(item.get("fee", 0) or 0),
-                    "timestamp": str(item.get("timestamp", "")),
-                }
-            )
-        return out
+        return [self._normalize_execution_dict(item, default_symbol=sym_up) for item in raw_list]
+
+    def get_executions(
+        self,
+        order_id: Optional[Union[str, int]] = None,
+        execution_id: Optional[Union[str, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """注文IDまたは約定ID指定で約定情報を取得する (`GET /private/v1/executions`, Priority 3)"""
+        params: Dict[str, Any] = {}
+        if order_id is not None and str(order_id).strip():
+            params["orderId"] = str(order_id).strip()
+        if execution_id is not None and str(execution_id).strip():
+            params["executionId"] = str(execution_id).strip()
+        if not params:
+            return []
+        data = self._request(
+            "GET",
+            "/private/v1/executions",
+            params=params,
+            priority=3,
+        )
+        raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        return [self._normalize_execution_dict(item) for item in raw_list]
 
     def place_order(
         self,
@@ -939,23 +987,81 @@ class GMOPrivateClient:
 
     @staticmethod
     def _normalize_order_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
+        oid = str(raw.get("orderId", raw.get("order_id", "")))
+        sym = str(raw.get("symbol", "")).upper()
+        side = str(raw.get("side", "")).upper()
+        exec_type = str(raw.get("executionType", raw.get("execution_type", ""))).upper()
+        tif = str(raw.get("timeInForce", raw.get("time_in_force", ""))).upper()
+        price_f = float(raw.get("price", 0) or 0)
+        losscut_f = float(raw.get("losscutPrice", raw.get("losscut_price", 0)) or 0)
         size_f = float(raw.get("size", 0) or 0)
         exec_f = float(raw.get("executedSize", raw.get("executed_size", 0)) or 0)
-        return {
-            "order_id": str(raw.get("orderId", raw.get("order_id", ""))),
-            "symbol": str(raw.get("symbol", "")).upper(),
-            "side": str(raw.get("side", "")).upper(),
-            "execution_type": str(raw.get("executionType", raw.get("execution_type", ""))).upper(),
-            "time_in_force": str(raw.get("timeInForce", raw.get("time_in_force", ""))).upper(),
-            "price": float(raw.get("price", 0) or 0),
-            "losscut_price": float(raw.get("losscutPrice", raw.get("losscut_price", 0)) or 0),
-            "size": size_f,
-            "executed_size": exec_f,
-            "remaining_size": max(0.0, round(size_f - exec_f, 8)),
-            "status": str(raw.get("status", "WAITING")).upper(),
-            "cancel_type": str(raw.get("cancelType", raw.get("cancel_type", ""))),
-            "timestamp": str(raw.get("timestamp", "")),
-        }
+        rem_f = max(0.0, round(size_f - exec_f, 8))
+        status_val = str(raw.get("status", raw.get("orderStatus", raw.get("order_status", "WAITING")))).upper()
+        cancel_t = str(raw.get("cancelType", raw.get("cancel_type", "")))
+        ts_val = str(raw.get("timestamp", raw.get("orderTimestamp", raw.get("created_at", ""))))
+        out = dict(raw)
+        out.update(
+            {
+                "order_id": oid,
+                "orderId": oid,
+                "symbol": sym,
+                "side": side,
+                "execution_type": exec_type,
+                "executionType": exec_type,
+                "time_in_force": tif,
+                "timeInForce": tif,
+                "price": price_f,
+                "losscut_price": losscut_f,
+                "losscutPrice": losscut_f,
+                "size": size_f,
+                "executed_size": exec_f,
+                "executedSize": exec_f,
+                "remaining_size": rem_f,
+                "status": status_val,
+                "order_status": status_val,
+                "orderStatus": status_val,
+                "cancel_type": cancel_t,
+                "cancelType": cancel_t,
+                "timestamp": ts_val,
+                "orderTimestamp": ts_val,
+            }
+        )
+        return out
+
+    @staticmethod
+    def _normalize_execution_dict(raw: Dict[str, Any], default_symbol: str = "") -> Dict[str, Any]:
+        eid = str(raw.get("executionId", raw.get("execution_id", "")))
+        oid = str(raw.get("orderId", raw.get("order_id", "")))
+        sym = str(raw.get("symbol", default_symbol)).upper()
+        side = str(raw.get("side", "")).upper()
+        exec_type = str(raw.get("executionType", raw.get("execution_type", ""))).upper()
+        size_f = float(raw.get("size", 0) or 0)
+        price_f = float(raw.get("price", 0) or 0)
+        fee_f = float(raw.get("fee", 0) or 0)
+        loss_gain_f = float(raw.get("lossGain", raw.get("loss_gain", 0)) or 0)
+        ts_val = str(raw.get("timestamp", raw.get("executionTimestamp", "")))
+        out = dict(raw)
+        out.update(
+            {
+                "execution_id": eid,
+                "executionId": eid,
+                "order_id": oid,
+                "orderId": oid,
+                "symbol": sym,
+                "side": side,
+                "execution_type": exec_type,
+                "executionType": exec_type,
+                "size": size_f,
+                "price": price_f,
+                "fee": fee_f,
+                "loss_gain": loss_gain_f,
+                "lossGain": loss_gain_f,
+                "timestamp": ts_val,
+                "executionTimestamp": ts_val,
+            }
+        )
+        return out
 
 
 class PaperBroker:
@@ -1089,17 +1195,32 @@ class PaperBroker:
             }
         ]
 
-        spot_totals: Dict[str, Decimal] = {}
+        active_spot_totals: Dict[str, Decimal] = {}
+        dust_in_positions: Dict[str, Decimal] = {}
         for pos in portfolio.get("positions", []) or []:
             sym = str(pos.get("symbol", "")).upper()
             sz = _to_decimal(pos.get("size", 0))
             if sym and sz > 0:
-                spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
+                if str(pos.get("state", "PROTECTED")).upper() == "DUST_QUARANTINED":
+                    dust_in_positions[sym] = dust_in_positions.get(sym, Decimal("0")) + sz
+                else:
+                    active_spot_totals[sym] = active_spot_totals.get(sym, Decimal("0")) + sz
+
+        dust_spot_totals: Dict[str, Decimal] = {}
         for dust in portfolio.get("quarantined_dust", []) or []:
             sym = str(dust.get("symbol", "")).upper()
             sz = _to_decimal(dust.get("size", 0))
-            if sym and sz > 0 and sym not in spot_totals:
-                spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
+            if sym and sz > 0:
+                dust_spot_totals[sym] = dust_spot_totals.get(sym, Decimal("0")) + sz
+        for sym, d_sz in dust_in_positions.items():
+            if sym not in dust_spot_totals:
+                dust_spot_totals[sym] = d_sz
+
+        spot_totals: Dict[str, Decimal] = {}
+        for sym, sz in active_spot_totals.items():
+            spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
+        for sym, sz in dust_spot_totals.items():
+            spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + sz
         for sym, p_sz in partial_buy_spot.items():
             if sym and p_sz > 0:
                 spot_totals[sym] = spot_totals.get(sym, Decimal("0")) + p_sz
@@ -1119,7 +1240,7 @@ class PaperBroker:
         return assets
 
     def get_trading_volume(self) -> Dict[str, Any]:
-        return {"jpyVolume": "0", "tierLevel": 1, "limit": []}
+        return {"jpyVolume": "0", "jpy_volume": "0", "tierLevel": 1, "tier_level": 1, "limit": []}
 
     def create_ws_auth_token(self) -> str:
         return "paper-ws-token-001"
@@ -1557,7 +1678,7 @@ class PaperBroker:
                 continue
             if sym_filter and str(o.get("symbol", "")).upper() != sym_filter:
                 continue
-            out.append(dict(o))
+            out.append(GMOPrivateClient._normalize_order_dict(o))
         return out[:count]
 
     def get_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> List[Dict[str, Any]]:
@@ -1568,7 +1689,11 @@ class PaperBroker:
         if not id_set:
             return []
         state = self._ensure_state_file()
-        return [dict(o) for o in state.get("orders", []) if str(o.get("order_id", "")) in id_set]
+        return [
+            GMOPrivateClient._normalize_order_dict(o)
+            for o in state.get("orders", [])
+            if str(o.get("order_id", "")) in id_set
+        ]
 
     def cancel_order(self, order_id: Union[str, int], now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         oid = str(order_id)
@@ -1581,13 +1706,13 @@ class PaperBroker:
                     o["remaining_size"] = 0.0
                     o["canceled_at"] = now_str
                     self._save_state(state)
-                return dict(o)
+                return GMOPrivateClient._normalize_order_dict(o)
         raise GMOPrivateAPIError(f"[PaperBroker] 指定された注文IDが見つかりません: {oid}")
 
     def cancel_orders(self, order_ids: List[Union[str, int]]) -> Dict[str, Any]:
         success = []
         failed = []
-        for oid in order_ids[:10]:
+        for oid in order_ids:
             try:
                 self.cancel_order(oid)
                 success.append(str(oid))
@@ -1637,9 +1762,32 @@ class PaperBroker:
             raise ValueError("get_latest_executions には有効な symbol 指定が必須です。")
         sym = symbol.strip().upper()
         state = self._ensure_state_file()
-        execs = [dict(e) for e in state.get("executions", []) if str(e.get("symbol", "")).upper() == sym]
+        execs = [
+            GMOPrivateClient._normalize_execution_dict(e, default_symbol=sym)
+            for e in state.get("executions", [])
+            if str(e.get("symbol", "")).upper() == sym
+        ]
         execs.reverse()
         return execs[:count]
+
+    def get_executions(
+        self,
+        order_id: Optional[Union[str, int]] = None,
+        execution_id: Optional[Union[str, int]] = None,
+    ) -> List[Dict[str, Any]]:
+        oid_filter = str(order_id).strip() if order_id is not None and str(order_id).strip() else None
+        eid_filter = str(execution_id).strip() if execution_id is not None and str(execution_id).strip() else None
+        if not oid_filter and not eid_filter:
+            return []
+        state = self._ensure_state_file()
+        out: List[Dict[str, Any]] = []
+        for e in state.get("executions", []):
+            if oid_filter and str(e.get("order_id", e.get("orderId", ""))) != oid_filter:
+                continue
+            if eid_filter and str(e.get("execution_id", e.get("executionId", ""))) != eid_filter:
+                continue
+            out.append(GMOPrivateClient._normalize_execution_dict(e))
+        return out
 
 
 def create_broker_client(

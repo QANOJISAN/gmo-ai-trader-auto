@@ -1914,6 +1914,341 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
 
             daemon.shutdown()
 
+    def test_round5_multi_fill_and_concurrency_convergence_audit(self) -> None:
+        """
+        Round 5 徹底総合監査:
+        1. [R5-01] 複数回部分約定 (Multi-Fill: 40% + 60%) 時の `get_executed_size_for_order` と未記録残余分の完全補完記録
+        2. [R5-02] デーモン稼働中の `--remote-cmd` SQLite `control_commands` キューイング & `cancel_pending_entries_only` 例外耐性
+        3. [R5-03] `GMOPrivateClient` / `PaperBroker` の `snake_case` & `camelCase` 両対応正規化と `get_executions` パリティ
+        4. [R5-04] TP発動・トレーリング更新直前に既存 `STOP` が取引所で約定した競合 (Race Condition) の自動検知・二重売却防止
+        5. [R5-05] 同一銘柄における `DUST_QUARANTINED` 端数と新規有効ポジションの共存時の 3-Way Reconciler / PaperBroker 整合性
+        """
+        from decimal import Decimal
+        from src.gmo_private_client import GMOPrivateClient
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            t0 = datetime(2026, 10, 22, 12, 0, 0, tzinfo=JST)
+
+            # ------------------------------------------------------------------
+            # 1. R5-01: Multi-Fill (40 XRP + 60 XRP = 100 XRP) の約定記録と残余補完
+            # ------------------------------------------------------------------
+            buy_res = daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "XRP",
+                    "limit_price": 80.0,
+                    "size": 100,
+                    "take_profit_price": 86.0,
+                    "stop_loss_price": 78.5,
+                    "expected_loss_jpy": 150,
+                },
+                tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                now_dt=t0,
+            )
+            xrp_oid = buy_res["pending_order"]["order_id"]
+
+            # 1回目の部分約定 (40 XRP) を simulate_partial_fill で発生させ、その後 60 XRP が追加約定して計 100 XRP になったケース
+            daemon.broker.simulate_partial_fill(
+                xrp_oid,
+                filled_size=40.0,
+                fill_price=80.0,
+                now_dt=t0 + timedelta(seconds=5),
+            )
+            self.assertEqual(daemon.db_wal.get_executed_size_for_order(xrp_oid), Decimal("40"))
+
+            # もし2回目の約定明細 (60 XRP) が executions API から欠落し、get_orders の executed_size=100 のみで検知された場合でも、
+            # _record_executions_to_wal が未記録残余 (100 - 40 = 60 XRP) を自動補完して合計 100 XRP になることを検証
+            state_ex_m = daemon.broker._ensure_state_file()
+            for o in state_ex_m["orders"]:
+                if str(o.get("order_id")) == str(xrp_oid):
+                    o["executed_size"] = 100.0
+                    o["remaining_size"] = 0.0
+                    o["status"] = "EXECUTED"
+            daemon.broker._save_state(state_ex_m)
+
+            daemon.run_fast_cycle(
+                tickers={"XRP": {"ask": 79.9, "bid": 79.8, "last": 79.9}},
+                now_dt=t0 + timedelta(seconds=15),
+            )
+            # 40 XRP だけでスキップされず、未記録だった残余 60 XRP が補完記録されて合計 100 XRP になっていること
+            self.assertEqual(daemon.db_wal.get_executed_size_for_order(xrp_oid), Decimal("100"))
+
+            # 一旦 XRP を AI_SELL で決済
+            daemon.oco_manager.close_position_immediately("XRP", reason="TEST_CLEANUP", now_dt=t0 + timedelta(seconds=30))
+
+            # ------------------------------------------------------------------
+            # 2. R5-03: camelCase / snake_case 両対応正規化 & get_executions パリティ
+            # ------------------------------------------------------------------
+            execs_by_oid = daemon.broker.get_executions(order_id=xrp_oid)
+            self.assertGreaterEqual(len(execs_by_oid), 1)
+            ex0 = execs_by_oid[0]
+            self.assertEqual(str(ex0.get("order_id")), str(xrp_oid))
+            self.assertEqual(str(ex0.get("orderId")), str(xrp_oid))
+            self.assertIn("execution_id", ex0)
+            self.assertIn("executionId", ex0)
+
+            norm_ord = GMOPrivateClient._normalize_order_dict(
+                {
+                    "orderId": 99901,
+                    "symbol": "BCH",
+                    "side": "BUY",
+                    "executionType": "LIMIT",
+                    "settleType": "OPEN",
+                    "size": "0.095",
+                    "executedSize": "0.040",
+                    "price": "43880",
+                    "losscutPrice": "0",
+                    "status": "ORDERED",
+                    "timeInForce": "SOK",
+                    "timestamp": "2026-10-22T03:00:00.000Z",
+                }
+            )
+            self.assertEqual(norm_ord["order_id"], "99901")
+            self.assertEqual(norm_ord["orderId"], "99901")
+            self.assertEqual(norm_ord["execution_type"], "LIMIT")
+            self.assertEqual(norm_ord["executionType"], "LIMIT")
+            self.assertAlmostEqual(float(norm_ord["executed_size"]), 0.04, places=4)
+            self.assertAlmostEqual(float(norm_ord["executedSize"]), 0.04, places=4)
+            self.assertEqual(norm_ord["orderStatus"], "ORDERED")
+
+            vol_info = daemon.broker.get_trading_volume()
+            self.assertIn("jpyVolume", vol_info)
+            self.assertIn("jpy_volume", vol_info)
+            self.assertIn("tierLevel", vol_info)
+            self.assertIn("tier_level", vol_info)
+
+            # ------------------------------------------------------------------
+            # 3. R5-02: デーモン稼働中の CLI コマンド SQLite キューイング & cancel_pending_entries_only 例外耐性
+            # ------------------------------------------------------------------
+            daemon.instance_lock.acquire()
+            try:
+                from src.circuit_breaker import SingleInstanceLock
+
+                probe_lock = SingleInstanceLock(daemon.instance_lock.lock_path)
+                self.assertTrue(probe_lock.is_locked_by_another_process())
+
+                cli_rc = RemoteControlManager(oco_manager=daemon.oco_manager, db_wal=daemon.db_wal)
+                enq_pause = cli_rc.enqueue_or_execute_command(
+                    "PAUSE",
+                    is_daemon_running=True,
+                    now_dt=t0 + timedelta(minutes=1),
+                )
+                self.assertEqual(enq_pause["status"], "QUEUED_FOR_DAEMON")
+                # デーモンの次サイクルで PAUSE が消化・反映されること
+                daemon.run_fast_cycle(
+                    tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                    now_dt=t0 + timedelta(minutes=1, seconds=5),
+                )
+                self.assertTrue(daemon.remote_control.is_paused)
+
+                # FLATTEN_ALL の 2段階承認も is_daemon_running=True でキュー経由実行できること
+                req_f = cli_rc.enqueue_or_execute_command(
+                    "FLATTEN_ALL",
+                    is_daemon_running=True,
+                    now_dt=t0 + timedelta(minutes=1, seconds=10),
+                )
+                self.assertEqual(req_f["status"], "AWAITING_CONFIRMATION")
+                enq_conf = cli_rc.enqueue_or_execute_command(
+                    f"FLATTEN_CONFIRM {req_f['nonce']}",
+                    is_daemon_running=True,
+                    now_dt=t0 + timedelta(minutes=1, seconds=15),
+                )
+                self.assertEqual(enq_conf["status"], "QUEUED_FOR_DAEMON")
+                daemon.run_fast_cycle(
+                    tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                    now_dt=t0 + timedelta(minutes=1, seconds=20),
+                )
+                # RESUME で再開
+                cli_rc.enqueue_or_execute_command(
+                    "RESUME",
+                    is_daemon_running=True,
+                    now_dt=t0 + timedelta(minutes=1, seconds=25),
+                )
+                daemon.run_fast_cycle(
+                    tickers={"XRP": {"ask": 81.0, "bid": 80.5, "last": 80.8}},
+                    now_dt=t0 + timedelta(minutes=1, seconds=30),
+                )
+                self.assertFalse(daemon.remote_control.is_paused)
+            finally:
+                daemon.instance_lock.release()
+
+            # cancel_pending_entries_only で部分約定注文の SL 発注が一時エラーになっても UNPROTECTED_HOLD が保存され、
+            # 次サイクルの Fast Recovery ガーディアンで SL が確実に再設置されること
+            ltc_res = daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "LTC",
+                    "limit_price": 12000.0,
+                    "size": 0.2,
+                    "take_profit_price": 12800.0,
+                    "stop_loss_price": 11600.0,
+                    "expected_loss_jpy": 80,
+                },
+                tickers={"LTC": {"ask": 12100.0, "bid": 12050.0, "last": 12080.0}},
+                now_dt=t0 + timedelta(minutes=1, seconds=35),
+            )
+            ltc_oid = ltc_res["pending_order"]["order_id"]
+            daemon.broker.simulate_partial_fill(
+                ltc_oid,
+                filled_size=0.1,
+                fill_price=12000.0,
+                now_dt=t0 + timedelta(minutes=1, seconds=40),
+            )
+            orig_place_order = daemon.broker.place_order
+
+            def _fail_stop_once(*args, **kwargs):
+                if str(kwargs.get("execution_type", "")).upper() == "STOP":
+                    raise GMOPrivateAPIError("Transient STOP placement failure")
+                return orig_place_order(*args, **kwargs)
+
+            daemon.broker.place_order = _fail_stop_once
+            try:
+                can_res = daemon.remote_control.cancel_pending_entries_only(
+                    now_dt=t0 + timedelta(minutes=1, seconds=45),
+                )
+                self.assertIn(ltc_oid, can_res["canceled_buy_order_ids"])
+            finally:
+                daemon.broker.place_order = orig_place_order
+
+            pf_ltc = daemon.oco_manager.load_portfolio()
+            ltc_pos = [p for p in pf_ltc["positions"] if p["symbol"] == "LTC"]
+            self.assertEqual(len(ltc_pos), 1)
+            self.assertEqual(ltc_pos[0]["state"], "UNPROTECTED_HOLD")
+
+            # Fast Recovery ガーディアンが直ちに STOP 注文を復旧して SL_ACTIVE に戻すこと
+            rec_ev = daemon.oco_manager.run_fast_recovery_guardian(
+                tickers={"LTC": {"ask": 12050.0, "bid": 12000.0, "last": 12020.0}},
+                now_dt=t0 + timedelta(minutes=1, seconds=46),
+            )
+            self.assertTrue(any(e.get("type") == "FAST_RECOVERY_SL_RESTORED" for e in rec_ev))
+            daemon.oco_manager.close_position_immediately("LTC", reason="TEST_CLEANUP", now_dt=t0 + timedelta(minutes=1, seconds=50))
+
+            # ------------------------------------------------------------------
+            # 4. R5-04: トレーリング更新直前に既存 STOP が約定していた競合の安全ハンドリング
+            # ------------------------------------------------------------------
+            daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "limit_price": 20000.0,
+                    "size": 0.1,
+                    "take_profit_price": 22000.0,
+                    "stop_loss_price": 19400.0,
+                    "expected_loss_jpy": 60,
+                },
+                tickers={"SOL": {"ask": 20100.0, "bid": 20050.0, "last": 20080.0}},
+                now_dt=t0 + timedelta(minutes=2),
+            )
+            daemon.run_fast_cycle(
+                tickers={"SOL": {"ask": 19980.0, "bid": 19950.0, "last": 19980.0}},
+                now_dt=t0 + timedelta(minutes=2, seconds=10),
+            )
+            pf_sol = daemon.oco_manager.load_portfolio()
+            sol_pos = [p for p in pf_sol["positions"] if p["symbol"] == "SOL"][0]
+            sol_sl_oid = sol_pos["sl_order_id"]
+
+            # `modify_position_tp_sl` が呼ばれた瞬間に、取引所側で既に `sol_sl_oid` が EXECUTED になっていた競合を模擬
+            state_ex = daemon.broker._ensure_state_file()
+            for o in state_ex["orders"]:
+                if str(o.get("order_id")) == str(sol_sl_oid):
+                    o["status"] = "EXECUTED"
+                    o["orderStatus"] = "EXECUTED"
+                    o["executed_size"] = "0.1"
+                    o["executedSize"] = "0.1"
+                    o["executed_price"] = 19400.0
+            daemon.broker._save_state(state_ex)
+
+            mod_res = daemon.oco_manager.modify_position_tp_sl(
+                symbol="SOL",
+                new_tp=22500.0,
+                new_sl=19800.0,
+                now_dt=t0 + timedelta(minutes=2, seconds=20),
+            )
+            self.assertIsNotNone(mod_res)
+            self.assertEqual(mod_res.get("exit_order_id"), sol_sl_oid)
+            self.assertEqual(
+                len([p for p in daemon.oco_manager.load_portfolio()["positions"] if p["symbol"] == "SOL"]),
+                0,
+            )
+
+            # ------------------------------------------------------------------
+            # 5. R5-05: 同一銘柄 (BCH) で DUST_QUARANTINED (0.003 BCH) と有効建玉 (0.095 BCH) が共存するケース
+            # ------------------------------------------------------------------
+            bch_dust_res = daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000.0,
+                    "size": 0.05,
+                    "take_profit_price": 46500.0,
+                    "stop_loss_price": 42500.0,
+                    "expected_loss_jpy": 75,
+                },
+                tickers={"BCH": {"ask": 44100.0, "bid": 44050.0, "last": 44080.0}},
+                now_dt=t0 + timedelta(minutes=3),
+            )
+            bch_dust_oid = bch_dust_res["pending_order"]["order_id"]
+            daemon.broker.simulate_partial_fill(
+                bch_dust_oid,
+                filled_size=0.003,
+                fill_price=44000.0,
+                now_dt=t0 + timedelta(minutes=3, seconds=5),
+            )
+            # 1回目の step で PARTIAL_FILLED 検知＆60秒グレースタイマー開始 -> 65秒後の step で DUST_QUARANTINED に隔離
+            daemon.oco_manager.step(
+                tickers={"BCH": {"ask": 44200.0, "bid": 44150.0, "last": 44180.0}},
+                now_dt=t0 + timedelta(minutes=3, seconds=10),
+            )
+            daemon.oco_manager.step(
+                tickers={"BCH": {"ask": 44200.0, "bid": 44150.0, "last": 44180.0}},
+                now_dt=t0 + timedelta(minutes=4, seconds=15),
+            )
+            pf_bch1 = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_bch1["quarantined_dust"]), 1)
+
+            # 同じ BCH で新規に 0.095 BCH の有効ポジションを建てて約定させる
+            daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000.0,
+                    "size": 0.095,
+                    "take_profit_price": 46500.0,
+                    "stop_loss_price": 42500.0,
+                    "expected_loss_jpy": 142,
+                },
+                tickers={"BCH": {"ask": 44100.0, "bid": 44050.0, "last": 44080.0}},
+                now_dt=t0 + timedelta(minutes=4, seconds=20),
+            )
+            daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 43950.0, "bid": 43900.0, "last": 43950.0}},
+                now_dt=t0 + timedelta(minutes=4, seconds=30),
+            )
+
+            # PaperBroker.get_assets() が 0.095 + 0.003 = 0.098 BCH (available=0.003) を返し、
+            # ThreeWayReconciler が DUST_QUARANTINED と有効ポジションを上書きせず共存維持すること
+            bch_assets = {a["symbol"]: a for a in daemon.broker.get_assets()}
+            self.assertEqual(Decimal(bch_assets["BCH"]["amount"]), Decimal("0.098"))
+            self.assertEqual(Decimal(bch_assets["BCH"]["available"]), Decimal("0.003"))
+
+            rec_coexist = daemon.reconciler.reconcile(now_dt=t0 + timedelta(minutes=4, seconds=45))
+            self.assertEqual(rec_coexist["status"], "RECONCILED")
+            pf_coexist = daemon.oco_manager.load_portfolio()
+            active_bch = [
+                p for p in pf_coexist["positions"]
+                if p.get("symbol") == "BCH" and p.get("state") != "DUST_QUARANTINED"
+            ]
+            self.assertEqual(len(active_bch), 1)
+            self.assertAlmostEqual(float(active_bch[0]["size"]), 0.095, places=4)
+
+            daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

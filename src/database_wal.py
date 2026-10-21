@@ -404,7 +404,7 @@ class DatabaseWAL:
     def close(self) -> None:
         with self._lock:
             try:
-                self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
             except Exception:
                 pass
             try:
@@ -871,6 +871,19 @@ class DatabaseWAL:
                 (oid,),
             ).fetchone()
             return row is not None
+
+    def get_executed_size_for_order(self, order_id: Union[str, int]) -> Decimal:
+        """指定された `order_id` について既に `executions` テーブルに記録済みの合計約定数量を返す"""
+        oid = str(order_id).strip()
+        if not oid:
+            return Decimal("0")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(SUM(size_satoshi), 0) AS total_sat FROM executions WHERE order_id = ?",
+                (oid,),
+            ).fetchone()
+            total_sat = int(row["total_sat"] or 0) if row is not None else 0
+            return Decimal(total_sat) / Decimal(SATOSHI_SCALE)
 
     def get_high_watermark_execution_id(self, symbol: Optional[str] = None) -> int:
         """記録済み `execution_id`（数値変換可能なもの）の最大値（ハイウォーターマーク）を返す"""

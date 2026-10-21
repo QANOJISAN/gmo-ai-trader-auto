@@ -1039,7 +1039,11 @@ def main() -> int:
             logger.info("ConservativeSpotBacktester 準備完了: symbol_rules=%d 銘柄", len(daemon.backtester.symbol_rules))
             return 0
         if args.remote_cmd:
-            res = daemon.remote_control.execute_command(args.remote_cmd)
+            daemon_running = daemon.instance_lock.is_locked_by_another_process()
+            res = daemon.remote_control.enqueue_or_execute_command(
+                args.remote_cmd,
+                is_daemon_running=daemon_running,
+            )
             logger.info("Remote Control 実行完了: %s", res)
             return 0
         if args.once:

@@ -184,6 +184,37 @@ class SingleInstanceLock:
             self._fh = None
         self.acquired = False
 
+    def is_locked_by_another_process(self) -> bool:
+        """別プロセスまたは別インスタンスによって排他ロックが保持中かどうかを非破壊で検査する"""
+        if self.acquired:
+            return False
+        if not self.lock_path.exists():
+            return False
+        fh = None
+        try:
+            fh = open(self.lock_path, "a+b")
+            fh.seek(0)
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+                fh.seek(0)
+                msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+        except Exception:
+            return True
+        finally:
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+
 
 class MultiTierCircuitBreaker:
     """

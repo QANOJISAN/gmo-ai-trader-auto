@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
@@ -379,23 +380,31 @@ class RemoteControlManager:
                 if exec_size > 0 and hasattr(self.oco_manager, "_activate_position_with_sl"):
                     rule = (getattr(self.oco_manager, "symbol_rules", None) or {}).get(sym, {})
                     min_order_size = float(rule.get("min_order_size", 0.0001) or 0.0001)
-                    if exec_size + 1e-12 >= min_order_size:
-                        self.oco_manager._activate_position_with_sl(
-                            pf=pf,
-                            pending=p_ord,
-                            filled_size=exec_size,
-                            filled_price=exec_price,
-                            now_jst=now_jst,
-                            partial_expired=True,
-                        )
-                    else:
-                        self.oco_manager._quarantine_partial_buy_dust(
-                            pf=pf,
-                            pending=p_ord,
-                            dust_size=exec_size,
-                            exec_price=exec_price,
-                            min_order_size=min_order_size,
-                            now_jst=now_jst,
+                    try:
+                        if exec_size + 1e-12 >= min_order_size:
+                            self.oco_manager._activate_position_with_sl(
+                                pf=pf,
+                                pending=p_ord,
+                                filled_size=exec_size,
+                                filled_price=exec_price,
+                                now_jst=now_jst,
+                                partial_expired=True,
+                            )
+                        else:
+                            self.oco_manager._quarantine_partial_buy_dust(
+                                pf=pf,
+                                pending=p_ord,
+                                dust_size=exec_size,
+                                exec_price=exec_price,
+                                min_order_size=min_order_size,
+                                now_jst=now_jst,
+                            )
+                    except Exception as act_exc:
+                        logger.error(
+                            "CANCEL_ENTRIES 時の部分約定昇格エラー (order_id=%s, sym=%s): %s",
+                            oid,
+                            sym,
+                            act_exc,
                         )
                 else:
                     if self.db_wal is not None:
@@ -566,6 +575,62 @@ class RemoteControlManager:
             "timestamp": now_jst.isoformat(timespec="seconds"),
         }
 
+    def enqueue_or_execute_command(
+        self,
+        command_text: str,
+        is_daemon_running: bool = False,
+        actor_id: Optional[str] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        CLI (`--remote-cmd`) から呼び出されるエントリポイント。
+        - 本体デーモンが停止中の場合 (`is_daemon_running=False`): 即座に `execute_command` を実行する。
+        - 本体デーモンが稼働中の場合 (`is_daemon_running=True`):
+          * `FLATTEN_ALL` / `FLATTEN_REQUEST` は SQLite WAL 上に確認待ち `nonce` (`AWAITING_CONFIRM`) を即時発行して返す。
+          * `PAUSE`, `RESUME`, `CANCEL_ENTRIES`, `FLATTEN_CONFIRM <nonce>` は SQLite WAL の `control_commands` テーブルに
+            `PENDING` としてエンキューし、本体デーモンの次サイクル (`poll_and_execute_db_commands`) でロック競合なく原子的に実行させる。
+        """
+        now_jst = _now_jst(now_dt)
+        verified_actor = self._verify_owner(actor_id)
+        parts = (command_text or "").strip().split()
+        if not parts:
+            raise ValueError("空のコマンドは実行できません。")
+
+        cmd = parts[0].upper()
+        arg_nonce = parts[1].strip() if len(parts) > 1 else ""
+
+        if not is_daemon_running or self.db_wal is None or cmd in ("FLATTEN_ALL", "FLATTEN_REQUEST"):
+            return self.execute_command(
+                command_text=command_text,
+                actor_id=verified_actor,
+                now_dt=now_jst,
+            )
+
+        if cmd not in ("PAUSE", "RESUME", "CANCEL_ENTRIES", "FLATTEN_CONFIRM"):
+            raise ValueError(f"未知のリモート制御コマンドです: {cmd}")
+        if cmd == "FLATTEN_CONFIRM" and not arg_nonce:
+            raise ReplayOrExpiredNonceError("FLATTEN_CONFIRM にはワンタイム nonce の指定が必須です。")
+
+        queue_nonce = f"cli_{secrets.token_hex(6)}"
+        payload = {"target_nonce": arg_nonce} if arg_nonce else {}
+        self.db_wal.enqueue_control_command(
+            command=cmd,
+            nonce=queue_nonce,
+            requested_by=verified_actor,
+            status="PENDING",
+            payload=payload,
+            now_ts_ms=int(now_jst.timestamp() * 1000),
+        )
+        return {
+            "command": cmd,
+            "status": "QUEUED_FOR_DAEMON",
+            "queued_to_wal": True,
+            "queue_nonce": queue_nonce,
+            "target_nonce": arg_nonce,
+            "actor_id": verified_actor,
+            "timestamp": now_jst.isoformat(timespec="seconds"),
+        }
+
     def poll_and_execute_db_commands(
         self,
         now_dt: Optional[datetime] = None,
@@ -581,8 +646,17 @@ class RemoteControlManager:
         rows = self.db_wal.fetch_pending_control_commands()
         for r in rows:
             nonce = str(r.get("nonce", ""))
-            cmd = str(r.get("command", "")).strip().upper()
+            raw_cmd = str(r.get("command", "")).strip()
+            parts = raw_cmd.split()
+            cmd = parts[0].upper() if parts else ""
             actor = str(r.get("requested_by", "") or "")
+            payload_dict: Dict[str, Any] = {}
+            try:
+                raw_payload = r.get("payload_json")
+                if raw_payload:
+                    payload_dict = json.loads(str(raw_payload)) if isinstance(raw_payload, str) else dict(raw_payload)
+            except Exception:
+                payload_dict = {}
             try:
                 if cmd == "PAUSE":
                     res = self.pause_new_entries(actor_id=actor, now_dt=now_jst)
@@ -590,6 +664,9 @@ class RemoteControlManager:
                     res = self.resume_new_entries(actor_id=actor, now_dt=now_jst)
                 elif cmd == "CANCEL_ENTRIES":
                     res = self.cancel_pending_entries_only(actor_id=actor, now_dt=now_jst)
+                elif cmd == "FLATTEN_CONFIRM":
+                    target_nonce = str(payload_dict.get("target_nonce", "") or (parts[1] if len(parts) > 1 else "")).strip()
+                    res = self.confirm_flatten_all(nonce=target_nonce, actor_id=actor, now_dt=now_jst)
                 else:
                     continue
                 self.db_wal.confirm_and_execute_command(nonce=nonce, actor_id=actor, now_dt=now_jst)
