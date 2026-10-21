@@ -202,25 +202,28 @@ class MarketRegimeFilter:
             }
 
         # 2時間ヒステリシス（冷却期間）中かどうかチェック
-        if self.risk_off_cooldown_until is not None and now_jst < self.risk_off_cooldown_until:
-            remaining_min = (self.risk_off_cooldown_until - now_jst).total_seconds() / 60.0
-            hyst_reason = (
-                f"RISK_OFF_CRASH 冷却ヒステリシス継続中 "
-                f"(残り {remaining_min:.0f}分 / 解除予定 {self.risk_off_cooldown_until.isoformat(timespec='seconds')})"
-            )
-            self.current_regime = "RISK_OFF_CRASH"
-            return {
-                "regime": "RISK_OFF_CRASH",
-                "allow_new_buy": False,
-                "should_cancel_pending_buys": True,
-                "in_hysteresis_cooldown": True,
-                "cooldown_until": self.risk_off_cooldown_until.isoformat(timespec="seconds"),
-                "btc_change_1h_pct": round(btc_1h_pct, 2),
-                "btc_change_4h_pct": round(btc_4h_pct, 2),
-                "btc_rsi_4h": round(btc_4h_rsi, 2),
-                "breadth_ratio": round(breadth_ratio, 4),
-                "reasons": [hyst_reason],
-            }
+        if self.risk_off_cooldown_until is not None:
+            cd_until_jst = _now_jst(self.risk_off_cooldown_until)
+            self.risk_off_cooldown_until = cd_until_jst
+            if now_jst < cd_until_jst:
+                remaining_min = (cd_until_jst - now_jst).total_seconds() / 60.0
+                hyst_reason = (
+                    f"RISK_OFF_CRASH 冷却ヒステリシス継続中 "
+                    f"(残り {remaining_min:.0f}分 / 解除予定 {cd_until_jst.isoformat(timespec='seconds')})"
+                )
+                self.current_regime = "RISK_OFF_CRASH"
+                return {
+                    "regime": "RISK_OFF_CRASH",
+                    "allow_new_buy": False,
+                    "should_cancel_pending_buys": True,
+                    "in_hysteresis_cooldown": True,
+                    "cooldown_until": cd_until_jst.isoformat(timespec="seconds"),
+                    "btc_change_1h_pct": round(btc_1h_pct, 2),
+                    "btc_change_4h_pct": round(btc_4h_pct, 2),
+                    "btc_rsi_4h": round(btc_4h_rsi, 2),
+                    "breadth_ratio": round(breadth_ratio, 4),
+                    "reasons": [hyst_reason],
+                }
 
         # 冷却期間経過後は解除
         self.risk_off_cooldown_until = None

@@ -56,7 +56,12 @@ from src.remote_control import (
     ReplayOrExpiredNonceError,
     UnauthorizedCommandError,
 )
-from src.validator import DEFAULT_SYMBOL_RULES, normalize_action, normalize_confidence
+from src.validator import (
+    DEFAULT_SYMBOL_RULES,
+    normalize_action,
+    normalize_confidence,
+    validate_and_adjust_decision,
+)
 from src.wfa_backtester import ConservativeSpotBacktester
 from src.ws_hybrid_engine import SyncState, WSHybridEngine
 
@@ -1313,6 +1318,152 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             polled = daemon.remote_control.poll_and_execute_db_commands(now_dt=t0)
             self.assertEqual(len(polled), 1)
             self.assertTrue(daemon.remote_control.is_paused)
+
+    def test_round2_deep_cross_component_audit(self) -> None:
+        """第2回徹底総合監査 (Round 2 Deep Cross-Component & Runtime State Audit) 全8領域 (R2-01〜R2-08) の検証"""
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            ex = ChaosMockExchange(tmp_dir, wal_db=daemon.db_wal)
+            daemon.broker = ex
+            daemon.oco_manager.broker = ex
+            daemon.reconciler.broker = ex
+
+            t0 = datetime(2026, 10, 27, 12, 0, 0, tzinfo=JST)
+
+            # [領域3 / R2-01] PENDING_BUY 注文中（日本円 4,400円拘束中）に ThreeWayReconciler.reconcile() が走っても
+            # jpy_amount (10,000円) と jpy_available (5,600円) を正しく区別し、誤って DEGRADED_RECONCILING にならないこと
+            daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000,
+                    "size": 0.1,
+                    "take_profit_price": 48000,
+                    "stop_loss_price": 42500,
+                    "expected_loss_jpy": 150,
+                },
+                tickers={"BCH": {"ask": 44100, "bid": 44050, "last": 44050}},
+                now_dt=t0,
+            )
+            balances = ex.get_jpy_and_spot_balances()
+            self.assertEqual(balances["jpy_amount"], 10000.0)
+            self.assertEqual(balances["jpy_balance"], 10000.0)
+            self.assertEqual(balances["jpy_available"], 5600.0)
+            self.assertEqual(balances["jpy_locked"], 4400.0)
+
+            rec_pending = daemon.reconciler.reconcile(now_dt=t0 + timedelta(seconds=30))
+            self.assertEqual(rec_pending["status"], "RECONCILED")
+            self.assertFalse(daemon.reconciler.degraded_reconciling)
+
+            # 同時に2枠目の新規BUYを validate_and_adjust_decision にかけた際、
+            # 1枠目の PENDING_BUY 拘束額 (4,400円) とリスク (150円) が正しく差し引かれて評価されること
+            pf_with_pending = daemon.oco_manager.load_portfolio()
+            val_slot2 = validate_and_adjust_decision(
+                decision={
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "suggested_entry_offset_atr": 0.5,
+                    "tp_price": 22000,
+                    "sl_price": 19200,
+                    "confidence": 85,
+                },
+                portfolio=pf_with_pending,
+                symbol_rules=DEFAULT_SYMBOL_RULES,
+                market_summaries={
+                    "BTC": {"price": {"last": 10000000}, "h4_indicators": {"change_4h_pct": 0.5, "rsi_14": 55.0}},
+                    "SOL": {
+                        "price": {"last": 20000, "best_bid": 19990, "best_ask": 20000, "spread_pct": 0.05},
+                        "daily_indicators": {"atr_14": 400.0},
+                    },
+                },
+            )
+            self.assertEqual(val_slot2["action"], "BUY")
+            # Best Bid 19,990 - 0.5 * 400 = 19,790 円に suggested_entry_offset_atr が反映されていること (R2-06)
+            self.assertEqual(val_slot2["limit_price"], 19790)
+            self.assertLessEqual(val_slot2["expected_cost_jpy"], 5600)
+
+            # [領域1 / R2-02] 約定 -> SL発動まで進めた際、SQLite WAL の orders / executions / tax_moving_avg_ledger / positions
+            # がリアルタイム同期され、万一 portfolio.json が消失しても SQLite スナップショットから完全復元されること
+            daemon.run_fast_cycle(
+                tickers={"BCH": {"ask": 43950, "bid": 43940, "last": 43945}},
+                now_dt=t0 + timedelta(seconds=45),
+            )
+            pos_rows = daemon.db_wal.get_positions_by_states(["SL_ACTIVE", "PROTECTED_ACTIVE"])
+            self.assertTrue(any(r["symbol"] == "BCH" for r in pos_rows))
+            tax_rows = daemon.db_wal.get_tax_moving_avg_ledger("BCH")
+            self.assertEqual(len(tax_rows), 1)
+            self.assertGreater(tax_rows[0]["total_size_satoshi"], 0)
+
+            # portfolio.json を一時削除しても load_portfolio() が SQLite WAL から自動復元すること
+            daemon.portfolio_path.unlink()
+            restored_pf = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(restored_pf["positions"]), 1)
+            self.assertEqual(restored_pf["positions"][0]["symbol"], "BCH")
+            self.assertTrue(daemon.portfolio_path.exists())
+
+            # [領域2 / R2-03] REST スナップショット由来の板記録が 15秒後の run_fast_cycle で
+            # 5.0秒遅延として誤爆キャンセルされないこと
+            daemon.adverse_guard.record_orderbook(
+                symbol="SOL",
+                asks=[{"price": 20010, "size": 5.0}],
+                bids=[{"price": 20000, "size": 5.0}],
+                timestamp_sec=t0.timestamp(),
+                is_rest_snapshot=True,
+            )
+            daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "limit_price": 19790,
+                    "size": 0.1,
+                    "take_profit_price": 21500,
+                    "stop_loss_price": 19100,
+                },
+                tickers={"SOL": {"ask": 20010, "bid": 20000, "last": 20000}},
+                now_dt=t0 + timedelta(seconds=50),
+            )
+            fast_after_15s = daemon.run_fast_cycle(
+                tickers={
+                    "BCH": {"ask": 44100, "bid": 44050, "last": 44050},
+                    "SOL": {"ask": 20010, "bid": 20000, "last": 20000},
+                },
+                now_dt=t0 + timedelta(seconds=65),
+            )
+            self.assertFalse(
+                any(e.get("type") == "ADVERSE_SELECTION_RESTING_BUY_CANCELED" for e in fast_after_15s["events"])
+            )
+            self.assertEqual(len(daemon.oco_manager.load_portfolio()["pending_orders"]), 1)
+
+            # [領域4 / R2-04] Offset-naive と Offset-aware datetime が混在しても TypeError が起きないこと
+            naive_dt = datetime(2026, 10, 27, 11, 30, 0)
+            daemon.ai_judge._last_symbol_ai_eval_at["XRP"] = naive_dt
+            on_cd, _ = daemon.ai_judge.is_symbol_on_ai_cooldown("XRP", now_dt=t0)
+            self.assertTrue(on_cd)
+            daemon.regime_filter.risk_off_cooldown_until = datetime(2026, 10, 27, 13, 0, 0)
+            reg_chk = daemon.regime_filter.evaluate({"BTC": {"price": {"last": 10000000}}}, now_dt=t0)
+            self.assertEqual(reg_chk["regime"], "RISK_OFF_CRASH")
+
+            # [領域5 / R2-05] L5 ハード・キルスイッチ 3回連続発動時に待機注文キャンセル＋保有建玉の即時成行決済が実行されること
+            crash_tickers = {
+                "BCH": {"ask": 43100, "bid": 43000, "last": 43000},
+                "SOL": {"ask": 20010, "bid": 20000, "last": 20000},
+            }
+            pf_l5_setup = daemon.oco_manager.load_portfolio()
+            pf_l5_setup["jpy_balance"] = 4000  # 4,000 + 43,000*0.1*(1-0.0009) = 8,296.13 < 8,500 (かつ SL 42,500 より上)
+            daemon.oco_manager.save_portfolio(pf_l5_setup, now_dt=t0 + timedelta(seconds=70))
+            daemon.run_fast_cycle(tickers=crash_tickers, now_dt=t0 + timedelta(seconds=75))
+            daemon.run_fast_cycle(tickers=crash_tickers, now_dt=t0 + timedelta(seconds=90))
+            l5_trig_cycle = daemon.run_fast_cycle(tickers=crash_tickers, now_dt=t0 + timedelta(seconds=105))
+            self.assertTrue(l5_trig_cycle["l5_kill_switch"]["newly_triggered"])
+            self.assertTrue(any(e.get("type") == "L5_KILL_SWITCH_FLATTENED" for e in l5_trig_cycle["events"]))
+            pf_after_l5 = daemon.oco_manager.load_portfolio()
+            self.assertEqual(len(pf_after_l5["pending_orders"]), 0)
+            self.assertEqual(len(pf_after_l5["positions"]), 0)
 
 
 if __name__ == "__main__":

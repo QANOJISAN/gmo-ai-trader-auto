@@ -46,8 +46,12 @@ DEFAULT_V2_PORTFOLIO = BASE_DIR / "portfolio.json"
 JST = timezone(timedelta(hours=9))
 
 
-def _now_jst() -> datetime:
-    return datetime.now(JST)
+def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
+    if now_dt is None:
+        return datetime.now(JST)
+    if now_dt.tzinfo is None:
+        return now_dt.replace(tzinfo=JST)
+    return now_dt.astimezone(JST)
 
 
 def validate_and_convert_v1_portfolio(
@@ -57,7 +61,7 @@ def validate_and_convert_v1_portfolio(
     """
     v1 の `portfolio.json` 辞書を検証し、v2 互換のポートフォリオ辞書・警告一覧・エラー一覧を返す。
     """
-    now_jst = now_dt or _now_jst()
+    now_jst = _now_jst(now_dt)
     warnings: List[str] = []
     errors: List[str] = []
 
@@ -247,6 +251,30 @@ def execute_migration(
         check_res["v2_backup_path"] = str(backup_path)
 
     write_json_file(v2_portfolio_path, check_res["converted_portfolio"])
+    try:
+        from src.database_wal import DatabaseWAL
+
+        wal_path = v2_portfolio_path.parent / "v2_state_wal.db"
+        wal = DatabaseWAL(wal_path, portfolio_json_path=v2_portfolio_path, auto_sync_files=True)
+        try:
+            conv_pf = check_res["converted_portfolio"]
+            for p in conv_pf.get("positions", []) or []:
+                wal.upsert_position(
+                    symbol=str(p.get("symbol", "")),
+                    state=str(p.get("state", "SL_ACTIVE")),
+                    size=p.get("size", 0),
+                    entry_price=p.get("entry_price", 0),
+                    take_profit_price=p.get("take_profit_price", 0),
+                    stop_loss_price=p.get("stop_loss_price", 0),
+                    initial_stop_loss_price=p.get("initial_stop_loss_price", p.get("stop_loss_price", 0)),
+                    sl_order_id=str(p.get("sl_order_id", "")),
+                    breakeven_locked=bool(p.get("breakeven_locked", False)),
+                )
+            wal.sync_portfolio_to_Sqlite_and_json(conv_pf)
+        finally:
+            wal.close()
+    except Exception:
+        pass
     check_res["migrated"] = True
     return check_res
 

@@ -563,7 +563,9 @@ class GMOPrivateClient:
 
         return {
             "jpy_amount": jpy_amount,
+            "jpy_balance": jpy_amount,
             "jpy_available": jpy_available,
+            "jpy_locked": max(0.0, round(jpy_amount - jpy_available, 2)),
             "spot_assets": spot_assets,
         }
 
@@ -1115,7 +1117,9 @@ class PaperBroker:
                 }
         return {
             "jpy_amount": jpy_amount,
+            "jpy_balance": jpy_amount,
             "jpy_available": jpy_available,
+            "jpy_locked": max(0.0, round(jpy_amount - jpy_available, 2)),
             "spot_assets": spot_assets,
         }
 

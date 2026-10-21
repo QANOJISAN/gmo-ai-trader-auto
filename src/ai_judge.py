@@ -76,6 +76,7 @@ SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）�
   "symbol": "スクリーニングされた対象銘柄シンボル または NONE",
   "order_type": "LIMIT_POST_ONLY" | "STOP_OR_LIMIT" | "LIMIT_OR_MARKET" | "NONE",
   "limit_price": 数値 (MODIFY時は 0),
+  "suggested_entry_offset_atr": 数値 (Best Bid から下方に引く ATR 倍率目安。例: 0.60〜0.75),
   "size": 数値,
   "take_profit_price": 数値,
   "stop_loss_price": 数値,
@@ -403,8 +404,9 @@ class AIJudge:
         last_dt = self._last_symbol_ai_eval_at.get(sym_up)
         if last_dt is None:
             return False, ""
+        last_jst = last_dt.astimezone(JST) if last_dt.tzinfo else last_dt.replace(tzinfo=JST)
         now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
-        elapsed_min = (now_jst - last_dt).total_seconds() / 60.0
+        elapsed_min = (now_jst - last_jst).total_seconds() / 60.0
         if elapsed_min < self.symbol_ai_cooldown_minutes:
             return True, f"{sym_up} AI呼び出しクールダウン中 ({elapsed_min:.1f}分 < {self.symbol_ai_cooldown_minutes:.0f}分)"
         return False, ""
@@ -414,8 +416,9 @@ class AIJudge:
         last_dt = self._last_symbol_sl_hit_at.get(sym_up)
         if last_dt is None:
             return False, ""
+        last_jst = last_dt.astimezone(JST) if last_dt.tzinfo else last_dt.replace(tzinfo=JST)
         now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
-        elapsed_hours = (now_jst - last_dt).total_seconds() / 3600.0
+        elapsed_hours = (now_jst - last_jst).total_seconds() / 3600.0
         if elapsed_hours < self.sl_penalty_cooldown_hours:
             return True, f"{sym_up} SL被弾後ペナルティクールダウン中 ({elapsed_hours:.2f}h < {self.sl_penalty_cooldown_hours:.1f}h)"
         return False, ""
@@ -509,6 +512,30 @@ class AIJudge:
             act_norm = "HOLD"
         decision["action"] = act_norm
         decision["confidence"] = normalize_confidence(decision.get("confidence", 0))
+        # キー別名および suggested_entry_offset_atr の正規化
+        if not decision.get("limit_price") and decision.get("entry_price"):
+            decision["limit_price"] = decision["entry_price"]
+        if not decision.get("take_profit_price") and (decision.get("tp_price") or decision.get("take_profit")):
+            decision["take_profit_price"] = decision.get("tp_price") or decision.get("take_profit")
+        if not decision.get("stop_loss_price") and (decision.get("sl_price") or decision.get("stop_loss")):
+            decision["stop_loss_price"] = decision.get("sl_price") or decision.get("stop_loss")
+
+        if (
+            act_norm == "BUY"
+            and not float(decision.get("limit_price", 0) or 0)
+            and decision.get("suggested_entry_offset_atr") is not None
+        ):
+            sym_for_offset = str(decision.get("symbol", "")).strip().upper()
+            s_info = (market_summaries or {}).get(sym_for_offset, {})
+            p_info = s_info.get("price", {})
+            ref_bid = float(p_info.get("best_bid", 0) or p_info.get("last", 0) or 0)
+            ref_atr = float(
+                s_info.get("daily_indicators", {}).get("atr_14", 0) or (ref_bid * 0.02 if ref_bid > 0 else 0)
+            )
+            if ref_bid > 0 and ref_atr > 0:
+                offset_mult = max(0.0, float(decision.get("suggested_entry_offset_atr", 0.0) or 0.0))
+                decision["limit_price"] = max(1.0, ref_bid - (offset_mult * ref_atr))
+
         if act_norm == "MODIFY":
             decision["limit_price"] = 0
 
@@ -645,8 +672,15 @@ class AIJudge:
             p for p in (portfolio.get("positions", []) or [])
             if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
         ]
+        pending_orders = [
+            o for o in (portfolio.get("pending_orders", []) or [])
+            if str(o.get("side", "BUY")).upper() == "BUY"
+            and str(o.get("state", "PENDING_BUY")).upper() in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED")
+        ]
         max_concurrent = int(portfolio.get("max_concurrent_positions", 2))
-        held_symbols = {str(p.get("symbol", "")).upper() for p in positions}
+        held_symbols = {str(p.get("symbol", "")).upper() for p in positions} | {
+            str(o.get("symbol", "")).upper() for o in pending_orders
+        }
 
         default_counter_thesis = [
             "上位足レジスタンス到達時の利益確定売りによる短期反落リスク",
@@ -753,7 +787,7 @@ class AIJudge:
                     ),
                 }
 
-        if len(positions) >= max_concurrent:
+        if (len(positions) + len(pending_orders)) >= max_concurrent:
             return {
                 "bearish_counter_thesis": default_counter_thesis,
                 "bullish_conviction_factors": [],
@@ -767,19 +801,25 @@ class AIJudge:
                 "stop_loss_price": 0,
                 "confidence": 0.70,
                 "reasoning": (
-                    f"現在 {len(positions)} 銘柄 ({', '.join(sorted(held_symbols))}) を保有中であり、"
-                    f"最大同時保有数 ({max_concurrent}銘柄) に達しているため、本日の新規エントリーは見送り (HOLD) とします。"
+                    f"現在 {len(positions) + len(pending_orders)} 枠 ({', '.join(sorted(held_symbols))}) を保有・発注中であり、"
+                    f"最大同時枠数 ({max_concurrent}枠) に達しているため、本日の新規エントリーは見送り (HOLD) とします。"
                 ),
             }
 
         jpy_balance = float(portfolio.get("jpy_balance", 10000))
+        locked_pending_jpy = sum(
+            float(o.get("limit_price", o.get("price", 0)) or 0)
+            * max(0.0, float(o.get("size", 0) or 0) - float(o.get("executed_size", 0) or 0))
+            for o in pending_orders
+        )
+        available_jpy = max(0.0, jpy_balance - locked_pending_jpy)
         max_alloc_pct = float(portfolio.get("max_allocation_per_trade_pct", 0.50))
         invested_jpy = sum(
             float(p.get("current_price") or p.get("entry_price", 0)) * float(p.get("size", 0))
             for p in positions
         )
         total_equity = jpy_balance + invested_jpy
-        budget_jpy = min(jpy_balance, total_equity * max_alloc_pct)
+        budget_jpy = min(available_jpy, total_equity * max_alloc_pct)
 
         target_risk_cfg = float(portfolio.get("target_risk_per_trade_jpy", 150))
         aim_risk_jpy = min(target_risk_cfg, total_equity * 0.015)
@@ -927,6 +967,7 @@ class AIJudge:
             "symbol": best_symbol,
             "order_type": "LIMIT_POST_ONLY",
             "limit_price": limit_price,
+            "suggested_entry_offset_atr": pullback_mult,
             "size": proposed_size,
             "take_profit_price": tp_price,
             "stop_loss_price": sl_price,

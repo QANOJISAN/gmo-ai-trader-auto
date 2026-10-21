@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -110,7 +110,12 @@ class ThreeWayReconciler:
         pf = self.oco_manager.load_portfolio()
 
         assets_summary = self.broker.get_jpy_and_spot_balances()
-        exchange_jpy = _to_decimal(assets_summary.get("jpy_balance", assets_summary.get("jpy_available", 0)))
+        exchange_jpy = _to_decimal(
+            assets_summary.get(
+                "jpy_amount",
+                assets_summary.get("jpy_balance", assets_summary.get("jpy_available", 0)),
+            )
+        )
         spot_assets: Dict[str, Dict[str, Any]] = assets_summary.get("spot_assets", {}) or {}
 
         active_orders = self.broker.get_active_orders()
@@ -215,32 +220,58 @@ class ThreeWayReconciler:
                     except Exception as exc:
                         logger.error("幽霊注文約定後のSL発注エラー (%s): %s", sym, exc)
 
+                rule_for_sym = self.symbol_rules.get(sym, {})
+                maker_fee_rate = _to_decimal(rule_for_sym.get("maker_fee", "-0.0001"))
+                notional_d = _to_decimal(fill_price) * filled_size_dec
+                if matched_execs and any("fee" in e for e in matched_execs):
+                    entry_fee_d = sum((_to_decimal(e.get("fee", 0)) for e in matched_execs), Decimal("0"))
+                else:
+                    entry_fee_d = (notional_d * maker_fee_rate).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+                total_cost_jpy = int((notional_d + entry_fee_d).to_integral_value(rounding=ROUND_HALF_UP))
+                pf["jpy_balance"] = int(_to_decimal(pf.get("jpy_balance", 10000)) - Decimal(total_cost_jpy))
+
                 new_pos = {
                     "symbol": sym,
                     "side": "BUY",
                     "size": float(filled_size_dec),
                     "entry_price": fill_price,
                     "current_price": fill_price,
+                    "cost_jpy": total_cost_jpy,
+                    "entry_fee_jpy": float(entry_fee_d),
                     "take_profit_price": tp_price,
                     "stop_loss_price": sl_price,
                     "initial_sl_price": sl_price,
+                    "initial_stop_loss_price": sl_price,
                     "sl_order_id": sl_order_id,
+                    "buy_order_id": oid,
                     "entry_order_id": oid,
                     "state": "PROTECTED" if sl_order_id else "STOP_REARMING",
                     "opened_at": now_jst.isoformat(timespec="seconds"),
                 }
                 pf.setdefault("positions", []).append(new_pos)
                 if self.db_wal is not None:
-                    for ex in matched_execs:
+                    if matched_execs:
+                        for ex in matched_execs:
+                            self.db_wal.record_execution_idempotent(
+                                execution_id=str(ex.get("execution_id", f"rec_{oid}")),
+                                order_id=oid,
+                                symbol=sym,
+                                side="BUY",
+                                price_str=str(ex.get("price", fill_price)),
+                                size_str=str(ex.get("size", filled_size_dec)),
+                                fee_jpy_str=str(ex.get("fee", str(entry_fee_d))),
+                                timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
+                            )
+                    else:
                         self.db_wal.record_execution_idempotent(
-                            execution_id=str(ex.get("execution_id", f"rec_{oid}")),
+                            execution_id=f"rec_{oid}",
                             order_id=oid,
                             symbol=sym,
                             side="BUY",
-                            price_str=str(ex.get("price", fill_price)),
-                            size_str=str(ex.get("size", filled_size_dec)),
-                            fee_jpy_str=str(ex.get("fee", "0")),
-                            timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
+                            price_str=str(fill_price),
+                            size_str=format_decimal_plain(filled_size_dec),
+                            fee_jpy_str=str(entry_fee_d),
+                            timestamp_str=now_jst.isoformat(timespec="seconds"),
                         )
                     self.db_wal.upsert_order(
                         order_id=oid,
@@ -251,6 +282,17 @@ class ThreeWayReconciler:
                         price=str(fill_price),
                         size=format_decimal_plain(filled_size_dec),
                         executed_size=format_decimal_plain(filled_size_dec),
+                    )
+                    self.db_wal.upsert_position(
+                        symbol=sym,
+                        state=new_pos["state"],
+                        size=format_decimal_plain(filled_size_dec),
+                        entry_price=str(fill_price),
+                        take_profit_price=str(tp_price),
+                        stop_loss_price=str(sl_price),
+                        buy_order_id=oid,
+                        sl_order_id=sl_order_id,
+                        opened_at=new_pos["opened_at"],
                     )
                 ghost_orders_resolved.append(oid)
                 actions_taken.append(f"幽霊注文の約定復元＆SL保護完了: {sym} order_id={oid} -> sl_order_id={sl_order_id}")

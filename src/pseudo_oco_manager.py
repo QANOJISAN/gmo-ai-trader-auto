@@ -244,6 +244,17 @@ class PseudoOCOManager:
     def load_portfolio(self) -> Dict[str, Any]:
         with self._lock:
             if not self.portfolio_path.exists():
+                if self.wal_db is not None:
+                    snap = self.wal_db.load_portfolio_snapshot()
+                    if isinstance(snap, dict) and snap:
+                        snap.setdefault("positions", [])
+                        snap.setdefault("quarantined_dust", [])
+                        snap.setdefault("closed_trades", [])
+                        snap.setdefault("pending_orders", [])
+                        snap.setdefault("realized_pnl_total_jpy", int(snap.get("total_realized_pnl_jpy", 0) or 0))
+                        snap.setdefault("total_realized_pnl_jpy", int(snap.get("realized_pnl_total_jpy", 0) or 0))
+                        write_json_file(self.portfolio_path, snap)
+                        return snap
                 default_pf = {
                     "initial_capital_jpy": 10000,
                     "jpy_balance": 10000,
@@ -275,14 +286,41 @@ class PseudoOCOManager:
     def save_portfolio(self, portfolio: Dict[str, Any], now_dt: Optional[datetime] = None) -> None:
         with self._lock:
             now_jst = _now_jst(now_dt)
+            ts_ms = int(now_jst.timestamp() * 1000)
             portfolio["last_updated"] = now_jst.isoformat(timespec="seconds")
             portfolio["execution_mode"] = getattr(self.broker, "MODE", "DRY_RUN")
             if self.wal_db is not None:
+                for p in portfolio.get("positions", []) or []:
+                    p_sym = str(p.get("symbol", "")).strip().upper()
+                    if not p_sym:
+                        continue
+                    p_state = str(p.get("state", "PROTECTED_ACTIVE")).strip().upper()
+                    self.wal_db.upsert_position(
+                        symbol=p_sym,
+                        state=p_state if p_state in ("ENTRY_PENDING", "PARTIAL_FILLED", "UNPROTECTED_HOLD", "PROTECTED_ACTIVE", "PROTECTED", "SL_ACTIVE", "MODIFYING_STOP_INTENT", "STOP_REARMING", "EXIT_PENDING", "CLOSED", "DUST_QUARANTINED") else "PROTECTED_ACTIVE",
+                        size=p.get("size", 0),
+                        entry_price=p.get("entry_price", 0),
+                        take_profit_price=p.get("take_profit_price") or p.get("tp_price") or 0,
+                        stop_loss_price=p.get("stop_loss_price") or p.get("sl_price") or 0,
+                        initial_stop_loss_price=p.get("initial_stop_loss_price") or p.get("stop_loss_price") or 0,
+                        initial_risk_jpy=float(p.get("initial_risk_jpy", 150) or 150),
+                        buy_order_id=str(p.get("buy_order_id", "") or ""),
+                        sl_order_id=str(p.get("sl_order_id", "") or ""),
+                        breakeven_locked=bool(p.get("breakeven_locked", False)),
+                        trailing_stage=int(p.get("trailing_stage", 0) or 0),
+                        opened_at=str(p.get("opened_at", "") or now_jst.isoformat(timespec="seconds")),
+                        now_ts_ms=ts_ms,
+                    )
                 self.wal_db.sync_portfolio_to_Sqlite_and_json(
                     portfolio,
-                    now_ts_ms=int(now_jst.timestamp() * 1000),
+                    now_ts_ms=ts_ms,
                 )
-            write_json_file(self.portfolio_path, portfolio)
+            if (
+                self.wal_db is None
+                or not getattr(self.wal_db, "auto_sync_files", False)
+                or getattr(self.wal_db, "portfolio_json_path", None) != self.portfolio_path
+            ):
+                write_json_file(self.portfolio_path, portfolio)
 
     # ------------------------------------------------------------------
     # 0.2秒 Fast Recovery ガーディアン (最大3秒 Dead-Man's Timer)
@@ -571,6 +609,18 @@ class PseudoOCOManager:
 
         pf = self.load_portfolio()
         pf["pending_orders"].append(pending_entry)
+        if self.wal_db is not None:
+            self.wal_db.upsert_order(
+                order_id=pending_entry["order_id"],
+                symbol=sym,
+                side="BUY",
+                execution_type="LIMIT",
+                state="WAITING",
+                price=actual_limit_price,
+                size=actual_size,
+                time_in_force="SOK",
+                now_ts_ms=int(now_jst.timestamp() * 1000),
+            )
         self.save_portfolio(pf, now_dt=now_jst)
 
         self.notifier.notify_event(
@@ -1194,6 +1244,43 @@ class PseudoOCOManager:
         )
         pos_entry["sl_order_id"] = str(sl_order.get("order_id", ""))
         pos_entry["state"] = "SL_ACTIVE"
+        if self.wal_db is not None:
+            buy_oid = str(pending.get("order_id", ""))
+            ts_ms = int(now_jst.timestamp() * 1000)
+            if buy_oid:
+                self.wal_db.upsert_order(
+                    order_id=buy_oid,
+                    symbol=sym,
+                    side="BUY",
+                    execution_type="LIMIT",
+                    state="EXECUTED",
+                    price=price_d,
+                    size=pending.get("size", size_d),
+                    executed_size=size_d,
+                    now_ts_ms=ts_ms,
+                )
+                self.wal_db.record_execution_idempotent(
+                    execution_id=f"exec_buy_{buy_oid}",
+                    order_id=buy_oid,
+                    symbol=sym,
+                    side="BUY",
+                    price_str=format_decimal_plain(price_d),
+                    size_str=format_decimal_plain(size_d),
+                    fee_jpy_str=format_decimal_plain(entry_fee_d),
+                    timestamp_str=now_jst.isoformat(timespec="seconds"),
+                )
+            if pos_entry["sl_order_id"]:
+                self.wal_db.upsert_order(
+                    order_id=pos_entry["sl_order_id"],
+                    symbol=sym,
+                    side="SELL",
+                    execution_type="STOP",
+                    state="WAITING",
+                    price=sl_price,
+                    size=size_d,
+                    time_in_force="FAK",
+                    now_ts_ms=ts_ms,
+                )
         self.save_portfolio(pf, now_dt=now_jst)
 
         event = {
@@ -1273,6 +1360,43 @@ class PseudoOCOManager:
             "closed_at": now_jst.isoformat(timespec="seconds"),
         }
         pf.setdefault("closed_trades", []).append(closed_record)
+        if self.wal_db is not None:
+            ts_ms = int(now_jst.timestamp() * 1000)
+            e_oid = str(exit_order_id or f"close_{sym}_{ts_ms}")
+            if exit_order_id and exit_order_id != "ALREADY_FILLED_OR_DUST":
+                self.wal_db.upsert_order(
+                    order_id=e_oid,
+                    symbol=sym,
+                    side="SELL",
+                    execution_type="LIMIT" if is_maker else "MARKET",
+                    state="EXECUTED",
+                    price=exit_d,
+                    size=size_d,
+                    executed_size=size_d,
+                    now_ts_ms=ts_ms,
+                )
+            self.wal_db.record_execution_idempotent(
+                execution_id=f"exec_sell_{e_oid}",
+                order_id=e_oid,
+                symbol=sym,
+                side="SELL",
+                price_str=format_decimal_plain(exit_d),
+                size_str=format_decimal_plain(size_d),
+                fee_jpy_str=format_decimal_plain(exit_fee_d),
+                timestamp_str=now_jst.isoformat(timespec="seconds"),
+            )
+            self.wal_db.upsert_position(
+                symbol=sym,
+                state="CLOSED",
+                size=0,
+                entry_price=entry_d,
+                take_profit_price=0,
+                stop_loss_price=0,
+                buy_order_id=str(pos.get("buy_order_id", "")),
+                sl_order_id=e_oid,
+                opened_at=str(pos.get("opened_at", "")),
+                now_ts_ms=ts_ms,
+            )
         return closed_record
 
     def modify_position_tp_sl(

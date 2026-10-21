@@ -55,6 +55,7 @@ class AdverseSelectionGuard:
         bids: List[Dict[str, Any]],
         timestamp_sec: Optional[float] = None,
         median_spread: Optional[float] = None,
+        is_rest_snapshot: bool = False,
     ) -> None:
         sym = symbol.strip().upper()
         ts = float(timestamp_sec if timestamp_sec is not None else time.time())
@@ -71,6 +72,7 @@ class AdverseSelectionGuard:
             "asks": norm_asks,
             "bids": norm_bids,
             "timestamp_sec": ts,
+            "is_rest_snapshot": bool(is_rest_snapshot),
         }
         if norm_asks and norm_bids:
             mid = (norm_asks[0]["price"] + norm_bids[0]["price"]) / 2.0

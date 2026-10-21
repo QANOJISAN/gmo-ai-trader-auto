@@ -428,7 +428,22 @@ class MultiTierCircuitBreaker:
         `last`（最終約定値）ではなく、保守的な即時清算価値 `Best Bid * (1 - Taker Fee)` を用いて総資産を計算する。
         保有銘柄の Best Bid が欠損（0以下）している場合は `(equity, False)` を返し、API欠損による誤判定を防ぐ。
         """
-        jpy_balance = _to_decimal(portfolio.get("jpy_balance", 10000))
+        if "jpy_balance" in portfolio and portfolio.get("jpy_balance") is not None:
+            jpy_balance = _to_decimal(portfolio.get("jpy_balance", 10000))
+        elif "jpy_amount" in portfolio and portfolio.get("jpy_amount") is not None:
+            jpy_balance = _to_decimal(portfolio.get("jpy_amount", 10000))
+        else:
+            avail_jpy = _to_decimal(portfolio.get("jpy_available", 10000))
+            locked_pending_jpy = Decimal("0")
+            for p_ord in portfolio.get("pending_orders", []) or []:
+                if str(p_ord.get("side", "BUY")).upper() == "BUY" and str(
+                    p_ord.get("state", "PENDING_BUY")
+                ).upper() in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED"):
+                    p_price = _to_decimal(p_ord.get("limit_price", p_ord.get("price", 0)))
+                    p_size = _to_decimal(p_ord.get("size", 0)) - _to_decimal(p_ord.get("executed_size", 0))
+                    if p_price > Decimal("0") and p_size > Decimal("0"):
+                        locked_pending_jpy += p_price * p_size
+            jpy_balance = avail_jpy + locked_pending_jpy
         positions: List[Dict[str, Any]] = portfolio.get("positions", []) or []
         tickers_map = tickers or {}
 

@@ -417,18 +417,21 @@ def calculate_total_equity_jpy(
 def calculate_existing_portfolio_risk_jpy(
     positions: List[Dict[str, Any]],
     merged_rules: Dict[str, Dict[str, Any]],
+    pending_orders: List[Dict[str, Any]] | None = None,
 ) -> Decimal:
     """
-    現在保有中のポジションが抱えている想定SLリスク合計額（円）を算出する。
-    SLが建値（entry_price）以上に引き上げられている建玉はダウンサイドリスク 0 円とみなす。
+    現在保有中のポジション（および発注中の待機指値 `PENDING_BUY`）が抱えている想定SLリスク合計額（円）を算出する。
+    SLが建値（entry_price）以上に引き上げられている建玉、および `DUST_QUARANTINED` 端数はダウンサイドリスク 0 円とみなす。
     """
     total_risk = Decimal("0")
     for pos in positions:
+        if str(pos.get("state", "PROTECTED")).upper() == "DUST_QUARANTINED":
+            continue
         p_sym = str(pos.get("symbol", "")).upper()
         p_size = _to_decimal(pos.get("size", 0) or 0)
         p_entry = _to_decimal(pos.get("entry_price", 0) or 0)
         p_sl = _to_decimal(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
-        explicit_risk = _to_decimal(pos.get("expected_loss_jpy", 0) or 0)
+        explicit_risk = _to_decimal(pos.get("expected_loss_jpy", 0) or pos.get("initial_risk_jpy", 0) or 0)
 
         if p_entry > 0 and p_sl >= p_entry:
             # 建値保護済みポジション
@@ -443,6 +446,26 @@ def calculate_existing_portfolio_risk_jpy(
         elif p_entry > 0 and p_size > 0:
             # SL未設定時のフォールバック（取得額の3%または150円）
             total_risk += min(p_entry * p_size * Decimal("0.03"), Decimal("150"))
+
+    for ord_item in pending_orders or []:
+        if str(ord_item.get("side", "BUY")).upper() != "BUY":
+            continue
+        if str(ord_item.get("state", "PENDING_BUY")).upper() not in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED"):
+            continue
+        o_sym = str(ord_item.get("symbol", "")).upper()
+        o_size = _to_decimal(ord_item.get("size", 0) or 0)
+        o_entry = _to_decimal(ord_item.get("limit_price", ord_item.get("price", 0)) or 0)
+        o_sl = _to_decimal(ord_item.get("stop_loss_price") or ord_item.get("sl_price") or 0)
+        o_explicit = _to_decimal(ord_item.get("initial_risk_jpy", ord_item.get("expected_loss_jpy", 0)) or 0)
+        if o_entry > 0 and Decimal("0") < o_sl < o_entry and o_size > 0:
+            o_rule = merged_rules.get(o_sym, {})
+            o_taker = max(_to_decimal(o_rule.get("taker_fee", "0.0005")), Decimal("0"))
+            o_calc_risk = ((o_entry - o_sl) + (o_sl * o_taker)) * o_size
+            total_risk += max(o_calc_risk, o_explicit)
+        elif o_explicit > 0:
+            total_risk += o_explicit
+        elif o_entry > 0 and o_size > 0:
+            total_risk += min(o_entry * o_size * Decimal("0.03"), Decimal("150"))
 
     return total_risk
 
@@ -597,28 +620,38 @@ def validate_and_adjust_decision(
         return _hold_decision(adjusted, symbol=symbol if symbol in merged_rules else "NONE", reason_prefix=prefix)
 
     max_concurrent = int(portfolio.get("max_concurrent_positions", 2))
+    active_positions: List[Dict[str, Any]] = [
+        p for p in positions if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+    ]
     pending_orders: List[Dict[str, Any]] = portfolio.get("pending_orders", []) or []
     active_pending_buys = [
         o for o in pending_orders
         if str(o.get("side", "BUY")).upper() == "BUY"
-        and str(o.get("state", "PENDING_BUY")).upper() == "PENDING_BUY"
+        and str(o.get("state", "PENDING_BUY")).upper() in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED")
     ]
+    locked_pending_buy_jpy = Decimal("0")
+    for o in active_pending_buys:
+        o_price = _to_decimal(o.get("limit_price", o.get("price", 0)) or 0)
+        o_size = max(Decimal("0"), _to_decimal(o.get("size", 0) or 0) - _to_decimal(o.get("executed_size", 0) or 0))
+        if o_price > Decimal("0") and o_size > Decimal("0"):
+            locked_pending_buy_jpy += o_price * o_size
+    available_jpy_for_new_buy = max(Decimal("0"), jpy_balance - locked_pending_buy_jpy)
 
     # 新規買い (BUY) 時の同時保有銘柄数＋発注中指値数上限チェック
-    if action == "BUY" and (len(positions) + len(active_pending_buys)) >= max_concurrent:
+    if action == "BUY" and (len(active_positions) + len(active_pending_buys)) >= max_concurrent:
         return _hold_decision(
             adjusted,
             symbol=symbol,
             reason_prefix=(
                 f"[同時保有・発注上限によりHOLDへ自動補正] 既に最大同時枠 ({max_concurrent}枠: "
-                f"保有{len(positions)}件＋待機指値{len(active_pending_buys)}件) に達しているため、新規買いエントリーを見送ります。"
+                f"保有{len(active_positions)}件＋待機指値{len(active_pending_buys)}件) に達しているため、新規買いエントリーを見送ります。"
             ),
         )
 
     # 新規買い (BUY) 時の既保有・待機中銘柄重複エントリー防止ガード
     held_symbols_active = {
         str(p.get("symbol", "")).strip().upper()
-        for p in positions
+        for p in active_positions
         if _to_decimal(p.get("size", 0) or 0) > 0
     } | {
         str(o.get("symbol", "")).strip().upper()
@@ -644,23 +677,48 @@ def validate_and_adjust_decision(
 
     summary = (market_summaries or {}).get(symbol, {}) or {}
     price_info = summary.get("price", {}) or {}
-    last_price = _to_decimal(price_info.get("last", 0) or adjusted.get("limit_price", 0) or 0)
+    raw_limit_candidate = (
+        adjusted.get("limit_price")
+        or adjusted.get("entry_price")
+        or adjusted.get("price")
+        or 0
+    )
+    last_price = _to_decimal(price_info.get("last", 0) or raw_limit_candidate or 0)
     best_ask = _to_decimal(price_info.get("best_ask", 0) or 0)
     best_bid = _to_decimal(price_info.get("best_bid", 0) or 0)
     atr_val = _to_decimal(summary.get("daily_indicators", {}).get("atr_14", 0) or (last_price * Decimal("0.02")))
     if atr_val <= 0:
         atr_val = last_price * Decimal("0.02")
 
-    # 1. 指値価格・TP・SL の丸め処理
-    raw_limit = _to_decimal(adjusted.get("limit_price", 0) or last_price)
+    # 1. 指値価格・TP・SL の丸め処理 (suggested_entry_offset_atr およびキー別名対応)
+    raw_limit = _to_decimal(raw_limit_candidate)
+    if (
+        action == "BUY"
+        and raw_limit <= Decimal("0")
+        and adjusted.get("suggested_entry_offset_atr") is not None
+    ):
+        offset_atr_d = max(Decimal("0"), _to_decimal(adjusted.get("suggested_entry_offset_atr")))
+        anchor_p = best_bid if best_bid > Decimal("0") else last_price
+        if anchor_p > Decimal("0"):
+            raw_limit = max(tick_size, anchor_p - (offset_atr_d * atr_val))
     if raw_limit <= 0:
         raw_limit = last_price
     limit_dec = round_to_step(raw_limit, tick_size, rounding=ROUND_DOWN)
     if limit_dec <= 0:
         limit_dec = tick_size
 
-    raw_tp = _to_decimal(adjusted.get("take_profit_price", 0) or 0)
-    raw_sl = _to_decimal(adjusted.get("stop_loss_price", 0) or 0)
+    raw_tp = _to_decimal(
+        adjusted.get("take_profit_price")
+        or adjusted.get("tp_price")
+        or adjusted.get("take_profit")
+        or 0
+    )
+    raw_sl = _to_decimal(
+        adjusted.get("stop_loss_price")
+        or adjusted.get("sl_price")
+        or adjusted.get("stop_loss")
+        or 0
+    )
 
     if action == "BUY":
         # Post-Only（Maker専用）指値注文が即時失効しないよう best_bid 以下（または best_ask 未満）へ上限丸め
@@ -813,7 +871,7 @@ def validate_and_adjust_decision(
     max_risk_cfg = _to_decimal(portfolio.get("max_risk_per_trade_jpy", 200))
 
     fee_buffer = Decimal("1") + taker_fee
-    per_trade_cap_jpy = min(jpy_balance, total_equity * max_alloc_pct)
+    per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct)
     available_budget = per_trade_cap_jpy / fee_buffer
 
     raw_size = _to_decimal(adjusted.get("size", 0) or 0)
@@ -846,7 +904,7 @@ def validate_and_adjust_decision(
 
         # 3. 2枠目を新規BUYする際の「ポートフォリオ合計リスク」上限（総資産の3.0%＝初期300円）チェック
         max_portfolio_risk_jpy = total_equity * Decimal("0.03")
-        existing_risk_jpy = calculate_existing_portfolio_risk_jpy(positions, merged_rules)
+        existing_risk_jpy = calculate_existing_portfolio_risk_jpy(active_positions, merged_rules, active_pending_buys)
         remaining_portfolio_risk_jpy = max_portfolio_risk_jpy - existing_risk_jpy
         if remaining_portfolio_risk_jpy <= Decimal("0"):
             return _hold_decision(
@@ -861,19 +919,19 @@ def validate_and_adjust_decision(
 
         # 4. 最小注文数量に必要な日本円を計算
         min_required_jpy = min_order_size * limit_dec * fee_buffer
-        if min_required_jpy > jpy_balance:
+        if min_required_jpy > available_jpy_for_new_buy:
             return _hold_decision(
                 adjusted,
                 symbol=symbol,
                 reason_prefix=(
                     f"[資金不足によりHOLDへ自動補正] {symbol} の最小注文数量 ({min_order_size_str} {symbol}) の購入に "
-                    f"約 {int(min_required_jpy):,} 円が必要ですが、現在残高 ({int(jpy_balance):,} 円) を超過しています。"
+                    f"約 {int(min_required_jpy):,} 円が必要ですが、現在利用可能余力 ({int(available_jpy_for_new_buy):,} 円) を超過しています。"
                 ),
             )
 
         max_affordable_size = round_to_step(available_budget / limit_dec, size_step, rounding=ROUND_DOWN)
         if max_affordable_size < min_order_size:
-            if min_required_jpy <= per_trade_cap_jpy * Decimal("1.05") and min_required_jpy <= jpy_balance:
+            if min_required_jpy <= per_trade_cap_jpy * Decimal("1.05") and min_required_jpy <= available_jpy_for_new_buy:
                 max_affordable_size = min_order_size
             else:
                 return _hold_decision(
@@ -938,7 +996,7 @@ def validate_and_adjust_decision(
             ):
                 size_dec = min_order_size
             else:
-                if len(positions) >= 1 and (
+                if (len(active_positions) + len(active_pending_buys)) >= 1 and (
                     existing_risk_jpy + min_lot_nominal_loss > max_portfolio_risk_jpy
                     or existing_risk_jpy + min_lot_stressed_loss > max_portfolio_risk_jpy
                 ):

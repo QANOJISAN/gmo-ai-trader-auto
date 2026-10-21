@@ -485,6 +485,9 @@ class AutoTraderDaemon:
                     p_sym in self.adverse_guard._latest_orderbook
                     or p_sym in self.adverse_guard._trades_by_symbol
                 ):
+                    ob_cached = self.adverse_guard._latest_orderbook.get(p_sym)
+                    if isinstance(ob_cached, dict) and ob_cached.get("is_rest_snapshot"):
+                        ob_cached["timestamp_sec"] = now_jst.timestamp()
                     cancel_chk = self.adverse_guard.should_cancel_resting_buy_order(
                         symbol=p_sym,
                         order_price=float(p_ord.get("limit_price", 0) or 0),
@@ -533,13 +536,36 @@ class AutoTraderDaemon:
             l5_res = self.circuit_breaker.evaluate_l5_hard_kill_switch(pf_now, current_tickers)
             if l5_res["newly_triggered"]:
                 self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                for l5_pos in list(pf_now.get("positions", []) or []):
+                    if str(l5_pos.get("state", "PROTECTED")).upper() == "DUST_QUARANTINED":
+                        continue
+                    l5_sym = str(l5_pos.get("symbol", "")).strip().upper()
+                    if l5_sym:
+                        try:
+                            closed_l5 = self.oco_manager.close_position_immediately(
+                                symbol=l5_sym,
+                                reason="L5_KILL_SWITCH",
+                                now_dt=now_jst,
+                            )
+                            if closed_l5:
+                                events.append(
+                                    {
+                                        "type": "L5_KILL_SWITCH_FLATTENED",
+                                        "symbol": l5_sym,
+                                        "exit_price": closed_l5.get("exit_price", 0),
+                                        "pnl_jpy": closed_l5.get("pnl_jpy", 0),
+                                        "timestamp": now_jst.isoformat(timespec="seconds"),
+                                    }
+                                )
+                        except Exception as l5_exc:
+                            logger.error("L5 キルスイッチ発動時のポジション決済エラー (%s): %s", l5_sym, l5_exc)
                 self.notification_dispatcher.dispatch(
                     tier="CRITICAL",
                     title="L5 ハード・キルスイッチ発動（3回連続 Best Bid 清算価値 < 8,500円）",
                     message=(
                         f"・保守的清算総資産: {l5_res['conservative_equity_jpy']:,.0f} 円 "
                         f"(< {l5_res['threshold_jpy']:,.0f} 円 × 3回連続)\n"
-                        "・未約定の買い指値を全キャンセルし、新規BUYを恒久ロックしました。"
+                        "・未約定の買い指値を全キャンセルし、全保有ポジションを即時成行決済の上、新規BUYを恒久ロックしました。"
                     ),
                     now_dt=now_jst,
                 )
@@ -724,12 +750,13 @@ class AutoTraderDaemon:
                 ob_data = sym_summary.get("orderbook") or {}
                 trades_data = sym_summary.get("recent_trades") or []
                 now_sec_val = now_jst.timestamp()
-                if ob_data:
+                if ob_data and (ob_data.get("asks") or ob_data.get("bids")):
                     self.adverse_guard.record_orderbook(
                         symbol=buy_sym,
                         asks=ob_data.get("asks", []),
                         bids=ob_data.get("bids", []),
                         timestamp_sec=now_sec_val,
+                        is_rest_snapshot=True,
                     )
                 for tr in trades_data:
                     self.adverse_guard.record_taker_trade(

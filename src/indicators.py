@@ -505,6 +505,10 @@ def summarize_indicators(
         },
         "h4_indicators": h4_summary,
         "h1_indicators": summarize_1h_indicators(df_1h),
+        "orderbook": {
+            "asks": list((orderbook or {}).get("asks", [])[:5]),
+            "bids": list((orderbook or {}).get("bids", [])[:5]),
+        },
         "orderbook_liquidity": {
             "bid_depth_1pct_jpy": round(bid_depth_1pct_jpy, 0),
             "ask_depth_1pct_jpy": round(ask_depth_1pct_jpy, 0),
