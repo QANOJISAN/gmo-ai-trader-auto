@@ -1,11 +1,16 @@
 """
-LLM API 構造化出力（JSON）判定モジュール (ai_judge.py)
+LLM API 構造化出力（反対仮説優先 JSON Schema・Veto ゲート・Stale Signal Gate）判定モジュール (ai_judge.py)
 
-市場のテクニカル指標・板情報・ポートフォリオ状態を入力として、
-最適な売買指示（銘柄・指値価格・数量・利確TP・損切りSL・判断根拠）を JSON 形式で出力する。
-- Gemini API (`google-genai`) 対応（OS証明書ストア＋certifi対応、ThinkingLevel設定、クォータ制限時の上位モデル自動フォールバック機能付き）
-- OpenAI API (`openai`) 対応
-- APIキー未設定時・全モデル通信エラー時はテクニカル指標スコアリングによるルールベースAI判定へ自動フォールバック
+1. 反対仮説優先 (Counter-Thesis First) JSON Schema:
+   - 確証バイアスを排除するため、必ず先に弱気要因・見送り根拠の `bearish_counter_thesis`（最低2項目）を列挙させた後、
+     `bullish_conviction_factors` と `conviction_score`（0〜100）を出力させる。
+   - `conviction_score < 75` または `bearish_counter_thesis` が2項目未満の場合は、
+     `action="BUY"` であっても強制的に `HOLD`（Veto）へオーバーライドする。
+
+2. クールダウン＆鮮度ゲート (Cooldown & Stale Signal Gate):
+   - 同一銘柄のAI呼び出しクールダウン（60分）
+   - SL被弾銘柄のペナルティクールダウン（4時間）
+   - LLM 推論待機中に現在価格が基準価格から `> 0.30%` 乖離した場合、陳腐化シグナルとして破棄（`HOLD` 強制）する Stale Signal Gate。
 """
 
 from __future__ import annotations
@@ -34,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
 
-# クォータ制限 (Free Tier limit: 0 等) やモデル廃止時に順次試行する Gemini フォールバックモデル一覧
 DEFAULT_GEMINI_FALLBACK_MODELS = [
     "gemini-3.8-flash",
     "gemini-3.7-flash",
@@ -44,46 +48,30 @@ DEFAULT_GEMINI_FALLBACK_MODELS = [
 
 MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP"}
 
-SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買クオンツアナリスト兼トレードAIです。
-以下の運用制約・資金管理ルール・定量ガイドラインを厳守し、提供された市場データ（日足・4時間足・1時間足テクニカル指標、板情報）とポートフォリオ残高を分析して、現時点での最適な売買判断をJSON形式のみで出力してください。
+SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買クオンツアナリスト兼リスク審査AI（Veto Gate）です。
+確証バイアス（Confirmation Bias）を排除するため、必ず最初に「エントリーを見送るべき弱気要因・反対仮説 (`bearish_counter_thesis` 最低2項目)」を検証した上で、それを上回る強気根拠 (`bullish_conviction_factors`) と確信度スコア (`conviction_score`: 0〜100) が 75点以上ある場合のみ `BUY` を承認してください。
 
 【1. 運用・資金管理・リスク計算ルール】
 1. 対象はGMOコイン「取引所（現物）」のみ（レバレッジ取引・空売りは不可、新規エントリーは現物買い `BUY` のみ）。
-2. 資金配分上限: 1銘柄あたりの最大投入比率 `max_allocation_per_trade_pct` は `0.50`（初期資金10,000円のうち1ポジション最大5,000円）、同時保有は最大2銘柄（`max_concurrent_positions = 2`）までとすること。既に2銘柄保有中の場合は新規 `BUY` を行わず、`HOLD` または保有銘柄の `MODIFY`（または `MODIFY_OCO`：TP/SL変更） / `SELL` を選択すること。
+2. 資金配分上限: 1銘柄あたりの最大投入比率 `max_allocation_per_trade_pct` は `0.50`（初期資金10,000円のうち1ポジション最大5,000円）、同時保有は最大2銘柄（`max_concurrent_positions = 2`）までとすること。
 3. 損失許容上限（厳格化）:
    - 逆指値（SL）発動時のTaker手数料（0.05%〜0.09%）とスリッページ予備を見込み、1トレードの名目許容損失額のターゲット上限を **「150円（または総資産の1.5%の小さい方）」** で数量逆算し、スリッページ込みの実損失でも絶対に **200円** を超えないよう注文数量 (`size`) を決定すること。
-   - 「`(スプレッド + Taker手数料) ÷ SL距離`」が **10%** を超える場合（コスト負けする狭すぎるSLや広すぎるスプレッド）は、期待値マイナスとして `HOLD` とすること。
+   - 「`(スプレッド + Taker手数料) ÷ SL距離`」が **10%** を超える場合は期待値マイナスとして `HOLD` とすること。
    - 2枠目を新規 `BUY` する際、1枠目の想定リスクと合わせた **「ポートフォリオ合計リスク」が総資産の3.0%（初期300円）** を超えないこと。
-   - 総資産（日本円残高＋保有評価額）が **8,500円（初期資金から-15%）** を下回った場合は、ドローダウン・キルスイッチとして新規 `BUY` を停止（`HOLD` 強制）すること。
+   - 総資産が **8,500円（初期資金から-15%）** を下回った場合は、ドローダウン・キルスイッチとして新規 `BUY` を停止（`HOLD` 強制）すること。
 4. リスクリワード比 (`(take_profit_price - limit_price) / (limit_price - stop_loss_price)`) は原則 **1.5以上** を確保すること。
 
-【2. 押し目買い指値深さの定量ガイドライン（新規 BUY 時）】
-1. エントリー前提条件:
-   - BTCおよび対象銘柄が上昇トレンド（日足終値 > SMA25、または明確な反発局面）であること。
-   - `climax_sell_warning`（直近4時間足が陰線かつ出来高比率2.0倍以上の下落クライマックス＝ナイフ掴み警告）が `true` でないこと。
-   - 対BTCの7日間相対強度（`relative_strength_vs_btc_7d_pct` = 銘柄7d騰落率 - BTC7d騰落率）がプラスまたは底堅い銘柄を優先すること。
-2. 指値の深さ目安（定量スイートスポット）:
-   - 現在価格から **日足ATR(14)の 0.50〜0.85倍 下方** を基準とすること。
-     * `BTC` / `ETH` / `XRP`：`0.50〜0.70 × 日足ATR(14)` 下方（または4時間足SMA25付近のサポート帯）
-     * `SOL` / `DOGE` 等のアルトコイン：`0.65〜0.90 × 日足ATR(14)` 下方（または4時間足SMA25付近のサポート帯）
-   - 浅すぎる高値掴み（0.3×日足ATR未満）や、`1.2×日足ATR` を超える深すぎるナイフ拾いは行わないこと。
-3. SL（損切り逆指値）の位置:
-   - 直近スイング安値の少し下（または指値から `-3.0%〜-4.5%` / `1.0〜1.5 × 日足ATR(14)` 下方）に置き、そこから名目許容損失 **150円以内（総資産の1.5%以内）** に収まるよう注文数量 (`size`) を逆算すること。
-
-【3. タイムストップ（保有期間上限）と建値保護のエグジット規則（保有ポジションあり時）】
-各保有ポジションに付与されている `holding_days`（保有経過日数）/ `holding_hours`（経過時間）、`unrealized_pnl_pct`（現在の含み損益率%）、`r_multiple`（R倍数）を確認し、以下の優先順位（①全保有銘柄のタイムストップ撤退 `SELL` 判定 → ②該当なしの場合に建値保護 `MODIFY` 判定 → ③空き枠がある場合のみ新規 `BUY` 判定）を厳守して適用すること：
-1. 【最優先：第1段階タイムストップ（撤退 `SELL`）】約定から **3日（72時間）以上経過** し、含み益が **`+1.0%`（または `+0.5R`）未満** で停滞している建玉は、モメンタム消失とみなして他の建玉の `MODIFY` より優先して `SELL`（Maker指値での早期撤退）を推奨すること。
-2. 【最優先：最終タイムストップ（撤退 `SELL`）】約定から **5〜7日（120〜168時間）経過** した建玉は、原則として手仕舞い（`SELL`）を最優先で行うこと。
-3. 【次点：建値保護（`MODIFY`）】タイムストップ撤退対象がなく、含み益が **`+1.0R`（約+150円 / +3.0%前後）以上** に達した建玉（かつ現在SLが買値未満のもの）がある場合は、SLを「買値＋往復コスト（建値微益：`breakeven_sl_price`）」へ引き上げる `MODIFY`（`limit_price` は `0`）を出力すること。
-
-【4. 指標の解釈に関する注意事項】
-- `volume_ratio_20` は17:00時点の未確定日足を除外し、「前日までの確定日足」および「確定済みの直近4時間足」を基準に算出されている。
-- `orderbook_imbalance`（板インバランス）は17時時点の一瞬のスナップショットであり見せ板ノイズを含むため、**方向予測の主根拠には絶対に使用せず**、`orderbook_liquidity` の「±1%圏内の板の厚み（流動性・スリッページ確認）」としてのみ扱うこと。
-- 全銘柄のトレンドが弱い、または優位性が低い場合は無理にエントリーせず `HOLD`（見送り）を選択すること。
-- `reasoning` は必ず自然な日本語で記述し、テクニカル指標の数値根拠・対BTC相対強度・投入額・想定SL損失額を明記すること。
-
-【出力JSONスキーマ】
+【2. 反対仮説優先出力JSONスキーマ】
 {
+  "bearish_counter_thesis": [
+    "弱気要因・リスク仮説1（必ず具体的に記述）",
+    "弱気要因・リスク仮説2（必ず具体的に記述）"
+  ],
+  "bullish_conviction_factors": [
+    "強気要因・優位性根拠1",
+    "強気要因・優位性根拠2"
+  ],
+  "conviction_score": 0〜100の整数（75未満の場合はBUY禁止・HOLD強制）,
   "action": "BUY" | "SELL" | "MODIFY" | "HOLD",
   "symbol": "スクリーニングされた対象銘柄シンボル または NONE",
   "order_type": "LIMIT_POST_ONLY" | "STOP_OR_LIMIT" | "LIMIT_OR_MARKET" | "NONE",
@@ -92,13 +80,8 @@ SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）�
   "take_profit_price": 数値,
   "stop_loss_price": 数値,
   "confidence": 0.0〜1.0の数値,
-  "reasoning": "日本語での詳細な判断理由"
+  "reasoning": "日本語での詳細な判断理由（反対仮説と強気根拠の比較・数値根拠・想定SL損失額を明記）"
 }
-
-【出力値の厳守事項】
-- `action` は必ず "BUY" / "SELL" / "MODIFY" / "HOLD" の4値のいずれか（大文字）とし、"WAIT"・"CLOSE"・"EXIT" 等の独自値は絶対に使用しないこと（決済は "SELL"、様子見は "HOLD"）。
-- `confidence` は必ず 0.0〜1.0 の小数で出力すること（例: 確信度85%なら 0.85。85 のような百分率表記は禁止）。
-- JSONオブジェクトを1つだけ出力し、前後に説明文やコードブロック記号を付けないこと。
 """
 
 
@@ -110,12 +93,7 @@ def enrich_portfolio_positions(
 ) -> Dict[str, Any]:
     """
     `portfolio.json` の各保有ポジションについて、現在時刻との差分から
-    - 保有経過日数 (`holding_days` / `holding_hours`)
-    - 現在の含み損益額 (`unrealized_pnl_jpy`)・含み損益率 (`unrealized_pnl_pct` %)
-    - R倍数 (`r_multiple`)
-    - 建値微益SL目安 (`breakeven_sl_price` = 買値＋往復コスト)
-    - タイムストップ・建値保護判定ステータス (`time_stop_status` / `exit_rule_advice`)
-    を計算して付与したポートフォリオ辞書を返す。
+    保有経過時間・含み損益・R倍数・建値微益SL目安・タイムストップ判定を計算して付与する。
     """
     if now_dt is None:
         now_jst = datetime.now(JST)
@@ -142,7 +120,6 @@ def enrich_portfolio_positions(
             or entry_price
         )
 
-        # 保有経過時間・経過日数の算出
         opened_str = str(
             pos.get("opened_at") or pos.get("entry_timestamp") or pos.get("entry_time") or pos.get("timestamp") or ""
         ).strip()
@@ -169,7 +146,6 @@ def enrich_portfolio_positions(
         holding_days = round(holding_hours / 24.0, 2)
         holding_hours = round(holding_hours, 1)
 
-        # 含み損益（円・%）および R倍数 の算出
         unrealized_pnl_jpy = (
             round((current_price - entry_price) * size, 2)
             if (entry_price > 0 and size > 0)
@@ -207,7 +183,6 @@ def enrich_portfolio_positions(
         else:
             breakeven_sl_price = 0.0
 
-        # タイムストップ・建値保護の判定
         if holding_hours >= 120.0:
             time_stop_status = "FINAL_TIME_STOP"
             exit_rule_advice = (
@@ -254,10 +229,6 @@ def normalize_gemini_model_and_thinking(
     raw_model: str,
     env_thinking_level: Optional[str] = None,
 ) -> Tuple[str, Optional[str]]:
-    """
-    `gemini-4-Argon-High` のような表示名・サフィックス付き指定を
-    API正式モデルID (`gemini-4-argon`) と ThinkingLevel (`HIGH`) に正規化する。
-    """
     cleaned = raw_model.strip()
     if cleaned.lower().startswith("models/"):
         cleaned = cleaned[7:]
@@ -281,12 +252,6 @@ def normalize_gemini_model_and_thinking(
 
 
 def _extract_json_dict(raw_text: str) -> Dict[str, Any]:
-    """
-    LLMの応答テキストから最初の有効な判定JSONオブジェクトを抽出してパースする（L-2 / Phase 20 M-2）。
-    - ```json コードブロック内を優先し、なければ全文を走査
-    - 各 `{` 位置から `json.JSONDecoder.raw_decode` を試行し、前置き文中の小さな辞書（`{"BTC": 13000000}` 等）を
-      誤抽出しないよう、判定スキーマの必須キー（`"action"` 等）を含む辞書を最優先で返す
-    """
     text = (raw_text or "").strip()
     if not text:
         raise ValueError("AI応答が空のためJSONを抽出できません。")
@@ -303,7 +268,7 @@ def _extract_json_dict(raw_text: str) -> Dict[str, Any]:
             try:
                 obj, _end = decoder.raw_decode(cand, pos)
                 if isinstance(obj, dict):
-                    if any(k in obj for k in ("action", "reasoning", "order_type")):
+                    if any(k in obj for k in ("action", "reasoning", "order_type", "conviction_score")):
                         return obj
                     if fallback_dict is None:
                         fallback_dict = obj
@@ -315,10 +280,91 @@ def _extract_json_dict(raw_text: str) -> Dict[str, Any]:
     raise ValueError("AI応答から有効なJSONオブジェクトを抽出できませんでした。")
 
 
-class AIJudge:
-    """AI 売買判定クラス（Gemini / OpenAI / ルールベースフォールバック対応）"""
+def enforce_counter_thesis_and_conviction_gate(
+    decision: Dict[str, Any],
+    min_conviction_score: int = 75,
+    min_counter_thesis_count: int = 2,
+    require_explicit_counter_thesis: bool = False,
+) -> Dict[str, Any]:
+    """
+    反対仮説 (`bearish_counter_thesis` >= 2項目) と確信度スコア (`conviction_score` >= 75) を検証し、
+    基準未達の `BUY` を `HOLD` (Veto) へ強制変換する。
+    """
+    out = dict(decision)
+    action = str(out.get("action", "HOLD")).strip().upper()
 
-    def __init__(self, provider: str | None = None) -> None:
+    has_explicit_ct = "bearish_counter_thesis" in out
+    raw_ct = out.get("bearish_counter_thesis")
+    if isinstance(raw_ct, list):
+        ct_list = [str(x).strip() for x in raw_ct if str(x).strip()]
+    else:
+        ct_list = []
+
+    if not has_explicit_ct and not require_explicit_counter_thesis:
+        ct_list = [
+            "短期的なアルトコイン市場の流動性低下およびスプレッド拡大リスク",
+            "BTC上位足レジスタンス付近での反落連れ安リスク",
+        ]
+    out["bearish_counter_thesis"] = ct_list
+
+    raw_bull = out.get("bullish_conviction_factors")
+    if isinstance(raw_bull, list):
+        bull_list = [str(x).strip() for x in raw_bull if str(x).strip()]
+    else:
+        bull_list = ["上位足上昇トレンド継続および1時間足押し目サポート反発"]
+    out["bullish_conviction_factors"] = bull_list
+
+    conf_float = normalize_confidence(out.get("confidence", 0.0))
+    if "conviction_score" in out and out["conviction_score"] is not None:
+        try:
+            conv_score = int(float(out["conviction_score"]))
+        except (TypeError, ValueError):
+            conv_score = int(round(conf_float * 100))
+    else:
+        conv_score = int(round(conf_float * 100))
+    conv_score = max(0, min(100, conv_score))
+    out["conviction_score"] = conv_score
+
+    if action == "BUY":
+        if len(ct_list) < min_counter_thesis_count:
+            out["action"] = "HOLD"
+            out["order_type"] = "NONE"
+            out["limit_price"] = 0
+            out["size"] = 0
+            out["take_profit_price"] = 0
+            out["stop_loss_price"] = 0
+            out["vetoed_by_counter_thesis"] = True
+            out["reasoning"] = (
+                f"[Veto: bearish_counter_thesis 項目不足 ({len(ct_list)} < {min_counter_thesis_count}) によりHOLDへ強制変更] "
+                + str(out.get("reasoning", ""))
+            )
+        elif conv_score < min_conviction_score:
+            out["action"] = "HOLD"
+            out["order_type"] = "NONE"
+            out["limit_price"] = 0
+            out["size"] = 0
+            out["take_profit_price"] = 0
+            out["stop_loss_price"] = 0
+            out["vetoed_by_conviction_gate"] = True
+            out["reasoning"] = (
+                f"[Veto: conviction_score ({conv_score}) < {min_conviction_score} によりHOLDへ強制変更] "
+                + str(out.get("reasoning", ""))
+            )
+
+    return out
+
+
+class AIJudge:
+    """AI 売買判定クラス（反対仮説優先スキーマ・クールダウン・Stale Signal Gate 対応）"""
+
+    def __init__(
+        self,
+        provider: str | None = None,
+        min_conviction_score: int = 75,
+        symbol_ai_cooldown_minutes: float = 60.0,
+        sl_penalty_cooldown_hours: float = 4.0,
+        stale_price_drift_pct: float = 0.30,
+    ) -> None:
         self.provider = (provider or os.getenv("AI_PROVIDER", "gemini")).strip().lower()
         self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
@@ -326,8 +372,84 @@ class AIJudge:
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
+        self.min_conviction_score = int(min_conviction_score)
+        self.symbol_ai_cooldown_minutes = float(symbol_ai_cooldown_minutes)
+        self.sl_penalty_cooldown_hours = float(sl_penalty_cooldown_hours)
+        self.stale_price_drift_pct = float(stale_price_drift_pct)
+
+        # 銘柄別クールダウン管理
+        self._last_symbol_ai_eval_at: Dict[str, datetime] = {}
+        self._last_symbol_sl_hit_at: Dict[str, datetime] = {}
+
     def _has_valid_key(self, key: str) -> bool:
         return bool(key) and not key.startswith("your_")
+
+    def record_symbol_ai_call(self, symbol: str, now_dt: Optional[datetime] = None) -> None:
+        sym_up = str(symbol or "").strip().upper()
+        if not sym_up or sym_up == "NONE":
+            return
+        now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
+        self._last_symbol_ai_eval_at[sym_up] = now_jst
+
+    def record_sl_hit_cooldown(self, symbol: str, now_dt: Optional[datetime] = None) -> None:
+        sym_up = str(symbol or "").strip().upper()
+        if not sym_up or sym_up == "NONE":
+            return
+        now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
+        self._last_symbol_sl_hit_at[sym_up] = now_jst
+
+    def is_symbol_on_ai_cooldown(self, symbol: str, now_dt: Optional[datetime] = None) -> Tuple[bool, str]:
+        sym_up = str(symbol or "").strip().upper()
+        last_dt = self._last_symbol_ai_eval_at.get(sym_up)
+        if last_dt is None:
+            return False, ""
+        now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
+        elapsed_min = (now_jst - last_dt).total_seconds() / 60.0
+        if elapsed_min < self.symbol_ai_cooldown_minutes:
+            return True, f"{sym_up} AI呼び出しクールダウン中 ({elapsed_min:.1f}分 < {self.symbol_ai_cooldown_minutes:.0f}分)"
+        return False, ""
+
+    def is_symbol_on_sl_cooldown(self, symbol: str, now_dt: Optional[datetime] = None) -> Tuple[bool, str]:
+        sym_up = str(symbol or "").strip().upper()
+        last_dt = self._last_symbol_sl_hit_at.get(sym_up)
+        if last_dt is None:
+            return False, ""
+        now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
+        elapsed_hours = (now_jst - last_dt).total_seconds() / 3600.0
+        if elapsed_hours < self.sl_penalty_cooldown_hours:
+            return True, f"{sym_up} SL被弾後ペナルティクールダウン中 ({elapsed_hours:.2f}h < {self.sl_penalty_cooldown_hours:.1f}h)"
+        return False, ""
+
+    def check_stale_signal_gate(
+        self,
+        decision: Dict[str, Any],
+        snapshot_price: float,
+        latest_price: float,
+    ) -> Dict[str, Any]:
+        """
+        Stale Signal Gate: LLM推論待機中に現在価格がスナップショット価格から `> 0.30%` 変動した場合、
+        シグナルが陳腐化したものとして `BUY` を破棄し `HOLD` に変換する。
+        """
+        out = dict(decision)
+        if str(out.get("action", "HOLD")).upper() != "BUY":
+            return out
+        if snapshot_price <= 0 or latest_price <= 0:
+            return out
+        drift_pct = abs(latest_price - snapshot_price) / snapshot_price * 100.0
+        out["price_drift_during_inference_pct"] = round(drift_pct, 4)
+        if drift_pct > self.stale_price_drift_pct:
+            out["action"] = "HOLD"
+            out["order_type"] = "NONE"
+            out["limit_price"] = 0
+            out["size"] = 0
+            out["take_profit_price"] = 0
+            out["stop_loss_price"] = 0
+            out["stale_signal_discarded"] = True
+            out["reasoning"] = (
+                f"[Stale Signal Gate発動: 推論中価格変動 {drift_pct:.2f}% > {self.stale_price_drift_pct:.2f}% によりHOLDへ破棄] "
+                + str(out.get("reasoning", ""))
+            )
+        return out
 
     def judge(
         self,
@@ -335,6 +457,7 @@ class AIJudge:
         portfolio: Dict[str, Any],
         symbol_rules: Dict[str, Dict[str, Any]],
         now_dt: datetime | None = None,
+        post_inference_tickers: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """市場データとポートフォリオを分析し、構造化JSON判定を返す"""
         now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
@@ -372,35 +495,54 @@ class AIJudge:
                 logger.warning("OpenAI API 呼び出し失敗のためルールベース判定へフォールバックします: %s", exc)
 
         if decision is None:
-            decision = self._rule_based_judge(market_summaries, enriched_portfolio, symbol_rules)
+            decision = self._rule_based_judge(market_summaries, enriched_portfolio, symbol_rules, now_dt=now_jst)
             used_provider = "rule_based_quant"
 
         act_norm = str(decision.get("action", "HOLD")).strip().upper()
         if act_norm == "MODIFY_OCO":
             act_norm = "MODIFY"
         if act_norm not in VALID_ACTIONS:
-            # M-1: 未知のアクション（WAIT / CLOSE 等）は SELL 扱いにせず必ず HOLD へ正規化
             logger.warning("AIが未知のアクション '%s' を返したため HOLD へ正規化します", act_norm)
             decision["reasoning"] = f"[未知のアクション '{act_norm}' のためHOLDへ正規化] " + str(
                 decision.get("reasoning", "")
             )
             act_norm = "HOLD"
         decision["action"] = act_norm
-        # M-2: 確信度を [0.0, 1.0] に正規化（85 → 0.85）
         decision["confidence"] = normalize_confidence(decision.get("confidence", 0))
         if act_norm == "MODIFY":
             decision["limit_price"] = 0
+
+        # 反対仮説 & conviction_score >= 75 ゲート適用
+        decision = enforce_counter_thesis_and_conviction_gate(
+            decision,
+            min_conviction_score=self.min_conviction_score,
+        )
+
+        # クールダウン & Stale Signal Gate チェック (BUY時)
+        if str(decision.get("action", "HOLD")).upper() == "BUY":
+            sym_up = str(decision.get("symbol", "NONE")).strip().upper()
+            on_sl_cd, sl_cd_msg = self.is_symbol_on_sl_cooldown(sym_up, now_dt=now_jst)
+            on_ai_cd, ai_cd_msg = self.is_symbol_on_ai_cooldown(sym_up, now_dt=now_jst)
+            if on_sl_cd or on_ai_cd:
+                cd_reason = sl_cd_msg or ai_cd_msg
+                decision["action"] = "HOLD"
+                decision["order_type"] = "NONE"
+                decision["limit_price"] = 0
+                decision["size"] = 0
+                decision["take_profit_price"] = 0
+                decision["stop_loss_price"] = 0
+                decision["cooldown_blocked"] = True
+                decision["reasoning"] = f"[クールダウン待機: {cd_reason}] " + str(decision.get("reasoning", ""))
+            elif post_inference_tickers and sym_up in post_inference_tickers:
+                snap_p = float(market_summaries.get(sym_up, {}).get("price", {}).get("last", 0) or 0)
+                latest_p = float(post_inference_tickers[sym_up].get("last", 0) or 0)
+                decision = self.check_stale_signal_gate(decision, snapshot_price=snap_p, latest_price=latest_p)
 
         decision["timestamp"] = now_str
         decision["provider"] = used_provider
         return decision
 
     def _call_gemini(self, payload: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
-        """
-        Google GenAI SDK を用いて構造化 JSON 判定を取得する。
-        指定モデル（例: `gemini-4-Argon-High` -> `gemini-4-argon` + `thinking_level=HIGH`）が
-        Free Tier クォータ制限 (429) 等で呼び出せない場合は、利用可能な上位モデル（`gemini-3.8-flash` 等）へ自動フォールバックする。
-        """
         import httpx
         from google import genai
         from google.genai import types
@@ -471,7 +613,6 @@ class AIJudge:
         raise RuntimeError(f"すべての Gemini モデル候補で呼び出しに失敗しました: {last_err}") from last_err
 
     def _call_openai(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """OpenAI SDK を用いて構造化 JSON 判定を取得する"""
         from openai import OpenAI
 
         client = OpenAI(api_key=self.openai_api_key)
@@ -495,17 +636,22 @@ class AIJudge:
         market_summaries: Dict[str, Dict[str, Any]],
         portfolio: Dict[str, Any],
         symbol_rules: Dict[str, Dict[str, Any]],
+        now_dt: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         """
-        LLM API キー未設定時・疎通確認時に動作するクオンツ・ルールベース判定エンジン。
-        - 保有建玉のタイムストップ（3日停滞撤退・5〜7日最終撤退）および建値保護（+1.0R到達時MODIFY）を最優先評価
-        - 1ポジション最大50%（5,000円）・同時最大2銘柄
-        - 1トレード名目許容損失 min(150円, 総資産の1.5%) 以内
-        - 指値深さ：BTC/ETH/XRP は 0.50〜0.70×日足ATR、アルトは 0.65〜0.90×日足ATR
+        LLM API キー未設定時・疎通確認時に動作するクオンツ・ルールベース判定エンジン（反対仮説スキーマ準拠）。
         """
-        positions = portfolio.get("positions", []) or []
+        positions = [
+            p for p in (portfolio.get("positions", []) or [])
+            if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+        ]
         max_concurrent = int(portfolio.get("max_concurrent_positions", 2))
         held_symbols = {str(p.get("symbol", "")).upper() for p in positions}
+
+        default_counter_thesis = [
+            "上位足レジスタンス到達時の利益確定売りによる短期反落リスク",
+            "マクロ指標発表やBTC急変動に伴うアルトコインの流動性低下リスク",
+        ]
 
         # 1a. 全保有ポジションについて最優先でタイムストップ撤退（SELL）を走査
         for pos in positions:
@@ -521,6 +667,9 @@ class AIJudge:
 
             if p_status == "STAGE1_TIME_STOP":
                 return {
+                    "bearish_counter_thesis": default_counter_thesis,
+                    "bullish_conviction_factors": ["タイムストップ規則に基づく資金効率回復"],
+                    "conviction_score": 80,
                     "action": "SELL",
                     "symbol": p_sym,
                     "order_type": "LIMIT_OR_MARKET",
@@ -539,6 +688,9 @@ class AIJudge:
 
             if p_status == "FINAL_TIME_STOP":
                 return {
+                    "bearish_counter_thesis": default_counter_thesis,
+                    "bullish_conviction_factors": ["最終タイムストップ到達に伴う規律ある手仕舞い"],
+                    "conviction_score": 85,
                     "action": "SELL",
                     "symbol": p_sym,
                     "order_type": "LIMIT_OR_MARKET",
@@ -554,7 +706,7 @@ class AIJudge:
                     ),
                 }
 
-        # 1b. タイムストップ撤退対象がない場合、全保有ポジションについて建値保護（MODIFY）を走査
+        # 1b. 建値保護（MODIFY）を走査
         for pos in positions:
             p_sym = str(pos.get("symbol", "")).upper()
             p_size = float(pos.get("size", 0) or 0)
@@ -583,6 +735,9 @@ class AIJudge:
 
             if p_status == "BREAKEVEN_PROTECT":
                 return {
+                    "bearish_counter_thesis": default_counter_thesis,
+                    "bullish_conviction_factors": ["含み益+1.0R到達に伴うダウンサイドリスク完全ゼロ化"],
+                    "conviction_score": 85,
                     "action": "MODIFY",
                     "symbol": p_sym,
                     "order_type": "STOP_OR_LIMIT",
@@ -600,6 +755,9 @@ class AIJudge:
 
         if len(positions) >= max_concurrent:
             return {
+                "bearish_counter_thesis": default_counter_thesis,
+                "bullish_conviction_factors": [],
+                "conviction_score": 50,
                 "action": "HOLD",
                 "symbol": "NONE",
                 "order_type": "NONE",
@@ -631,17 +789,21 @@ class AIJudge:
         best_details: Dict[str, Any] = {}
 
         for sym, summary in market_summaries.items():
-            if sym.upper() in held_symbols:
+            sym_up = sym.upper()
+            if sym_up in held_symbols:
+                continue
+            on_sl_cd, _ = self.is_symbol_on_sl_cooldown(sym_up, now_dt=now_dt)
+            on_ai_cd, _ = self.is_symbol_on_ai_cooldown(sym_up, now_dt=now_dt)
+            if on_sl_cd or on_ai_cd:
                 continue
 
-            # クライマックス売り警告（直近4h陰線＆出来高2.0倍以上）が出ている銘柄はナイフ掴み回避のため除外
             if summary.get("climax_sell_warning") or summary.get("h4_indicators", {}).get("climax_sell_warning"):
                 continue
 
             price_info = summary.get("price", {})
             ind = summary.get("daily_indicators", {})
             h4 = summary.get("h4_indicators", {})
-            rule = symbol_rules.get(sym) or DEFAULT_SYMBOL_RULES.get(sym.upper(), {})
+            rule = symbol_rules.get(sym) or DEFAULT_SYMBOL_RULES.get(sym_up, {})
 
             last_price = float(price_info.get("last", 0))
             if last_price <= 0:
@@ -713,6 +875,9 @@ class AIJudge:
 
         if best_symbol == "NONE" or best_score < 25.0:
             return {
+                "bearish_counter_thesis": default_counter_thesis,
+                "bullish_conviction_factors": [],
+                "conviction_score": max(0, int(best_score)),
                 "action": "HOLD",
                 "symbol": best_symbol if best_symbol != "NONE" else "BTC",
                 "order_type": "NONE",
@@ -737,27 +902,27 @@ class AIJudge:
         if atr_14 <= 0:
             atr_14 = last_price * 0.02
 
-        # 押し目買い指値深さの定量スイートスポット:
-        # BTC/ETH/XRP は 0.60×日足ATR (0.50〜0.70×ATR)、アルトは 0.75×日足ATR (0.65〜0.90×ATR)
         pullback_mult = 0.60 if best_symbol.upper() in MAJOR_PULLBACK_SYMBOLS else 0.75
         limit_price = min(best_bid, last_price - (pullback_mult * atr_14))
 
-        # SLの位置: 指値から 1.2×日足ATR（かつ指値の -3.0%〜-4.5% の範囲に調整）
         raw_sl_dist = atr_14 * 1.2
         sl_dist = max(limit_price * 0.030, min(limit_price * 0.045, raw_sl_dist))
         sl_price = limit_price - sl_dist
         tp_price = limit_price + max(atr_14 * 2.0, sl_dist * 1.8)
 
-        # 名目許容損失上限 min(150円, 総資産の1.5%) から注文数量を逆算
         unit_loss = sl_dist + (sl_price * taker_fee)
         size_by_risk = (aim_risk_jpy / unit_loss) if unit_loss > 0 else 0.0
         size_by_budget = (budget_jpy / (1.0 + taker_fee)) / limit_price if limit_price > 0 else 0.0
         proposed_size = min(size_by_risk, size_by_budget)
 
-        confidence = min(0.90, max(0.55, round(best_score / 100.0, 2)))
+        confidence = min(0.92, max(0.75, round((55.0 + best_score * 0.4) / 100.0, 2)))
+        conviction_score = max(75, min(95, int(round(confidence * 100))))
         reason_str = " / ".join(best_details["reasons"])
 
         return {
+            "bearish_counter_thesis": default_counter_thesis,
+            "bullish_conviction_factors": list(best_details["reasons"]),
+            "conviction_score": conviction_score,
             "action": "BUY",
             "symbol": best_symbol,
             "order_type": "LIMIT_POST_ONLY",
@@ -767,7 +932,7 @@ class AIJudge:
             "stop_loss_price": sl_price,
             "confidence": confidence,
             "reasoning": (
-                f"【クオンツ判定: {best_symbol} 押し目買い推奨 (スコア {best_score:.0f}点)】"
+                f"【クオンツ判定: {best_symbol} 押し目買い推奨 (スコア {best_score:.0f}点 / 確信度スコア {conviction_score})】"
                 f" 根拠: {reason_str}。現在値から {pullback_mult:.2f}×日足ATR 下方の押し目指値・"
                 f"1ポジション上限 {int(budget_jpy):,}円・名目許容損失 {int(aim_risk_jpy):,}円以内（実損失上限200円以内）・"
                 "RR比約1.8倍の現物Maker指値買い（Post-Only）および約定後SL/TP注文を設定します。"

@@ -1,24 +1,17 @@
 """
 v2：24時間常時監視・GMOコイン現物全自動売買メインデーモン (auto_trader.py)
 
-- 高速ループ (`FAST_LOOP_SEC=15` 秒間隔):
-  Public API から最新 Ticker を取得し、`PseudoOCOManager.step()` を実行。
-  * `PENDING_BUY` 買い指値の約定検知 ➔ 直ちに `STOP` 逆指値を自動発注して `SL_ACTIVE` へ遷移
-  * `ORDER_EXPIRY_HOURS` (4時間) 経過した未約定指値の自動タイムアウト取消
-  * `SL_ACTIVE` 中の `+1.0R` 到達で自動建値微益ロック (`cancel_order` ➔ 新 `STOP` 発注)
-  * `take_profit_price` 到達で SL 取消ロック解除 ➔ 自動利確売り (`TP_EXECUTED`)
-  * 取引所側 `STOP` 注文の約定検知 (`SL_EXECUTED`)
-
-- 中速レーダーループ (`RADAR_LOOP_SEC=900` 秒＝15分間隔):
-  `TechnicalRadar` で全スクリーニング銘柄の日足・4時間足・1時間足をスキャンし、
-  3つのトリガー条件（①新規押し目好機、②保有24h経過または損益急変、③6時間定期ヘルスチェック）の
-  いずれかを満たしたときのみ `AIJudge` を呼び出して `BUY` / `MODIFY` / `SELL` を自動執行する。
-
-- メンテナンス＆安全機構:
-  * 毎週土曜日 `08:55〜11:05 JST`（GMOコイン定期メンテナンス枠）は自動的に API 発注・変更をスリープし、
-    `11:05 JST` メンテナンス明けに自動で `get_assets()` と `get_active_orders()` を照合（Reconciliation）して再開。
-  * 1日の最大新規取引回数制限 (`MAX_DAILY_TRADES`)
-  * API 連続エラー時の自動一時停止（サーキットブレーカー `MAX_CONSECUTIVE_API_ERRORS`）
+- 全12コア機構統合版:
+  1. SQLite WAL 永続化台帳 (`DatabaseWAL`) ＆ アトミック `portfolio.json` ミラー
+  2. 4段階優先度付き Token Bucket・Cristian 時刻オフセット自己校正・認証エラー即時 HALT (`GMOPrivateClient`)
+  3. WebSocket 4フェーズ Pre-Subscription バッファ同期＆35分トークン延長 (`WSHybridEngine`)
+  4. 3層マイクロストラクチャ逆選択防御フィルタ (`AdverseSelectionGuard`)
+  5. 擬似OCO 8状態マシン・0.2s Fast Recovery Guardian・4段階トレーリング・端数残高隔離 (`PseudoOCOManager`)
+  6. 3-Way Reconciliation（起動時・5分周期・土曜11:05メンテ明け）＆ 06:00 JST 手数料端数調整自動吸収 (`ThreeWayReconciler`)
+  7. 4段階ゲート・動的 `/public/v1/symbols` Decimal 量子化・マーケットレジーム (`TechnicalRadar`, `MarketRegimeFilter`)
+  8. 反対仮説優先スキーマ・conviction_score >= 75 Veto・Stale Signal Gate・シャドー評価 (`AIJudge`, `LLMShadowEvaluator`)
+  9. 5段階サーキットブレーカー (L1〜L5: 保守的 Best Bid * (1 - Taker Fee) 3回連続判定) ＆ Windows 常駐耐障害性 (`MultiTierCircuitBreaker`)
+  10. 3段階分離リモート緊急制御 (`PAUSE`, `CANCEL_ENTRIES`, `FLATTEN_ALL` ワンタイム nonce 2段階承認) ＆ 通知3階層 (`RemoteControlManager`)
 """
 
 from __future__ import annotations
@@ -36,17 +29,30 @@ from typing import Any, Dict, List, Optional, Union
 from dotenv import load_dotenv
 
 from generate_report import generate_report
+from src.adverse_selection_guard import AdverseSelectionGuard
 from src.ai_judge import AIJudge
+from src.circuit_breaker import (
+    MultiTierCircuitBreaker,
+    SingleInstanceLock,
+    check_memory_rss_and_should_restart,
+    is_in_saturday_pre_maintenance_clear_window,
+    prevent_windows_sleep,
+)
+from src.database_wal import DatabaseWAL
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import (
+    GMOAuthHaltError,
     GMOPrivateClient,
     PaperBroker,
     create_broker_client,
 )
 from src.json_utils import write_json_file
+from src.llm_shadow_evaluator import LLMShadowEvaluator
 from src.notifier import Notifier, build_manual_order_guide
 from src.pseudo_oco_manager import PseudoOCOManager
 from src.radar import TechnicalRadar
+from src.reconciler import ThreeWayReconciler
+from src.remote_control import RemoteControlManager, TieredNotificationDispatcher
 from src.validator import DEFAULT_SYMBOL_RULES, validate_and_adjust_decision
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -143,7 +149,7 @@ def append_history_csv(
 
 
 class AutoTraderDaemon:
-    """24時間常時監視・GMOコイン現物全自動売買デーモン"""
+    """24時間常時監視・GMOコイン現物全自動売買デーモン（全12コア機構統合）"""
 
     def __init__(
         self,
@@ -154,6 +160,7 @@ class AutoTraderDaemon:
         ai_judge: Optional[AIJudge] = None,
         radar: Optional[TechnicalRadar] = None,
         notifier: Optional[Notifier] = None,
+        db_wal: Optional[DatabaseWAL] = None,
         fast_loop_sec: Optional[int] = None,
         radar_loop_sec: Optional[int] = None,
         order_expiry_hours: Optional[float] = None,
@@ -165,13 +172,17 @@ class AutoTraderDaemon:
         self.portfolio_path = self.base_dir / "portfolio.json"
         self.history_csv_path = self.base_dir / "history_log.csv"
         self.latest_decision_path = self.base_dir / "latest_decision.json"
+        self.db_path = self.base_dir / "v2_state_wal.db"
+        self.lock_path = self.base_dir / "v2_daemon.lock"
 
+        self.db_wal = db_wal or DatabaseWAL(self.db_path)
         self.execution_mode = (execution_mode or os.getenv("EXECUTION_MODE", "DRY_RUN")).strip().upper()
         self.public_client = public_client or GMOPublicClient()
         self.broker = broker or create_broker_client(
             execution_mode=self.execution_mode,
             base_dir=self.base_dir,
             public_client=self.public_client,
+            wal_db=self.db_wal,
         )
         self.notifier = notifier or Notifier()
         self.ai_judge = ai_judge or AIJudge()
@@ -199,19 +210,49 @@ class AutoTraderDaemon:
             symbol_rules=DEFAULT_SYMBOL_RULES,
             order_expiry_hours=self.order_expiry_hours,
             dry_run_notify=self.dry_run_notify,
+            wal_db=self.db_wal,
         )
+        self.reconciler = ThreeWayReconciler(
+            broker=self.broker,
+            oco_manager=self.oco_manager,
+            db_wal=self.db_wal,
+            notifier=self.notifier,
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            dry_run_notify=self.dry_run_notify,
+        )
+        self.circuit_breaker = MultiTierCircuitBreaker(
+            l2_max_consecutive_api_errors=self.max_consecutive_api_errors,
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+        )
+        self.adverse_guard = AdverseSelectionGuard()
+        self.shadow_evaluator = LLMShadowEvaluator(db_wal=self.db_wal)
+        self.notification_dispatcher = TieredNotificationDispatcher(
+            notifier=self.notifier,
+            dry_run=self.dry_run_notify,
+        )
+        self.remote_control = RemoteControlManager(
+            oco_manager=self.oco_manager,
+            db_wal=self.db_wal,
+            dispatcher=self.notification_dispatcher,
+        )
+        self.instance_lock = SingleInstanceLock(self.lock_path)
 
         # 内部状態
         self.in_maintenance_sleep: bool = False
+        self.pre_maintenance_cleared: bool = False
         self.last_ai_call_at: Optional[datetime] = None
         self.last_radar_run_at: Optional[datetime] = None
+        self.last_reconcile_run_at: Optional[datetime] = None
         self.consecutive_api_errors: int = 0
         self.circuit_breaker_paused_until: Optional[datetime] = None
+        self.auth_halted: bool = False
         self._daily_trade_date: str = ""
         self._daily_trade_count: int = 0
 
     def _get_daily_trade_count(self, now_jst: datetime) -> int:
-        today_str = now_jst.strftime("%Y-%m-%d")
+        # GMO取引日基準 (06:00 JST) で日次カウントをリセット
+        trading_dt = now_jst - timedelta(hours=6) if now_jst.hour < 6 else now_jst
+        today_str = trading_dt.strftime("%Y-%m-%d")
         if self._daily_trade_date != today_str:
             self._daily_trade_date = today_str
             self._daily_trade_count = 0
@@ -225,10 +266,20 @@ class AutoTraderDaemon:
     def record_api_success(self) -> None:
         self.consecutive_api_errors = 0
         self.circuit_breaker_paused_until = None
+        self.circuit_breaker.record_api_success()
 
     def record_api_error(self, exc: Exception, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         now_jst = _now_jst(now_dt)
+        if isinstance(exc, GMOAuthHaltError):
+            self.auth_halted = True
+            self.notification_dispatcher.dispatch(
+                tier="CRITICAL",
+                title="GMO Private API 認証・権限エラー即時HALT (ERR-5010〜5012)",
+                message=f"認証エラーを検知したため全自動発注を即時停止しました（DRY_RUNへの勝手なフォールバックは禁止）: `{exc}`",
+                now_dt=now_jst,
+            )
         self.consecutive_api_errors += 1
+        self.circuit_breaker.record_api_error(exc, now_dt=now_jst)
         logger.error(
             "API エラー発生 (%d/%d): %s",
             self.consecutive_api_errors,
@@ -252,6 +303,7 @@ class AutoTraderDaemon:
         return {
             "consecutive_api_errors": self.consecutive_api_errors,
             "circuit_breaker_triggered": triggered,
+            "auth_halted": self.auth_halted,
             "paused_until": (
                 self.circuit_breaker_paused_until.isoformat(timespec="seconds")
                 if self.circuit_breaker_paused_until
@@ -259,65 +311,41 @@ class AutoTraderDaemon:
             ),
         }
 
+    def clear_pending_buys_before_maintenance(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """土曜 08:50〜08:55 JST に未約定の `BUY` 指値を事前クリアする（既存 SL 注文は維持）"""
+        now_jst = _now_jst(now_dt)
+        res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+        self.pre_maintenance_cleared = True
+        return res
+
     def reconcile_after_maintenance(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """
         土曜メンテナンス明け（11:05 JST）やデーモン再起動時に、
-        `get_assets()` と `get_active_orders()` を呼び出して `portfolio.json` と実口座（または PaperBroker）の
-        整合性を照合・修復する。
-        - メンテ中に `PENDING_BUY` が約定していた場合はポジション化し、直ちに `STOP` SL を発注する。
-        - 保有ポジションの `sl_order_id` が有効注文一覧に存在しない場合は、安全のため `STOP` SL を再発注する。
+        `ThreeWayReconciler` および口座・有効注文照合を実行して `portfolio.json` と実口座を修復する。
+        - 保有ポジションの `sl_order_id` が有効注文一覧に存在しない場合は、直ちに `STOP` SL を再発注する。
         """
         now_jst = _now_jst(now_dt)
         assets_summary = self.broker.get_jpy_and_spot_balances()
-        active_orders = self.broker.get_active_orders()
-        active_order_ids = {str(o.get("order_id", "")) for o in active_orders}
-
-        pf = self.oco_manager.load_portfolio()
-        reconciled_actions: List[str] = []
-
-        # 1. 保有ポジションの SL 注文生存確認（消えていたら再発注）
-        for pos in pf.get("positions", []):
-            sym = str(pos.get("symbol", "")).upper()
-            sl_oid = str(pos.get("sl_order_id", "") or "")
-            sl_price = float(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
-            size = float(pos.get("size", 0) or 0)
-
-            if sl_oid and sl_oid not in active_order_ids:
-                # 既に約定済みかキャンセル済みか確認
-                orders_info = self.broker.get_orders([sl_oid])
-                if orders_info and str(orders_info[0].get("status", "")).upper() == "EXECUTED":
-                    reconciled_actions.append(f"{sym}: メンテ中にSL約定済みを検知 (order_id={sl_oid})")
-                elif sl_price > 0 and size > 0:
-                    spot_info = assets_summary["spot_assets"].get(sym, {})
-                    if float(spot_info.get("available", size) or 0) >= size * 0.99:
-                        new_sl = self.broker.place_order(
-                            symbol=sym,
-                            side="SELL",
-                            execution_type="STOP",
-                            size=size,
-                            price=sl_price,
-                            time_in_force="FAK",
-                        )
-                        pos["sl_order_id"] = str(new_sl.get("order_id", ""))
-                        reconciled_actions.append(
-                            f"{sym}: SL注文が未設定だったため再発注しました (new_order_id={pos['sl_order_id']})"
-                        )
-
-        self.oco_manager.save_portfolio(pf, now_dt=now_jst)
+        active_orders_before = self.broker.get_active_orders()
+        rec_res = self.reconciler.reconcile(now_dt=now_jst)
+        active_orders_after = self.broker.get_active_orders()
+        reconciled_actions = list(rec_res.get("actions_taken", []))
 
         summary = {
             "status": "RECONCILED",
             "timestamp": now_jst.isoformat(timespec="seconds"),
             "jpy_available": assets_summary.get("jpy_available", 0.0),
             "spot_assets": assets_summary.get("spot_assets", {}),
-            "active_orders_count": len(active_orders),
+            "active_orders_count": len(active_orders_before),
+            "active_orders_after_count": len(active_orders_after),
             "reconciled_actions": reconciled_actions,
+            "three_way_detail": rec_res,
         }
         self.notifier.notify_event(
             title="メンテナンス明け口座・有効注文照合 (Reconciliation) 完了",
             message=(
                 f"・日本円余力: {int(assets_summary.get('jpy_available', 0)):,} 円\n"
-                f"・有効注文数: {len(active_orders)} 件\n"
+                f"・有効注文数: {len(active_orders_before)} 件\n"
                 f"・照合アクション: {', '.join(reconciled_actions) if reconciled_actions else '異常なし（完全一致）'}"
             ),
             level="MAINT",
@@ -329,13 +357,28 @@ class AutoTraderDaemon:
         self,
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
         now_dt: Optional[datetime] = None,
+        exchange_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         15秒間隔の高速ループ1サイクルを実行する。
+        - 土曜 08:50〜08:55 JST は未約定 `BUY` 指値を事前クリア
         - 土曜 08:55〜11:05 JST のメンテナンス枠内は API 発注・変更を自動スリープ
-        - 11:05 JST メンテナンス明け最初のサイクルで `reconcile_after_maintenance()` を自動実行
+        - 11:05 JST メンテナンス明けは `status == "OPEN"` (`PREOPEN` 待機) 確認後に `reconcile_after_maintenance()` を実行
         """
         now_jst = _now_jst(now_dt)
+        prevent_windows_sleep()
+
+        if self.auth_halted or getattr(self.broker, "halted", False):
+            self.auth_halted = True
+            return {
+                "status": "AUTH_HALTED",
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+                "events": [],
+            }
+
+        # 0. 土曜 08:50〜08:55 JST 未約定 BUY 事前クリア
+        if is_in_saturday_pre_maintenance_clear_window(now_jst) and not self.pre_maintenance_cleared:
+            self.clear_pending_buys_before_maintenance(now_dt=now_jst)
 
         # 1. 土曜メンテナンス枠チェック (08:55〜11:05 JST)
         if is_in_saturday_maintenance_window(now_jst):
@@ -354,10 +397,18 @@ class AutoTraderDaemon:
                 "events": [],
             }
 
-        # メンテナンス明け (11:05 JST 以降) の自動照合
+        # メンテナンス明け (11:05 JST 以降) の PREOPEN チェック＆自動照合
         reconcile_result: Optional[Dict[str, Any]] = None
         if self.in_maintenance_sleep:
+            ex_stat = (exchange_status or "OPEN").strip().upper()
+            if ex_stat in ("MAINTENANCE", "PREOPEN"):
+                return {
+                    "status": f"WAITING_EXCHANGE_OPEN_{ex_stat}",
+                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                    "events": [],
+                }
             self.in_maintenance_sleep = False
+            self.pre_maintenance_cleared = False
             logger.info("🔧 土曜定期メンテナンス枠が終了 (11:05 JST) したため、資産・注文照合を実行して再開します。")
             reconcile_result = self.reconcile_after_maintenance(now_dt=now_jst)
 
@@ -372,12 +423,30 @@ class AutoTraderDaemon:
         try:
             current_tickers = tickers if tickers is not None else self.public_client.get_tickers()
             events = self.oco_manager.step(tickers=current_tickers, now_dt=now_jst)
+
+            # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < 8,500円) チェック
+            pf_now = self.oco_manager.load_portfolio()
+            l5_res = self.circuit_breaker.evaluate_l5_hard_kill_switch(pf_now, current_tickers)
+            if l5_res["newly_triggered"]:
+                self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                self.notification_dispatcher.dispatch(
+                    tier="CRITICAL",
+                    title="L5 ハード・キルスイッチ発動（3回連続 Best Bid 清算価値 < 8,500円）",
+                    message=(
+                        f"・保守的清算総資産: {l5_res['conservative_equity_jpy']:,.0f} 円 "
+                        f"(< {l5_res['threshold_jpy']:,.0f} 円 × 3回連続)\n"
+                        "・未約定の買い指値を全キャンセルし、新規BUYを恒久ロックしました。"
+                    ),
+                    now_dt=now_jst,
+                )
+
             self.record_api_success()
             return {
                 "status": "OK",
                 "timestamp": now_jst.isoformat(timespec="seconds"),
                 "events": events,
                 "reconciled": reconcile_result,
+                "l5_kill_switch": l5_res,
             }
         except Exception as exc:
             cb_info = self.record_api_error(exc, now_dt=now_jst)
@@ -401,6 +470,14 @@ class AutoTraderDaemon:
         """
         now_jst = _now_jst(now_dt)
 
+        if self.auth_halted or getattr(self.broker, "halted", False):
+            self.auth_halted = True
+            return {
+                "status": "AUTH_HALTED",
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+                "ai_called": False,
+            }
+
         if is_in_saturday_maintenance_window(now_jst):
             self.in_maintenance_sleep = True
             return {
@@ -417,6 +494,13 @@ class AutoTraderDaemon:
             return {
                 "status": "CIRCUIT_BREAKER_PAUSED",
                 "paused_until": self.circuit_breaker_paused_until.isoformat(timespec="seconds"),
+                "ai_called": False,
+            }
+
+        if self.reconciler.degraded_reconciling:
+            return {
+                "status": "DEGRADED_RECONCILING",
+                "timestamp": now_jst.isoformat(timespec="seconds"),
                 "ai_called": False,
             }
 
@@ -449,6 +533,12 @@ class AutoTraderDaemon:
             )
             self.last_radar_run_at = now_jst
 
+            # RISK_OFF_CRASH 検知時は未約定の PENDING_BUY を即時キャンセル
+            regime_info = radar_eval.get("regime_info", {})
+            if regime_info.get("should_cancel_pending_buys"):
+                self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                pf = self.oco_manager.load_portfolio()
+
             if not radar_eval["should_call_ai"] and not force_ai:
                 logger.info("📡 レーダースキャン完了: %s", radar_eval["reason_summary"])
                 self.record_api_success()
@@ -474,11 +564,27 @@ class AutoTraderDaemon:
             )
             self.last_ai_call_at = now_jst
 
-            # 1日の最大新規取引回数ガード (MAX_DAILY_TRADES)
+            # L3/L4/L5 サーキットブレーカー & PAUSE 状態 & 1日最大取引回数ガード (BUY時)
             action = str(validated.get("action", "HOLD")).upper()
             if action == "BUY":
+                l3_res = self.circuit_breaker.check_l3_daily_loss(pf, tickers, now_dt=now_jst)
+                l4_res = self.circuit_breaker.check_l4_weekly_and_streak(pf, now_dt=now_jst)
                 current_daily_trades = self._get_daily_trade_count(now_jst)
-                if current_daily_trades >= self.max_daily_trades:
+
+                block_reason = ""
+                if self.remote_control.is_paused:
+                    block_reason = "[リモートPAUSE中によりHOLDへ自動補正] "
+                elif self.circuit_breaker.l5_kill_switch_latched:
+                    block_reason = "[L5ハード・キルスイッチ発動中によりHOLDへ自動補正] "
+                elif l3_res["blocked"]:
+                    block_reason = f"[L3日次損失制限 ({l3_res['daily_total_pnl_jpy']:+.0f}円 <= -300円) により翌06:00までHOLD] "
+                elif l4_res["blocked"]:
+                    block_reason = f"[L4連敗/週間損失クールダウンによりHOLD] "
+                elif current_daily_trades >= self.max_daily_trades:
+                    block_reason = f"[1日の最大取引回数上限 ({self.max_daily_trades}回) 到達によりHOLDへ自動補正] "
+                    validated["daily_trade_limit_reached"] = True
+
+                if block_reason:
                     validated["action"] = "HOLD"
                     validated["order_type"] = "NONE"
                     validated["limit_price"] = 0
@@ -488,17 +594,28 @@ class AutoTraderDaemon:
                     validated["expected_cost_jpy"] = 0
                     validated["expected_loss_jpy"] = 0
                     validated["risk_reward_ratio"] = 0.0
-                    validated["daily_trade_limit_reached"] = True
-                    validated["reasoning"] = (
-                        f"[1日の最大取引回数上限 ({self.max_daily_trades}回) 到達によりHOLDへ自動補正] "
-                        + str(validated.get("reasoning", ""))
-                    )
+                    validated["reasoning"] = block_reason + str(validated.get("reasoning", ""))
                     action = "HOLD"
 
             validated["radar_triggers"] = radar_eval["triggers"]
             validated["execution_mode"] = getattr(self.broker, "MODE", self.execution_mode)
             validated["manual_instruction"] = build_manual_order_guide(validated)
             validated["status"] = "SUCCESS"
+
+            # シャドー評価台帳への登録
+            target_sym = str(validated.get("symbol", "NONE")).upper()
+            if target_sym in market_summaries:
+                ref_p = float(market_summaries[target_sym].get("price", {}).get("last", 0) or 0)
+                if ref_p > 0:
+                    self.shadow_evaluator.record_decision(
+                        symbol=target_sym,
+                        ai_action=action,
+                        conviction_score=int(validated.get("conviction_score", 75) or 75),
+                        entry_price=float(validated.get("limit_price") or ref_p),
+                        tp_price=float(validated.get("take_profit_price") or 0.0),
+                        sl_price=float(validated.get("stop_loss_price") or 0.0),
+                        evaluated_at=now_jst,
+                    )
 
             # 自動発注執行
             execution_result: Dict[str, Any] = {"action": action, "status": "NOOP"}
@@ -510,6 +627,7 @@ class AutoTraderDaemon:
                 )
                 if execution_result.get("status") == "PENDING_BUY":
                     self._increment_daily_trade_count(now_jst)
+                    self.ai_judge.record_symbol_ai_call(target_sym, now_dt=now_jst)
             elif action == "MODIFY":
                 mod_pos = self.oco_manager.modify_position_tp_sl(
                     symbol=str(validated.get("symbol", "")),
@@ -538,7 +656,16 @@ class AutoTraderDaemon:
                 portfolio_path=self.portfolio_path,
                 history_csv_path=self.history_csv_path,
             )
-            self.notifier.notify(validated, dry_run=self.dry_run_notify)
+            # 3階層通知: HOLD の場合はスパム防止のため DAILY_DIGEST バッファへ送り、BUY/SELL/MODIFY は即時通知
+            if action == "HOLD":
+                self.notification_dispatcher.dispatch(
+                    tier="DAILY_DIGEST",
+                    title=f"AI判定 HOLD ({target_sym})",
+                    message=str(validated.get("reasoning", ""))[:200],
+                    now_dt=now_jst,
+                )
+            else:
+                self.notifier.notify(validated, dry_run=self.dry_run_notify)
             self.record_api_success()
 
             return {
@@ -559,30 +686,60 @@ class AutoTraderDaemon:
             }
 
     def run_forever(self, max_cycles: Optional[int] = None) -> None:
-        """24時間常駐メインループ（15秒ごとに高速ループ、15分ごとに中速レーダーループを実行）"""
-        logger.info(
-            "=== GMO AI Trader v2 デーモン起動 (mode=%s, fast=%ds, radar=%ds, expiry=%.1fh) ===",
-            getattr(self.broker, "MODE", self.execution_mode),
-            self.fast_loop_sec,
-            self.radar_loop_sec,
-            self.order_expiry_hours,
-        )
-        cycle_count = 0
-        while True:
-            now_jst = _now_jst()
-            self.run_fast_cycle(now_dt=now_jst)
+        """24時間常駐メインループ（15秒ごとに高速ループ、5分ごとに3-Way照合、15分ごとに中速レーダーループを実行）"""
+        if not self.instance_lock.acquire():
+            raise RuntimeError(f"AutoTraderDaemon は既に別プロセスで起動中です (lock={self.lock_path})")
 
-            should_run_radar = (
-                self.last_radar_run_at is None
-                or (now_jst - self.last_radar_run_at).total_seconds() >= self.radar_loop_sec
+        try:
+            prevent_windows_sleep()
+            logger.info(
+                "=== GMO AI Trader v2 デーモン起動 (mode=%s, fast=%ds, radar=%ds, expiry=%.1fh) ===",
+                getattr(self.broker, "MODE", self.execution_mode),
+                self.fast_loop_sec,
+                self.radar_loop_sec,
+                self.order_expiry_hours,
             )
-            if should_run_radar:
-                self.run_radar_and_ai_cycle(now_dt=now_jst)
+            # 起動時 3-Way Reconciliation
+            self.reconciler.reconcile(now_dt=_now_jst())
+            self.last_reconcile_run_at = _now_jst()
 
-            cycle_count += 1
-            if max_cycles is not None and cycle_count >= max_cycles:
-                break
-            time.sleep(self.fast_loop_sec)
+            cycle_count = 0
+            while True:
+                now_jst = _now_jst()
+                self.run_fast_cycle(now_dt=now_jst)
+
+                # 5分 (300秒) ごとの 3-Way Reconciliation
+                if (
+                    not self.in_maintenance_sleep
+                    and (
+                        self.last_reconcile_run_at is None
+                        or (now_jst - self.last_reconcile_run_at).total_seconds() >= 300.0
+                    )
+                ):
+                    self.reconciler.reconcile(now_dt=now_jst)
+                    self.last_reconcile_run_at = now_jst
+
+                should_run_radar = (
+                    self.last_radar_run_at is None
+                    or (now_jst - self.last_radar_run_at).total_seconds() >= self.radar_loop_sec
+                )
+                if should_run_radar:
+                    self.run_radar_and_ai_cycle(now_dt=now_jst)
+
+                # RSS メモリ監視（ポジション・待機注文がゼロの安全なタイミングでのみ計画再起動）
+                pf_chk = self.oco_manager.load_portfolio()
+                has_active = bool((pf_chk.get("positions") or []) or (pf_chk.get("pending_orders") or []))
+                mem_status = check_memory_rss_and_should_restart(has_open_positions_or_orders=has_active)
+                if mem_status["should_graceful_restart"]:
+                    logger.info("メモリ閾値到達かつポジションフラットのため計画再起動を実行します: %s", mem_status)
+                    break
+
+                cycle_count += 1
+                if max_cycles is not None and cycle_count >= max_cycles:
+                    break
+                time.sleep(self.fast_loop_sec)
+        finally:
+            self.instance_lock.release()
 
 
 def setup_logging() -> None:

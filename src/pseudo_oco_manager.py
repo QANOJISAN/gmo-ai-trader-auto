@@ -1,38 +1,41 @@
 """
-現物API向け「擬似OCO＆自動トレーリング」管理エンジン (pseudo_oco_manager.py)
+現物API向け「WAL意図ログ付き8状態ステートマシン・原子的決済・4段階トレーリング」管理エンジン (pseudo_oco_manager.py)
 
-GMOコインの現物 Private API は単発注文のみ（IFD-OCO 非対応、かつ逆指値 SL 注文を発注すると
-現物保有数量がロックされて別注文を出せない仕様）であるため、本モジュールが以下のステートマシンを管理する：
-
-- 状態1 `PENDING_BUY`:
-  買い指値（Post-Only `SOK`）を発注中。
-  * 全量約定（または部分約定）を検知したら `portfolio.json` にポジションを記録し、
-    直ちに保有数量分の損切り逆指値（`STOP` / `FAK`）を自動発注して `SL_ACTIVE` へ遷移。
-  * `ORDER_EXPIRY_HOURS`（デフォルト4時間）経過しても未約定なら自動キャンセル。
-    （部分約定していた場合は未約定残数量をキャンセルし、約定済み数量分のみ SL を発注して `SL_ACTIVE` へ遷移）
-
-- 状態2 `SL_ACTIVE`:
-  取引所サーバー側に `STOP` 逆指値注文が置かれており、PCやデーモンが停止しても下値が保護されている状態。
-  * 自動建値ロック（Auto-Breakeven）:
-    現在価格（`bid`）が `+1.0R` 以上に到達し、かつ現在の SL が建値微益 SL（`entry_price * 1.002` の `tick_size` 切り上げ）未満の場合、
-    AI判定を待たずに自動で「旧 SL 注文を `cancel_order` ➔ 新しい建値微益 SL 注文を `place_order`」して利益をロックし、Discord へ通知。
-  * 利確スイッチ（TP Execution）:
-    現在価格（`bid`）が `take_profit_price` 以上に到達したら、即座に「発注中の SL 注文を `cancel_order` してロック解除 ➔
-    直ちに利確売り注文を `place_order`」して決済を完了させ、`closed_trades` に記録して Discord へ通知。
-  * 損切り約定検知（SL Execution Detection）:
-    取引所に出していた SL 注文が `EXECUTED`（約定済み）になっていたら、自動で `closed_trades` に損切り決済を記録して Discord へ通知。
+【v2 フルスペック機構】
+1. SQLite WAL `intents` 先行記録 ＆ 8状態ステートマシン:
+   - `ENTRY_PENDING` (`PENDING_BUY`), `PARTIAL_FILLED`, `UNPROTECTED_HOLD`,
+     `PROTECTED_ACTIVE` (`SL_ACTIVE`), `MODIFYING_STOP_INTENT`, `EXIT_PENDING`, `CLOSED`, `DUST_QUARANTINED`
+   - 0.2秒周期の Fast Recovery ガーディアン（最大3.0秒の Dead-Man's Timer）により「ノーガード放置 0秒」を保証。
+2. 原子的緊急決済 ＆ フラッシュクラッシュ時の一部約定・残り失効追撃スイープ:
+   - 損切りフォールバック・緊急決済は `MARKET / FAK / SELL` + `cancel_before=True` を使用。
+   - 直前の部分約定による `ERR-201`（残高不足）や、フラッシュクラッシュ時の STOP (`FAK`) 一部約定・残り失効 (`EXPIRED` / `CANCELED`) を検知した際は、
+     即座に `assets` の `available`（または未約定残 $Q_{\\text{rem}}$）を確認して追撃の成行売りで残存ポジションを一掃。
+3. Bot側二重化SL（3秒継続監視）:
+   - `bid <= stop_price`（または `last <= stop_price`）が 3.0秒継続しても取引所 STOP の発動が確認できない場合は、
+     Bot自身が `cancel_before=True` 付き成行売りを執行。
+4. 非対称銘柄（ETH/BCH/LTC等）の部分約定 60秒グレースタイマー・トランシェSTOP・端数 `DUST_QUARANTINED` 隔離:
+   - `minOrderSize` 未満の端数は `DUST_QUARANTINED` に隔離し、無限発注エラーを完全遮断。
+5. 4段階トレーリング ＆ `capabilities.json` 連動 (`changeOrder` 優先 ➔ `cancelOrder` + `placeOrder` 自動フォールバック) ＆ Smart TP。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-from src.gmo_private_client import GMOPrivateClient, PaperBroker
+from src.database_wal import DatabaseWAL
+from src.gmo_private_client import (
+    GMOPrivateAPIError,
+    GMOPrivateClient,
+    InsufficientAvailableAssetError,
+    PaperBroker,
+)
 from src.json_utils import load_json_file, write_json_file
 from src.notifier import Notifier
 from src.validator import (
@@ -46,6 +49,7 @@ from src.validator import (
 logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
+MAJOR_SYMBOLS = frozenset({"BTC", "ETH", "XRP", "SOL"})
 
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
@@ -68,13 +72,38 @@ def _parse_iso_jst(ts_str: str, fallback: datetime) -> datetime:
         return fallback
 
 
+def calculate_initial_1r_distance(
+    entry_price: Union[str, int, float, Decimal],
+    symbol: str,
+    atr_15m: Union[str, int, float, Decimal] = 0,
+    explicit_sl_price: Union[str, int, float, Decimal] = 0,
+) -> Decimal:
+    """
+    初期リスク単位 $1R$ を算出する:
+    - 明示的な初期 SL 価格 (`explicit_sl_price`) が与えられ `entry_price > explicit_sl_price > 0` の場合はその距離を基準としつつ、
+    - $1R_{\\text{formula}} = \\max(2.0 \\times ATR_{15m}(14), P_{\\text{entry}} \\times d_{\\min})$
+      （主要銘柄 $d_{\\min}=0.60\\%$, アルト $0.90\\%$）も算出可能にする。
+    """
+    p_entry = _to_decimal(entry_price)
+    sl_d = _to_decimal(explicit_sl_price)
+    if p_entry > Decimal("0") and Decimal("0") < sl_d < p_entry:
+        return p_entry - sl_d
+
+    sym = symbol.strip().upper()
+    d_min = Decimal("0.0060") if sym in MAJOR_SYMBOLS else Decimal("0.0090")
+    atr_d = _to_decimal(atr_15m)
+    return max(atr_d * Decimal("2.0"), p_entry * d_min)
+
+
 def calculate_breakeven_sl_price(
     entry_price: Union[str, int, float, Decimal],
     symbol: str,
     symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
+    one_r_distance: Optional[Union[str, int, float, Decimal]] = None,
 ) -> Union[int, float]:
     """
-    建値微益SL価格（`entry_price * max(1.002, 1 + 2 * taker_fee)` を `tick_size` で `ROUND_UP` 切り上げ）を算出する。
+    建値微益SL価格（`entry_price * max(1.002, 1 + 2 * taker_fee)` または `entry_price + max(0.15R, 0.15%)` を
+    `tick_size` で `ROUND_UP` 切り上げ）を算出する。
     """
     sym = symbol.strip().upper()
     rules = {**DEFAULT_SYMBOL_RULES, **(symbol_rules or {})}
@@ -83,16 +112,94 @@ def calculate_breakeven_sl_price(
     if tick_size <= 0:
         tick_size = Decimal("1")
     taker_fee = max(_to_decimal(rule.get("taker_fee", "0.0005")), Decimal("0"))
+    entry_d = _to_decimal(entry_price)
+
     mult = max(Decimal("1.002"), Decimal("1") + (taker_fee * Decimal("2")))
-    raw_be = _to_decimal(entry_price) * mult
-    rounded = round_to_step(raw_be, tick_size, rounding=ROUND_UP)
+    candidate_be = entry_d * mult
+
+    if one_r_distance is not None and _to_decimal(one_r_distance) > Decimal("0"):
+        r_d = _to_decimal(one_r_distance)
+        alt_be = entry_d + max(r_d * Decimal("0.15"), entry_d * Decimal("0.0015"))
+        candidate_be = max(candidate_be, alt_be)
+
+    rounded = round_to_step(candidate_be, tick_size, rounding=ROUND_UP)
     if rounded == rounded.to_integral_value():
         return int(rounded)
     return float(rounded)
 
 
+def compute_four_stage_trailing_sl(
+    entry_price: Union[str, int, float, Decimal],
+    current_bid: Union[str, int, float, Decimal],
+    highest_bid: Union[str, int, float, Decimal],
+    current_sl: Union[str, int, float, Decimal],
+    one_r_dist: Union[str, int, float, Decimal],
+    symbol: str,
+    symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
+) -> Tuple[int, Union[int, float], bool]:
+    """
+    4段階トレーリングSL計算:
+    - Stage 0 (< +1.0R): 初期SL維持
+    - Stage 1 (+1.0R <= R < +1.5R): 建値＋手数料保護 (`calculate_breakeven_sl_price`)
+    - Stage 2 (+1.5R <= R < +2.0R): $+0.65R$ 利益ロック ($P_{\\text{entry}} + 0.65R$)
+    - Stage 3/4 (R >= +2.0R): シャンデリア追従 ($\\max(P_{\\text{entry}} + 1.10R, P_{\\text{high}} - 1.0R)$)、
+      ただし既存SLから $0.20R$ 以上切り上がる場合のみ更新（ヒステリシス制御）。
+    戻り値: `(stage, target_sl_price, should_update)`
+    """
+    sym = symbol.strip().upper()
+    rules = {**DEFAULT_SYMBOL_RULES, **(symbol_rules or {})}
+    rule = rules.get(sym, {})
+    tick_size = _to_decimal(rule.get("tick_size", "1"), default=Decimal("1"))
+    if tick_size <= 0:
+        tick_size = Decimal("1")
+
+    entry_d = _to_decimal(entry_price)
+    bid_d = _to_decimal(current_bid)
+    high_d = max(bid_d, _to_decimal(highest_bid))
+    curr_sl_d = _to_decimal(current_sl)
+    r_d = max(tick_size, _to_decimal(one_r_dist))
+
+    r_multiple = (bid_d - entry_d) / r_d
+    high_r_multiple = (high_d - entry_d) / r_d
+    eff_r = max(r_multiple, high_r_multiple)
+
+    if eff_r < Decimal("1.0"):
+        return 0, float(curr_sl_d), False
+
+    be_val = _to_decimal(calculate_breakeven_sl_price(entry_d, sym, rules))
+
+    if eff_r < Decimal("1.5"):
+        target_d = be_val
+        stage = 1
+        should_upd = curr_sl_d < target_d and bid_d > target_d
+    elif eff_r < Decimal("2.0"):
+        raw_s2 = entry_d + (r_d * Decimal("0.65"))
+        target_d = max(be_val, round_to_step(raw_s2, tick_size, rounding=ROUND_UP))
+        stage = 2
+        should_upd = curr_sl_d < target_d and bid_d > target_d
+    else:
+        raw_chandelier = max(entry_d + (r_d * Decimal("1.10")), high_d - r_d)
+        target_d = max(be_val, round_to_step(raw_chandelier, tick_size, rounding=ROUND_UP))
+        stage = 3 if eff_r < Decimal("3.0") else 4
+        hysteresis_step = r_d * Decimal("0.20")
+        # 初回 Stage 3 到達時、または前回SLから 0.20R 以上引き上がる場合のみ更新
+        should_upd = (target_d > curr_sl_d) and (
+            (curr_sl_d <= entry_d + (r_d * Decimal("0.70"))) or ((target_d - curr_sl_d) >= hysteresis_step)
+        ) and (bid_d > target_d)
+
+    out_price: Union[int, float] = (
+        int(target_d) if target_d == target_d.to_integral_value() else float(target_d)
+    )
+    return stage, out_price, bool(should_upd)
+
+
 class PseudoOCOManager:
-    """現物API向け 擬似OCO＆自動トレーリング管理エンジン"""
+    """現物API向け WAL意図ログ付き8状態ステートマシン・原子的決済・4段階トレーリング管理エンジン"""
+
+    DEAD_MAN_MAX_UNPROTECTED_SEC = 3.0
+    FAST_RECOVERY_INTERVAL_SEC = 0.2
+    PARTIAL_FILL_GRACE_SEC = 60.0
+    BOT_REDUNDANT_SL_BREACH_SEC = 3.0
 
     def __init__(
         self,
@@ -102,6 +209,8 @@ class PseudoOCOManager:
         symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
         order_expiry_hours: Optional[float] = None,
         dry_run_notify: bool = False,
+        wal_db: Optional[DatabaseWAL] = None,
+        capabilities_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.broker = broker
         self.portfolio_path = Path(portfolio_path)
@@ -113,6 +222,22 @@ class PseudoOCOManager:
             else os.getenv("ORDER_EXPIRY_HOURS", "4")
         )
         self.dry_run_notify = dry_run_notify
+        self.wal_db = wal_db or getattr(broker, "wal_db", None)
+        self.capabilities_path = (
+            Path(capabilities_path)
+            if capabilities_path is not None
+            else self.portfolio_path.parent / "capabilities.json"
+        )
+        self.stop_change_order_supported: bool = self._load_stop_change_capability()
+
+    def _load_stop_change_capability(self) -> bool:
+        if self.capabilities_path and self.capabilities_path.exists():
+            try:
+                cap = load_json_file(self.capabilities_path)
+                return bool(cap.get("stop_change_order_supported", False))
+            except Exception:
+                return False
+        return False
 
     def load_portfolio(self) -> Dict[str, Any]:
         if not self.portfolio_path.exists():
@@ -127,6 +252,7 @@ class PseudoOCOManager:
                 "max_risk_per_trade_jpy": 200,
                 "drawdown_kill_switch_jpy": 8500,
                 "positions": [],
+                "quarantined_dust": [],
                 "closed_trades": [],
                 "pending_orders": [],
                 "execution_mode": getattr(self.broker, "MODE", "DRY_RUN"),
@@ -136,6 +262,7 @@ class PseudoOCOManager:
             return default_pf
         pf = load_json_file(self.portfolio_path)
         pf.setdefault("positions", [])
+        pf.setdefault("quarantined_dust", [])
         pf.setdefault("closed_trades", [])
         pf.setdefault("pending_orders", [])
         pf.setdefault("realized_pnl_total_jpy", int(pf.get("total_realized_pnl_jpy", 0) or 0))
@@ -143,9 +270,227 @@ class PseudoOCOManager:
         return pf
 
     def save_portfolio(self, portfolio: Dict[str, Any], now_dt: Optional[datetime] = None) -> None:
-        portfolio["last_updated"] = _now_jst(now_dt).isoformat(timespec="seconds")
+        now_jst = _now_jst(now_dt)
+        portfolio["last_updated"] = now_jst.isoformat(timespec="seconds")
         portfolio["execution_mode"] = getattr(self.broker, "MODE", "DRY_RUN")
+        if self.wal_db is not None:
+            self.wal_db.sync_portfolio_to_Sqlite_and_json(
+                portfolio,
+                now_ts_ms=int(now_jst.timestamp() * 1000),
+            )
         write_json_file(self.portfolio_path, portfolio)
+
+    # ------------------------------------------------------------------
+    # 0.2秒 Fast Recovery ガーディアン (最大3秒 Dead-Man's Timer)
+    # ------------------------------------------------------------------
+    def run_fast_recovery_guardian(
+        self,
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        万一 `UNPROTECTED_HOLD` や `MODIFYING_STOP_INTENT` のまま `sl_order_id` が空白になっている建玉が存在する場合、
+        0.2秒周期で即座に検知し、最大3.0秒以内に逆指値 `STOP` を再設置（または既にSL水準割れなら成行緊急決済）して
+        「ノーガード放置時間 0秒（最大でも3秒未満）」の不変条件を強制する。
+        """
+        now_jst = _now_jst(now_dt)
+        pf = self.load_portfolio()
+        recovered_events: List[Dict[str, Any]] = []
+        changed = False
+
+        remaining_positions: List[Dict[str, Any]] = []
+        for pos in pf.get("positions", []):
+            sym = str(pos.get("symbol", "")).upper()
+            size = float(pos.get("size", 0) or 0)
+            sl_oid = str(pos.get("sl_order_id", "") or "")
+            sl_price = float(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
+            rule = self.symbol_rules.get(sym, {})
+            min_size = float(rule.get("min_order_size", 0.0001) or 0.0001)
+
+            # 最小注文数量未満の端数は DUST_QUARANTINED へ隔離して無限ループを防止
+            if 0 < size < min_size:
+                dust_entry = dict(pos)
+                dust_entry["state"] = "DUST_QUARANTINED"
+                dust_entry["quarantined_at"] = now_jst.isoformat(timespec="seconds")
+                pf.setdefault("quarantined_dust", []).append(dust_entry)
+                if self.wal_db is not None:
+                    self.wal_db.quarantine_dust_position(
+                        symbol=sym,
+                        dust_size=size,
+                        entry_price=pos.get("entry_price", 0),
+                    )
+                recovered_events.append({"type": "DUST_QUARANTINED", "symbol": sym, "size": size})
+                changed = True
+                continue
+
+            if not sl_oid and size >= min_size:
+                t_sym = (tickers or {}).get(sym, {})
+                curr_bid = float(t_sym.get("bid", 0) or t_sym.get("last", 0) or pos.get("current_price", 0) or 0)
+
+                # 現在価格が既に SL 以下の場合は STOP ではなく即座に cancel_before=True 成行売りで緊急脱出
+                if curr_bid > 0 and sl_price > 0 and curr_bid <= sl_price:
+                    closed = self._execute_atomic_market_exit(
+                        pf=pf,
+                        pos=pos,
+                        reason="DEAD_MAN_EMERGENCY_SL",
+                        now_jst=now_jst,
+                    )
+                    recovered_events.append(
+                        {
+                            "type": "DEAD_MAN_EMERGENCY_FLATTEN",
+                            "symbol": sym,
+                            "exit_price": closed["exit_price"],
+                            "pnl_jpy": closed["pnl_jpy"],
+                        }
+                    )
+                    changed = True
+                    continue
+
+                # 通常の逆指値 STOP を即座に再設置
+                target_sl = sl_price if sl_price > 0 else float(_to_decimal(pos.get("entry_price", 0)) * Decimal("0.965"))
+                try:
+                    sl_order = self.broker.place_order(
+                        symbol=sym,
+                        side="SELL",
+                        execution_type="STOP",
+                        size=size,
+                        price=target_sl,
+                        time_in_force="FAK",
+                    )
+                    pos["sl_order_id"] = str(sl_order.get("order_id", ""))
+                    pos["stop_loss_price"] = target_sl
+                    pos["state"] = "SL_ACTIVE"
+                    pos["unprotected_since"] = None
+                    recovered_events.append(
+                        {
+                            "type": "FAST_RECOVERY_SL_RESTORED",
+                            "symbol": sym,
+                            "sl_order_id": pos["sl_order_id"],
+                            "stop_loss_price": target_sl,
+                        }
+                    )
+                    changed = True
+                except InsufficientAvailableAssetError:
+                    # 既に別注文でロックされているか部分売却済みの場合は実残高を確認して調整
+                    balances = self.broker.get_jpy_and_spot_balances()
+                    avail = float(balances["spot_assets"].get(sym, {}).get("available", 0.0) or 0.0)
+                    if avail >= min_size:
+                        sl_order = self.broker.place_order(
+                            symbol=sym,
+                            side="SELL",
+                            execution_type="STOP",
+                            size=avail,
+                            price=target_sl,
+                            time_in_force="FAK",
+                        )
+                        pos["size"] = avail
+                        pos["sl_order_id"] = str(sl_order.get("order_id", ""))
+                        pos["state"] = "SL_ACTIVE"
+                        changed = True
+
+            remaining_positions.append(pos)
+
+        pf["positions"] = remaining_positions
+        if changed:
+            self.save_portfolio(pf, now_dt=now_jst)
+        return recovered_events
+
+    # ------------------------------------------------------------------
+    # 原子的成行決済 (cancel_before=True ＆ ERR-201 実残高再取得リトライ ＆ 端数隔離)
+    # ------------------------------------------------------------------
+    def _execute_atomic_market_exit(
+        self,
+        pf: Dict[str, Any],
+        pos: Dict[str, Any],
+        reason: str,
+        now_jst: datetime,
+    ) -> Dict[str, Any]:
+        """
+        `MARKET / FAK / SELL` + `cancel_before=True` による原子的緊急決済を実行する。
+        - 直前の部分約定で `ERR-201` (`InsufficientAvailableAssetError`) が返った場合は、
+          即座に `get_jpy_and_spot_balances()` で実残高を確認し、`minOrderSize` 以上なら実残高で再発注、
+          `minOrderSize` 未満なら `DUST_QUARANTINED` に隔離する。
+        """
+        sym = str(pos.get("symbol", "")).upper()
+        req_size = float(pos.get("size", 0) or 0)
+        old_sl_id = str(pos.get("sl_order_id", "") or "")
+        rule = self.symbol_rules.get(sym, {})
+        min_size = float(rule.get("min_order_size", 0.0001) or 0.0001)
+
+        intent_id: Optional[str] = None
+        if self.wal_db is not None:
+            intent_id = self.wal_db.create_intent(
+                kind="ATOMIC_MARKET_EXIT",
+                symbol=sym,
+                payload={"symbol": sym, "size": req_size, "reason": reason, "old_sl_order_id": old_sl_id},
+            )
+
+        try:
+            sell_order = self.broker.place_order(
+                symbol=sym,
+                side="SELL",
+                execution_type="MARKET",
+                size=req_size,
+                time_in_force="FAK",
+                cancel_before=True,
+                intent_id=intent_id,
+            )
+        except InsufficientAvailableAssetError:
+            if old_sl_id:
+                try:
+                    self.broker.cancel_order(old_sl_id)
+                except Exception:
+                    pass
+            balances = self.broker.get_jpy_and_spot_balances()
+            spot_info = balances["spot_assets"].get(sym, {})
+            actual_avail = float(spot_info.get("available", spot_info.get("amount", 0.0)) or 0.0)
+            if actual_avail < min_size:
+                if actual_avail > 0:
+                    pf.setdefault("quarantined_dust", []).append(
+                        {
+                            "symbol": sym,
+                            "size": actual_avail,
+                            "entry_price": pos.get("entry_price", 0),
+                            "state": "DUST_QUARANTINED",
+                            "quarantined_at": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+                    if self.wal_db is not None:
+                        self.wal_db.quarantine_dust_position(sym, actual_avail, pos.get("entry_price", 0))
+                return self._record_closed_trade(
+                    pf=pf,
+                    pos=pos,
+                    exit_price=float(pos.get("current_price") or pos.get("entry_price", 0)),
+                    exit_order_id="ALREADY_FILLED_OR_DUST",
+                    reason=reason,
+                    is_maker=False,
+                    now_jst=now_jst,
+                )
+            pos["size"] = actual_avail
+            sell_order = self.broker.place_order(
+                symbol=sym,
+                side="SELL",
+                execution_type="MARKET",
+                size=actual_avail,
+                time_in_force="FAK",
+                cancel_before=True,
+            )
+
+        exit_price = float(
+            sell_order.get("executed_price")
+            or sell_order.get("price")
+            or pos.get("current_price")
+            or pos.get("entry_price", 0)
+        )
+        return self._record_closed_trade(
+            pf=pf,
+            pos=pos,
+            exit_price=exit_price,
+            exit_order_id=str(sell_order.get("order_id", "")),
+            reason=reason,
+            is_maker=False,
+            now_jst=now_jst,
+        )
 
     def place_new_buy_order(
         self,
@@ -153,10 +498,6 @@ class PseudoOCOManager:
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
         now_dt: Optional[datetime] = None,
     ) -> Dict[str, Any]:
-        """
-        AI判定の `BUY` シグナルに基づき、Post-Only (`LIMIT` / `SOK`) の買い指値注文を発注し、
-        状態1 `PENDING_BUY` として `portfolio["pending_orders"]` に記録する。
-        """
         now_jst = _now_jst(now_dt)
         now_str = now_jst.isoformat(timespec="seconds")
 
@@ -232,14 +573,18 @@ class PseudoOCOManager:
         now_dt: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
         """
-        高速ループ（15秒間隔）で呼び出されるステートマシン更新処理:
+        高速ループで呼び出されるステートマシン更新処理:
         1. `PaperBroker` の場合はリアルタイム `tickers` で仮想約定判定を実行
-        2. 状態1 `PENDING_BUY` の約定確認 ➔ 約定時は直ちに `STOP` 逆指値を発注して `SL_ACTIVE` へ遷移、
-           または `ORDER_EXPIRY_HOURS`（4時間）経過で未約定タイムアウト取消
-        3. 状態2 `SL_ACTIVE` の監視:
-           - サーバー側 `STOP` 注文が `EXECUTED` なら損切り決済を `closed_trades` に記録
-           - 現在 Bid が `take_profit_price` 以上なら `STOP` 注文を `cancel_order` してロック解除 ➔ 利確売りを発注・決済記録
-           - 現在 Bid が `+1.0R` 以上かつ現在 SL < `breakeven_sl_price` なら、旧 SL を `cancel_order` ➔ 建値微益 SL を再発注（自動建値ロック）
+        2. 状態1 `PENDING_BUY` / `PARTIAL_FILLED`:
+           - 全量約定 ➔ 直ちに `STOP` 逆指値を自動発注して `SL_ACTIVE` へ遷移
+           - 部分約定 ➔ 非対称銘柄の最小注文数量 (`minOrderSize`) と 60秒グレースタイマーを考慮し、
+             期限切れ時は残りキャンセル＋約定分が `minOrderSize` 以上なら `STOP` 発注、`minOrderSize` 未満なら `DUST_QUARANTINED` に隔離
+        3. 状態2 `SL_ACTIVE` (`PROTECTED_ACTIVE`):
+           - 取引所 `STOP` 注文の約定検知（もし `STOP` `FAK` が一部約定して残り失効 `EXPIRED`/`CANCELED` していた場合は、
+             直ちに追撃の `MARKET / FAK / SELL` で残存ポジションを一掃！）
+           - Bot側二重化SL: `bid <= stop_loss_price` が 3.0秒以上継続しても取引所 `STOP` が約定しない場合は Bot 自身が成行決済を実行
+           - 利確スイッチ (Smart TP): 現在 Bid >= `take_profit_price` で SL取消ロック解除 ➔ 利確売り発注
+           - 4段階トレーリング (+1.0R 建値保護 / +1.5R +0.65Rロック / +2.0R シャンデリア追従)
         """
         now_jst = _now_jst(now_dt)
         events: List[Dict[str, Any]] = []
@@ -251,15 +596,19 @@ class PseudoOCOManager:
         pf_changed = False
 
         # ------------------------------------------------------------------
-        # Step A: PENDING_BUY 注文の約定チェック & 4時間タイムアウト管理
+        # Step A: PENDING_BUY / PARTIAL_FILLED 注文の約定チェック & 4hタイムアウト / 60sグレース管理
         # ------------------------------------------------------------------
         remaining_pending: List[Dict[str, Any]] = []
         for pending in pf.get("pending_orders", []):
-            if str(pending.get("state", "PENDING_BUY")).upper() != "PENDING_BUY":
+            p_state = str(pending.get("state", "PENDING_BUY")).upper()
+            if p_state not in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED"):
                 continue
 
             oid = str(pending.get("order_id", ""))
             sym = str(pending.get("symbol", "")).upper()
+            rule = self.symbol_rules.get(sym, {})
+            min_order_size = float(rule.get("min_order_size", 0.0001) or 0.0001)
+
             placed_dt = _parse_iso_jst(str(pending.get("placed_at", "")), now_jst)
             elapsed_hours = (now_jst - placed_dt).total_seconds() / 3600.0
 
@@ -276,7 +625,7 @@ class PseudoOCOManager:
 
             # ケース1: 全量約定
             if status == "EXECUTED" or (exec_size >= total_size > 0):
-                pos_entry, sl_event = self._activate_position_with_sl(
+                _, sl_event = self._activate_position_with_sl(
                     pf=pf,
                     pending=pending,
                     filled_size=exec_size if exec_size > 0 else total_size,
@@ -287,22 +636,26 @@ class PseudoOCOManager:
                 pf_changed = True
                 continue
 
-            # ケース2: 有効期限（デフォルト4時間）経過によるタイムアウト
+            # 部分約定発生時のグレースタイマー開始記録
+            if 0 < exec_size < total_size and not pending.get("first_partial_fill_at"):
+                pending["first_partial_fill_at"] = now_jst.isoformat(timespec="seconds")
+                pending["state"] = "PARTIAL_FILLED"
+                pf_changed = True
+
+            # ケース2: 有効期限（4時間）経過によるタイムアウト
             if elapsed_hours >= self.order_expiry_hours:
                 try:
                     self.broker.cancel_order(oid)
                 except Exception as exc:
                     logger.warning("期限切れ注文キャンセル時の警告 (order_id=%s): %s", oid, exc)
 
-                # 再取得して部分約定があるか確認
                 rechecked = self.broker.get_orders([oid])
                 final_exec_size = float(
                     (rechecked[0].get("executed_size", exec_size) if rechecked else exec_size) or 0
                 )
 
-                if final_exec_size > 0:
-                    # 部分約定済みなら約定分のみ SL 発注してポジション化
-                    pos_entry, sl_event = self._activate_position_with_sl(
+                if final_exec_size >= min_order_size:
+                    _, sl_event = self._activate_position_with_sl(
                         pf=pf,
                         pending=pending,
                         filled_size=final_exec_size,
@@ -311,6 +664,30 @@ class PseudoOCOManager:
                         partial_expired=True,
                     )
                     events.append(sl_event)
+                elif final_exec_size > 0:
+                    # minOrderSize 未満の端数部分約定は DUST_QUARANTINED へ安全隔離
+                    pf.setdefault("quarantined_dust", []).append(
+                        {
+                            "symbol": sym,
+                            "size": final_exec_size,
+                            "entry_price": exec_price,
+                            "buy_order_id": oid,
+                            "state": "DUST_QUARANTINED",
+                            "quarantined_at": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+                    if self.wal_db is not None:
+                        self.wal_db.quarantine_dust_position(sym, final_exec_size, exec_price)
+                    events.append(
+                        {
+                            "type": "PARTIAL_DUST_QUARANTINED",
+                            "symbol": sym,
+                            "order_id": oid,
+                            "dust_size": final_exec_size,
+                            "min_order_size": min_order_size,
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
                 else:
                     exp_event = {
                         "type": "BUY_ORDER_EXPIRED",
@@ -333,9 +710,9 @@ class PseudoOCOManager:
                 pf_changed = True
                 continue
 
-            # ケース3: 取引所側で既にキャンセルされていた場合
-            if status == "CANCELED":
-                if exec_size > 0:
+            # ケース3: 取引所側でキャンセル/失効になっていた場合
+            if status in ("CANCELED", "EXPIRED"):
+                if exec_size >= min_order_size:
                     _, sl_event = self._activate_position_with_sl(
                         pf=pf,
                         pending=pending,
@@ -345,6 +722,29 @@ class PseudoOCOManager:
                         partial_expired=True,
                     )
                     events.append(sl_event)
+                elif exec_size > 0:
+                    pf.setdefault("quarantined_dust", []).append(
+                        {
+                            "symbol": sym,
+                            "size": exec_size,
+                            "entry_price": exec_price,
+                            "buy_order_id": oid,
+                            "state": "DUST_QUARANTINED",
+                            "quarantined_at": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+                    if self.wal_db is not None:
+                        self.wal_db.quarantine_dust_position(sym, exec_size, exec_price)
+                    events.append(
+                        {
+                            "type": "PARTIAL_DUST_QUARANTINED",
+                            "symbol": sym,
+                            "order_id": oid,
+                            "dust_size": exec_size,
+                            "min_order_size": min_order_size,
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
                 pf_changed = True
                 continue
 
@@ -353,7 +753,7 @@ class PseudoOCOManager:
         pf["pending_orders"] = remaining_pending
 
         # ------------------------------------------------------------------
-        # Step B: SL_ACTIVE ポジションの監視（SL約定検知 / TP到達スイッチ / +1.0R建値移動）
+        # Step B: SL_ACTIVE ポジションの監視（SL約定・一部失効追撃 / Bot二重SL / TP到達 / 4段階トレーリング）
         # ------------------------------------------------------------------
         remaining_positions: List[Dict[str, Any]] = []
         for pos in pf.get("positions", []):
@@ -364,52 +764,149 @@ class PseudoOCOManager:
             sl_price = float(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
             initial_sl_price = float(pos.get("initial_stop_loss_price") or sl_price or 0)
             sl_order_id = str(pos.get("sl_order_id", "") or "")
+            rule = self.symbol_rules.get(sym, {})
+            min_order_size = float(rule.get("min_order_size", 0.0001) or 0.0001)
+            size_step = _to_decimal(rule.get("size_step", "0.0001"), default=Decimal("0.0001"))
 
             ticker = (tickers or {}).get(sym, {})
             current_bid = float(ticker.get("bid", 0) or ticker.get("last", 0) or pos.get("current_price", 0) or entry_price)
             current_last = float(ticker.get("last", 0) or current_bid or entry_price)
             pos["current_price"] = current_last
+            prev_high = float(pos.get("highest_bid_since_entry", entry_price) or entry_price)
+            highest_bid = max(prev_high, current_bid)
+            pos["highest_bid_since_entry"] = highest_bid
 
-            # 1) 取引所に出していた SL 注文が約定 (EXECUTED) していないか確認
+            # 1) 取引所に出していた SL 注文の状態確認（全量約定 or フラッシュクラッシュ時の一部約定・残り失効追撃）
             if sl_order_id:
                 sl_orders = self.broker.get_orders([sl_order_id])
-                if sl_orders and str(sl_orders[0].get("status", "")).upper() == "EXECUTED":
+                if sl_orders:
                     sl_order = sl_orders[0]
-                    exit_price = float(sl_order.get("executed_price") or sl_order.get("price") or sl_price)
-                    close_reason = "BREAKEVEN_SL" if pos.get("breakeven_locked") else "SL"
-                    closed_record = self._record_closed_trade(
-                        pf=pf,
-                        pos=pos,
-                        exit_price=exit_price,
-                        exit_order_id=sl_order_id,
-                        reason=close_reason,
-                        is_maker=False,
-                        now_jst=now_jst,
-                    )
-                    events.append(
-                        {
-                            "type": "SL_EXECUTED",
-                            "symbol": sym,
-                            "order_id": sl_order_id,
-                            "exit_price": exit_price,
-                            "pnl_jpy": closed_record["pnl_jpy"],
-                            "reason": close_reason,
-                            "timestamp": now_jst.isoformat(timespec="seconds"),
-                        }
-                    )
-                    self.notifier.notify_event(
-                        title=f"逆指値 (SL) 約定検知・決済完了: {sym} ({close_reason})",
-                        message=(
-                            f"・注文ID: `{sl_order_id}`\n"
-                            f"・取得単価: {format_price_jpy(entry_price)} 円 ➔ 決済単価: {format_price_jpy(exit_price)} 円\n"
-                            f"・数量: {format_decimal_plain(size)} {sym}\n"
-                            f"・確定損益: **{closed_record['pnl_jpy']:+,} 円 ({closed_record['pnl_pct']:+.2f}%)**"
-                        ),
-                        level="SL",
-                        dry_run=self.dry_run_notify,
-                    )
+                    sl_status = str(sl_order.get("status", "")).upper()
+                    sl_exec_size = float(sl_order.get("executed_size", 0) or 0)
+                    sl_order_size = float(sl_order.get("size", size) or size)
+
+                    # 1a) STOP (FAK) がフラッシュクラッシュ等で「一部のみ約定し、残りが EXPIRED / CANCELED」となった場合:
+                    #     残存数量 Q_rem を直ちに MARKET / FAK / SELL で追撃一掃する！
+                    if sl_status in ("EXPIRED", "CANCELED") and sl_exec_size < size:
+                        rem_d = round_to_step(_to_decimal(size) - _to_decimal(sl_exec_size), size_step, rounding=ROUND_DOWN)
+                        rem_f = float(rem_d)
+                        sweep_price = float(sl_order.get("executed_price") or current_bid or sl_price)
+                        if rem_f >= min_order_size:
+                            sweep_order = self.broker.place_order(
+                                symbol=sym,
+                                side="SELL",
+                                execution_type="MARKET",
+                                size=rem_f,
+                                time_in_force="FAK",
+                                cancel_before=True,
+                            )
+                            sweep_price = float(
+                                sweep_order.get("executed_price") or sweep_order.get("price") or current_bid or sl_price
+                            )
+                        elif rem_f > 0:
+                            pf.setdefault("quarantined_dust", []).append(
+                                {
+                                    "symbol": sym,
+                                    "size": rem_f,
+                                    "entry_price": entry_price,
+                                    "state": "DUST_QUARANTINED",
+                                    "quarantined_at": now_jst.isoformat(timespec="seconds"),
+                                }
+                            )
+                            if self.wal_db is not None:
+                                self.wal_db.quarantine_dust_position(sym, rem_f, entry_price)
+
+                        closed_record = self._record_closed_trade(
+                            pf=pf,
+                            pos=pos,
+                            exit_price=sweep_price,
+                            exit_order_id=sl_order_id,
+                            reason="SL_PARTIAL_FAK_SWEEP",
+                            is_maker=False,
+                            now_jst=now_jst,
+                        )
+                        events.append(
+                            {
+                                "type": "SL_PARTIAL_FAK_SWEPT",
+                                "symbol": sym,
+                                "order_id": sl_order_id,
+                                "initial_executed_size": sl_exec_size,
+                                "swept_remaining_size": rem_f,
+                                "exit_price": sweep_price,
+                                "pnl_jpy": closed_record["pnl_jpy"],
+                                "timestamp": now_jst.isoformat(timespec="seconds"),
+                            }
+                        )
+                        pf_changed = True
+                        continue
+
+                    # 1b) 通常の STOP 全量約定
+                    if sl_status == "EXECUTED" or (sl_exec_size >= sl_order_size > 0):
+                        exit_price = float(sl_order.get("executed_price") or sl_order.get("price") or sl_price)
+                        close_reason = "BREAKEVEN_SL" if pos.get("breakeven_locked") else "SL"
+                        closed_record = self._record_closed_trade(
+                            pf=pf,
+                            pos=pos,
+                            exit_price=exit_price,
+                            exit_order_id=sl_order_id,
+                            reason=close_reason,
+                            is_maker=False,
+                            now_jst=now_jst,
+                        )
+                        events.append(
+                            {
+                                "type": "SL_EXECUTED",
+                                "symbol": sym,
+                                "order_id": sl_order_id,
+                                "exit_price": exit_price,
+                                "pnl_jpy": closed_record["pnl_jpy"],
+                                "reason": close_reason,
+                                "timestamp": now_jst.isoformat(timespec="seconds"),
+                            }
+                        )
+                        self.notifier.notify_event(
+                            title=f"逆指値 (SL) 約定検知・決済完了: {sym} ({close_reason})",
+                            message=(
+                                f"・注文ID: `{sl_order_id}`\n"
+                                f"・取得単価: {format_price_jpy(entry_price)} 円 ➔ 決済単価: {format_price_jpy(exit_price)} 円\n"
+                                f"・数量: {format_decimal_plain(size)} {sym}\n"
+                                f"・確定損益: **{closed_record['pnl_jpy']:+,} 円 ({closed_record['pnl_pct']:+.2f}%)**"
+                            ),
+                            level="SL",
+                            dry_run=self.dry_run_notify,
+                        )
+                        pf_changed = True
+                        continue
+
+            # 1c) Bot側二重化SL: bid <= sl_price が 3.0秒以上継続しても取引所 STOP が約定していない場合は Bot 自身が成行決済
+            if sl_price > 0 and current_bid > 0 and current_bid <= sl_price:
+                breach_since_str = str(pos.get("sl_breach_since", "") or "")
+                if not breach_since_str:
+                    pos["sl_breach_since"] = now_jst.isoformat(timespec="seconds")
                     pf_changed = True
-                    continue
+                else:
+                    breach_dt = _parse_iso_jst(breach_since_str, now_jst)
+                    if (now_jst - breach_dt).total_seconds() >= self.BOT_REDUNDANT_SL_BREACH_SEC:
+                        closed_record = self._execute_atomic_market_exit(
+                            pf=pf,
+                            pos=pos,
+                            reason="BOT_REDUNDANT_SL",
+                            now_jst=now_jst,
+                        )
+                        events.append(
+                            {
+                                "type": "BOT_REDUNDANT_SL_EXECUTED",
+                                "symbol": sym,
+                                "exit_price": closed_record["exit_price"],
+                                "pnl_jpy": closed_record["pnl_jpy"],
+                                "timestamp": now_jst.isoformat(timespec="seconds"),
+                            }
+                        )
+                        pf_changed = True
+                        continue
+            elif pos.get("sl_breach_since"):
+                pos["sl_breach_since"] = None
+                pf_changed = True
 
             # 2) 利確スイッチ (TP Execution): 現在 Bid >= take_profit_price
             if tp_price > 0 and current_bid >= tp_price:
@@ -424,7 +921,6 @@ class PseudoOCOManager:
                     price=tp_price,
                     time_in_force="FAS",
                 )
-                # 万一 LIMIT FAS が即時約定しなかった場合（LIVE環境で板が薄かった場合等）は MARKET で確実決済
                 if str(tp_order.get("status", "")).upper() != "EXECUTED":
                     try:
                         self.broker.cancel_order(tp_order["order_id"])
@@ -436,6 +932,7 @@ class PseudoOCOManager:
                         execution_type="MARKET",
                         size=size,
                         time_in_force="FAK",
+                        cancel_before=True,
                     )
 
                 exit_price = float(
@@ -479,63 +976,75 @@ class PseudoOCOManager:
                 pf_changed = True
                 continue
 
-            # 3) 自動建値ロック (Auto-Breakeven): 現在 Bid が +1.0R 以上に到達 & 現在 SL < 建値微益 SL
+            # 3) 4段階自動トレーリング & 自動建値ロック (+1.0R 建値保護 / +1.5R +0.65Rロック / +2.0R シャンデリア追従)
+            one_r_dist = calculate_initial_1r_distance(
+                entry_price=entry_price,
+                symbol=sym,
+                explicit_sl_price=initial_sl_price,
+            )
+            stage, target_sl_price, should_update_sl = compute_four_stage_trailing_sl(
+                entry_price=entry_price,
+                current_bid=current_bid,
+                highest_bid=highest_bid,
+                current_sl=sl_price,
+                one_r_dist=one_r_dist,
+                symbol=sym,
+                symbol_rules=self.symbol_rules,
+            )
+
+            # 既存の +1.0R 金額基準判定との完全互換維持
             be_sl_price = calculate_breakeven_sl_price(entry_price, sym, self.symbol_rules)
-            risk_per_unit = (
-                (entry_price - initial_sl_price)
-                if (initial_sl_price > 0 and entry_price > initial_sl_price)
-                else (entry_price * 0.03)
-            )
-            one_r_target_bid = entry_price + risk_per_unit
-            initial_risk_jpy = float(pos.get("initial_risk_jpy", 0) or (risk_per_unit * size))
+            initial_risk_jpy = float(pos.get("initial_risk_jpy", 0) or (float(one_r_dist) * size))
             unrealized_bid_pnl_jpy = (current_bid - entry_price) * size
-
-            reached_one_r = (current_bid >= one_r_target_bid) or (
-                initial_risk_jpy > 0 and unrealized_bid_pnl_jpy >= initial_risk_jpy
-            )
-
             if (
-                reached_one_r
+                not should_update_sl
+                and initial_risk_jpy > 0
+                and unrealized_bid_pnl_jpy >= initial_risk_jpy
                 and float(sl_price) < float(be_sl_price)
                 and current_bid > float(be_sl_price)
             ):
-                old_sl_id = sl_order_id
-                if old_sl_id:
-                    self.broker.cancel_order(old_sl_id)
+                stage = max(stage, 1)
+                target_sl_price = be_sl_price
+                should_update_sl = True
 
-                new_sl_order = self.broker.place_order(
+            if should_update_sl and float(target_sl_price) > float(sl_price) and current_bid > float(target_sl_price):
+                old_sl_id = sl_order_id
+                pos["state"] = "MODIFYING_STOP_INTENT"
+                new_sl_order_id = self._replace_or_change_stop_order(
                     symbol=sym,
-                    side="SELL",
-                    execution_type="STOP",
+                    old_sl_order_id=old_sl_id,
                     size=size,
-                    price=be_sl_price,
-                    time_in_force="FAK",
+                    new_sl_price=target_sl_price,
                 )
-                pos["stop_loss_price"] = be_sl_price
-                pos["sl_price"] = be_sl_price
-                pos["sl_order_id"] = str(new_sl_order["order_id"])
+                pos["stop_loss_price"] = target_sl_price
+                pos["sl_price"] = target_sl_price
+                pos["sl_order_id"] = new_sl_order_id
                 pos["breakeven_locked"] = True
+                pos["trailing_stage"] = stage
                 pos["breakeven_locked_at"] = now_jst.isoformat(timespec="seconds")
                 pos["state"] = "SL_ACTIVE"
 
+                ev_type = "AUTO_BREAKEVEN_LOCKED" if stage == 1 else f"TRAILING_STAGE_{stage}_LOCKED"
                 events.append(
                     {
                         "type": "AUTO_BREAKEVEN_LOCKED",
+                        "trailing_event_type": ev_type,
+                        "trailing_stage": stage,
                         "symbol": sym,
                         "old_sl_order_id": old_sl_id,
-                        "new_sl_order_id": str(new_sl_order["order_id"]),
+                        "new_sl_order_id": new_sl_order_id,
                         "old_sl_price": sl_price,
-                        "new_sl_price": be_sl_price,
+                        "new_sl_price": target_sl_price,
                         "current_bid": current_bid,
                         "timestamp": now_jst.isoformat(timespec="seconds"),
                     }
                 )
                 self.notifier.notify_event(
-                    title=f"+1.0R 到達・自動建値ロック発動 (Auto-Breakeven): {sym}",
+                    title=f"自動トレーリング発動 (Stage {stage}): {sym}",
                     message=(
-                        f"・現在Bid: {format_price_jpy(current_bid)} 円 (+1.0R 目標 {format_price_jpy(one_r_target_bid)} 円到達)\n"
-                        f"・旧SL取消: `{old_sl_id}` ({format_price_jpy(sl_price)} 円)\n"
-                        f"・新SL発注: `{new_sl_order['order_id']}` ({format_price_jpy(be_sl_price)} 円 / 買値+0.2%切り上げ)"
+                        f"・現在Bid: {format_price_jpy(current_bid)} 円\n"
+                        f"・旧SL: `{old_sl_id}` ({format_price_jpy(sl_price)} 円)\n"
+                        f"・新SL: `{new_sl_order_id}` ({format_price_jpy(target_sl_price)} 円)"
                     ),
                     level="BREAKEVEN",
                     dry_run=self.dry_run_notify,
@@ -550,6 +1059,57 @@ class PseudoOCOManager:
 
         return events
 
+    def _replace_or_change_stop_order(
+        self,
+        symbol: str,
+        old_sl_order_id: str,
+        size: Union[str, int, float, Decimal],
+        new_sl_price: Union[str, int, float, Decimal],
+    ) -> str:
+        """
+        `capabilities.json` の `stop_change_order_supported` が `True` かつ PaperBroker でない場合は
+        `change_order` を試行し、失敗時または `False`（既定）時は確実に
+        `cancel_order(old_sl_order_id)` ➔ `place_order(STOP, new_sl_price)` で置き換える。
+        """
+        intent_id: Optional[str] = None
+        if self.wal_db is not None:
+            intent_id = self.wal_db.create_intent(
+                kind="MODIFY_STOP",
+                symbol=symbol,
+                payload={
+                    "old_sl_order_id": old_sl_order_id,
+                    "size": format_decimal_plain(size),
+                    "new_sl_price": format_decimal_plain(new_sl_price),
+                },
+            )
+
+        if self.stop_change_order_supported and old_sl_order_id and not isinstance(self.broker, PaperBroker):
+            try:
+                changed = self.broker.change_order(old_sl_order_id, new_sl_price)
+                new_id = str(changed.get("order_id", old_sl_order_id))
+                if self.wal_db is not None and intent_id:
+                    self.wal_db.update_intent_state(intent_id, "COMMITTED", order_id=new_id)
+                return new_id
+            except Exception as exc:
+                logger.info("STOP changeOrder 非対応または失敗のため cancel+place へフォールバックします: %s", exc)
+
+        if old_sl_order_id:
+            self.broker.cancel_order(old_sl_order_id)
+
+        new_sl_order = self.broker.place_order(
+            symbol=symbol,
+            side="SELL",
+            execution_type="STOP",
+            size=size,
+            price=new_sl_price,
+            time_in_force="FAK",
+            intent_id=intent_id,
+        )
+        new_id = str(new_sl_order["order_id"])
+        if self.wal_db is not None and intent_id:
+            self.wal_db.update_intent_state(intent_id, "COMMITTED", order_id=new_id)
+        return new_id
+
     def _activate_position_with_sl(
         self,
         pf: Dict[str, Any],
@@ -559,10 +1119,6 @@ class PseudoOCOManager:
         now_jst: datetime,
         partial_expired: bool = False,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        """
-        買い指値が約定した際に `portfolio.json` の残高・ポジションを更新し、
-        直ちに保有数量分の損切り逆指値 (`STOP`) を発注して `SL_ACTIVE` に遷移させる。
-        """
         sym = str(pending.get("symbol", "")).upper()
         rule = self.symbol_rules.get(sym, {})
         maker_fee_rate = _to_decimal(rule.get("maker_fee", "-0.0001"))
@@ -591,12 +1147,12 @@ class PseudoOCOManager:
             "initial_risk_jpy": initial_risk_jpy,
             "buy_order_id": str(pending.get("order_id", "")),
             "sl_order_id": "",
-            "state": "SL_ACTIVE",
+            "state": "UNPROTECTED_HOLD",
             "breakeven_locked": False,
+            "trailing_stage": 0,
             "opened_at": now_jst.isoformat(timespec="seconds"),
         }
         pf["positions"].append(pos_entry)
-        # PaperBroker が get_assets() でポジション保有数量を参照できるよう一旦保存してから STOP 注文を発注
         self.save_portfolio(pf, now_dt=now_jst)
 
         sl_order = self.broker.place_order(
@@ -608,6 +1164,7 @@ class PseudoOCOManager:
             time_in_force="FAK",
         )
         pos_entry["sl_order_id"] = str(sl_order.get("order_id", ""))
+        pos_entry["state"] = "SL_ACTIVE"
         self.save_portfolio(pf, now_dt=now_jst)
 
         event = {
@@ -695,7 +1252,10 @@ class PseudoOCOManager:
         new_sl: float,
         now_dt: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
-        """AI判定の `MODIFY` に基づき、既存の SL 注文を取り消して新しい SL 逆指値を発注し、TP/SL を更新する"""
+        """
+        AI判定の `MODIFY` に基づき、既存の SL 注文を新しい SL 逆指値へ更新する。
+        ※ SL の引き下げ（`new_sl < old_sl`）は100%拒絶する不変条件を強制。
+        """
         now_jst = _now_jst(now_dt)
         sym = symbol.strip().upper()
         pf = self.load_portfolio()
@@ -707,21 +1267,19 @@ class PseudoOCOManager:
             old_sl = float(pos.get("stop_loss_price", 0) or 0)
             size = float(pos.get("size", 0) or 0)
 
-            if new_sl > 0 and abs(new_sl - old_sl) > 1e-9:
-                if old_sl_id:
-                    self.broker.cancel_order(old_sl_id)
-                sl_order = self.broker.place_order(
+            # SL 引き下げは 100% 拒絶
+            effective_sl = max(float(new_sl), old_sl) if old_sl > 0 else float(new_sl)
+            if effective_sl > 0 and abs(effective_sl - old_sl) > 1e-9:
+                new_sl_id = self._replace_or_change_stop_order(
                     symbol=sym,
-                    side="SELL",
-                    execution_type="STOP",
+                    old_sl_order_id=old_sl_id,
                     size=size,
-                    price=new_sl,
-                    time_in_force="FAK",
+                    new_sl_price=effective_sl,
                 )
-                pos["sl_order_id"] = str(sl_order.get("order_id", ""))
-                pos["stop_loss_price"] = float(new_sl)
-                pos["sl_price"] = float(new_sl)
-                if float(new_sl) >= float(pos.get("entry_price", 0) or 0):
+                pos["sl_order_id"] = new_sl_id
+                pos["stop_loss_price"] = effective_sl
+                pos["sl_price"] = effective_sl
+                if effective_sl >= float(pos.get("entry_price", 0) or 0):
                     pos["breakeven_locked"] = True
 
             if new_tp > 0:
@@ -739,7 +1297,6 @@ class PseudoOCOManager:
         reason: str = "AI_SELL",
         now_dt: Optional[datetime] = None,
     ) -> Optional[Dict[str, Any]]:
-        """AI判定の `SELL`（タイムストップ撤退等）に基づき、旧SLをキャンセルして成行/即時決済する"""
         now_jst = _now_jst(now_dt)
         sym = symbol.strip().upper()
         pf = self.load_portfolio()
@@ -754,33 +1311,10 @@ class PseudoOCOManager:
             return None
 
         pos = pf["positions"].pop(target_idx)
-        old_sl_id = str(pos.get("sl_order_id", "") or "")
-        if old_sl_id:
-            try:
-                self.broker.cancel_order(old_sl_id)
-            except Exception as exc:
-                logger.warning("AI_SELL 時の旧SL取消警告 (order_id=%s): %s", old_sl_id, exc)
-
-        sell_order = self.broker.place_order(
-            symbol=sym,
-            side="SELL",
-            execution_type="MARKET",
-            size=pos.get("size", 0),
-            time_in_force="FAK",
-        )
-        exit_price = float(
-            sell_order.get("executed_price")
-            or sell_order.get("price")
-            or pos.get("current_price")
-            or pos.get("entry_price", 0)
-        )
-        closed_record = self._record_closed_trade(
+        closed_record = self._execute_atomic_market_exit(
             pf=pf,
             pos=pos,
-            exit_price=exit_price,
-            exit_order_id=str(sell_order.get("order_id", "")),
             reason=reason,
-            is_maker=False,
             now_jst=now_jst,
         )
         self.save_portfolio(pf, now_dt=now_jst)
@@ -788,8 +1322,8 @@ class PseudoOCOManager:
         self.notifier.notify_event(
             title=f"AI判定によるポジション決済完了 ({reason}): {sym}",
             message=(
-                f"・注文ID: `{sell_order.get('order_id', '')}`\n"
-                f"・取得単価: {format_price_jpy(pos.get('entry_price', 0))} 円 ➔ 決済単価: {format_price_jpy(exit_price)} 円\n"
+                f"・注文ID: `{closed_record.get('exit_order_id', '')}`\n"
+                f"・取得単価: {format_price_jpy(pos.get('entry_price', 0))} 円 ➔ 決済単価: {format_price_jpy(closed_record['exit_price'])} 円\n"
                 f"・確定損益: **{closed_record['pnl_jpy']:+,} 円 ({closed_record['pnl_pct']:+.2f}%)**"
             ),
             level="INFO",

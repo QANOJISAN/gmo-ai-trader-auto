@@ -1,41 +1,46 @@
 """
 GMOコイン Private API クライアント ＆ 仮想取引所シミュレータ (gmo_private_client.py)
 
-- `GMOPrivateClient`:
-  HMAC-SHA256署名（`API-KEY`, `API-TIMESTAMP`, `API-SIGN`）による GMOコイン公式 Private API クライアント。
-  * `get_assets()` (`GET /private/v1/account/assets`)
-  * `place_order(...)` (`POST /private/v1/order` — Post-Only `SOK` 即時失効時の1ティック調整・再試行機能付き)
-  * `get_active_orders(symbol)` (`GET /private/v1/activeOrders`)
-  * `get_orders(order_ids)` (`GET /private/v1/orders`)
-  * `cancel_order(order_id)` (`POST /private/v1/cancelOrder`)
-  * `get_latest_executions(symbol)` (`GET /private/v1/latestExecutions`)
-
-- `PaperBroker`:
-  `EXECUTION_MODE=DRY_RUN` 時に Private API を一切呼ばず、Public API のリアルタイム Ticker (`ask`, `bid`, `last`) と照合して
-  ローカルの `paper_orders.json` 上で
-  * 指値刺さり（`last <= limit_price` または `ask <= limit_price`）
-  * SL発動（`bid <= stop_loss_price` または `last <= stop_loss_price`）
-  * TP到達（`bid >= take_profit_price` または `last >= take_profit_price`）
-  * GMOコイン現物特有の「SL逆指値発注中の保有数量ロック（取消しない限り別注文を出せない仕様）」
-  * Post-Only (`SOK`) 指値が `ask` 以上で発注された際の即時失効（`CANCELED`）と1ティック再調整
-  を本物そっくりに再現する仮想取引所クラス。
+【v2 フルスペック機構】
+1. 優先度付きトークンバケット (`PriorityTokenBucket`):
+   Tier 1 上限 (20 req/s) に対し安全マージンを設けた 4段階優先度制御:
+   - Priority 1: 緊急成行決済・SL設置 (緊急リザーブ枠まで無制限利用可)
+   - Priority 2: 注文取消・SL変更 (`changeOrder`, `cancelOrder`, `cancelOrders`, `cancelBulkOrder`)
+   - Priority 3: 3者照合・状態照会 (`assets`, `activeOrders`, `orders`, `latestExecutions`)
+   - Priority 4: 新規買い発注・一般データ取得 (`tradingVolume` 等)
+2. クリスティアンのアルゴリズムによるサーバー時計オフセット自己校正 (`clock_offset_ms`):
+   - JSONレスポンスの `responsetime`（ミリ秒UTC）および HTTP `Date` ヘッダから通信往復遅延 $\\text{RTT}/2$ を補正して
+     常時 `clock_offset_ms` を算出し、`API-TIMESTAMP` を自動補正。
+   - `ERR-5008` / `ERR-5009` 受信時は、そのエラー応答自身の `responsetime` / `Date` から即座にオフセットを自己校正して再試行。
+3. 署名対象 JSON 文字列の直接送信 ＆ 指数表記 (`1e-05`) の完全排除。
+4. 全エンドポイント実装:
+   - `POST /private/v1/changeOrder`, `POST /private/v1/cancelOrders`, `POST /private/v1/cancelBulkOrder`,
+     `GET /private/v1/account/tradingVolume`, `POST/PUT/DELETE /private/v1/ws-auth`
+   - ※ `PUT/DELETE /private/v1/ws-auth` はリクエスト body に `{"token": ...}` を送るが、
+     **HMAC 署名対象文字列には body を含めない (`timestamp + method + /v1/ws-auth`)** GMO 固有仕様を厳守。
+5. 認証エラー (`ERR-5010〜5012`) 時は絶対にドライラン残高へフォールバックせず、即座にシステムを `HALT`（台帳不変更）にする。
+6. POST 発注時のタイムアウトや `ERR-5003` は盲目的に再送せず、必ず `intents` を `UNKNOWN` にして
+   `activeOrders` と `latestExecutions` の照合を先に行う。
 """
 
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import hmac
 import json
 import logging
 import os
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
+from src.database_wal import DatabaseWAL
 from src.gmo_client import GMOPublicClient, SystemSSLAdapter
 from src.json_utils import load_json_file, write_json_file
 from src.validator import (
@@ -51,15 +56,39 @@ JST = timezone(timedelta(hours=9))
 
 
 class GMOPrivateAPIError(RuntimeError):
-    """GMOコイン Private API エラー例外"""
+    """GMOコイン Private API エラー基底例外"""
 
-    def __init__(self, message: str, messages: Optional[List[Dict[str, Any]]] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        error_codes: Optional[List[str]] = None,
+    ) -> None:
         super().__init__(message)
         self.messages = messages or []
+        self.error_codes = error_codes or [
+            str(m.get("message_code", "")) for m in (messages or []) if isinstance(m, dict)
+        ]
 
 
 class InsufficientAvailableAssetError(GMOPrivateAPIError):
-    """現物保有数量または日本円余力が別注文（SL等）でロックされており発注できない場合の例外 (ERR-201相当)"""
+    """現物保有数量または日本円余力が別注文（SL等）でロックされており発注できない場合の例外 (ERR-201)"""
+
+
+class GMOAuthHaltError(GMOPrivateAPIError):
+    """認証エラー (ERR-5010〜5012)・権限エラーによりシステムを即時 HALT させる致命的例外"""
+
+
+class GMORateLimitError(GMOPrivateAPIError):
+    """レートリミット超過 (ERR-5003 / HTTP 429) 例外"""
+
+
+class GMOMaintenanceError(GMOPrivateAPIError):
+    """メンテナンス中・プレオープン中 (ERR-5201〜5206 / ERR-5203) 例外"""
+
+
+class GMOOrderOutcomeUnknownError(GMOPrivateAPIError):
+    """POST 発注時のタイムアウト等で約定・注文成否が不明 (UNKNOWN) となり照合が必要な例外"""
 
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
@@ -82,8 +111,109 @@ def _normalize_v1_path(path: str) -> str:
     return p
 
 
+def parse_server_time_ms(
+    responsetime_str: Optional[str] = None,
+    http_date_header: Optional[str] = None,
+) -> Optional[int]:
+    """
+    JSON の `responsetime`（例: `"2026-10-21T12:00:00.123Z"`）または HTTP `Date` ヘッダから
+    サーバー時刻の Unix ミリ秒を抽出する。
+    """
+    if responsetime_str:
+        s = str(responsetime_str).strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    if http_date_header:
+        try:
+            dt = email.utils.parsedate_to_datetime(str(http_date_header).strip())
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            pass
+    return None
+
+
+class PriorityTokenBucket:
+    """
+    Tier 1 上限 (20 req/s) に対して安全マージンを設けた 4段階優先度付きトークンバケット。
+    - Priority 1 (緊急決済・SL設置): 予約リザーブ 0（最後の1トークンまで使用可能）
+    - Priority 2 (注文取消・SL変更): 予約リザーブ 2（緊急用2トークンを残す）
+    - Priority 3 (3者照合・状態照会): 予約リザーブ 4
+    - Priority 4 (新規買い・一般取得): 予約リザーブ 6
+    """
+
+    RESERVE_BY_PRIORITY: Dict[int, float] = {
+        1: 0.0,
+        2: 2.0,
+        3: 4.0,
+        4: 6.0,
+    }
+
+    def __init__(self, rate_per_sec: float = 15.0, capacity: float = 16.0) -> None:
+        self.rate_per_sec = float(rate_per_sec)
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.last_refill = time.monotonic()
+        self._lock = threading.Lock()
+        self.total_consumed_by_priority: Dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.total_waits_by_priority: Dict[int, int] = {1: 0, 2: 0, 3: 0, 4: 0}
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self.last_refill)
+        self.last_refill = now
+        self.tokens = min(self.capacity, self.tokens + elapsed * self.rate_per_sec)
+
+    def acquire(self, priority: int = 3, cost: float = 1.0, max_wait_sec: float = 5.0) -> float:
+        """
+        指定された優先度でトークンを取得する。
+        低優先度リクエストはリザーブ閾値を下回ると自動的に待機し、Priority 1/2 の帯域を100%保護する。
+        戻り値: 待機した秒数
+        """
+        prio = min(4, max(1, int(priority)))
+        reserve = self.RESERVE_BY_PRIORITY.get(prio, 4.0)
+        required = reserve + float(cost)
+        start_t = time.monotonic()
+        waited = 0.0
+
+        while True:
+            with self._lock:
+                self._refill()
+                if self.tokens >= required:
+                    self.tokens -= float(cost)
+                    self.total_consumed_by_priority[prio] = self.total_consumed_by_priority.get(prio, 0) + 1
+                    return waited
+                deficit = required - self.tokens
+                sleep_sec = min(0.25, max(0.005, deficit / self.rate_per_sec))
+
+            if (time.monotonic() - start_t) + sleep_sec > max_wait_sec:
+                with self._lock:
+                    self._refill()
+                    if prio == 1:
+                        # Priority 1（緊急決済・SL設置）はタイムアウト時も強制通過を許可
+                        self.tokens = max(0.0, self.tokens - float(cost))
+                        self.total_consumed_by_priority[1] += 1
+                        return time.monotonic() - start_t
+                raise GMORateLimitError(
+                    f"PriorityTokenBucket 待機上限超過 (priority={prio}, tokens={self.tokens:.2f}, required={required:.2f})"
+                )
+
+            with self._lock:
+                self.total_waits_by_priority[prio] = self.total_waits_by_priority.get(prio, 0) + 1
+            time.sleep(sleep_sec)
+            waited = time.monotonic() - start_t
+
+
 class GMOPrivateClient:
-    """GMOコイン 公式 Private API クライアント (LIVE モード用)"""
+    """GMOコイン 公式 Private API クライアント (LIVE モード用・自己修復時計オフセット＆優先度バケット内蔵)"""
 
     BASE_URL = "https://api.coin.z.com/private"
     MODE = "LIVE"
@@ -93,6 +223,8 @@ class GMOPrivateClient:
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
         public_client: Optional[GMOPublicClient] = None,
+        wal_db: Optional[DatabaseWAL] = None,
+        token_bucket: Optional[PriorityTokenBucket] = None,
         timeout: int = 10,
         max_retries: int = 2,
         retry_delay: float = 0.5,
@@ -100,9 +232,16 @@ class GMOPrivateClient:
         self.api_key = (api_key if api_key is not None else os.getenv("GMO_API_KEY", "")).strip()
         self.api_secret = (api_secret if api_secret is not None else os.getenv("GMO_API_SECRET", "")).strip()
         self.public_client = public_client or GMOPublicClient(timeout=timeout)
+        self.wal_db = wal_db
+        self.token_bucket = token_bucket or PriorityTokenBucket()
         self.timeout = timeout
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+
+        self.clock_offset_ms: int = 0
+        self.last_rtt_ms: float = 0.0
+        self.halted: bool = False
+        self.halt_reason: str = ""
 
         self.session = requests.Session()
         self.session.mount("https://", SystemSSLAdapter())
@@ -121,12 +260,53 @@ class GMOPrivateClient:
             and not self.api_secret.startswith("your_")
         )
 
-    def _build_auth_headers(self, method: str, v1_path: str, body_str: str = "") -> Dict[str, str]:
+    def _current_timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + int(self.clock_offset_ms)
+
+    def update_clock_offset_cristian(
+        self,
+        t_send_ms: float,
+        t_recv_ms: float,
+        responsetime_str: Optional[str] = None,
+        http_date_header: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        クリスティアンのアルゴリズムにより通信往復遅延 $\\text{RTT}/2$ を補正して
+        サーバー時刻オフセット `clock_offset_ms` を更新する。
+        $\\text{offset} = (T_{\\text{server}} + \\text{RTT}/2) - T_{\\text{recv}}$
+        """
+        server_ms = parse_server_time_ms(responsetime_str, http_date_header)
+        if server_ms is None:
+            return None
+        rtt_ms = max(0.0, float(t_recv_ms) - float(t_send_ms))
+        self.last_rtt_ms = rtt_ms
+        estimated_server_now_ms = float(server_ms) + (rtt_ms / 2.0)
+        self.clock_offset_ms = int(round(estimated_server_now_ms - float(t_recv_ms)))
+        return self.clock_offset_ms
+
+    def _build_auth_headers(
+        self,
+        method: str,
+        v1_path: str,
+        body_str: str = "",
+        timestamp_ms: Optional[int] = None,
+        exclude_body_from_sign: bool = False,
+    ) -> Dict[str, str]:
+        """
+        HMAC-SHA256 署名ヘッダを生成する。
+        ※ GMOコイン仕様: `PUT /v1/ws-auth` および `DELETE /v1/ws-auth` は body に token を送るが、
+          署名対象文字列 (`timestamp + method + path`) には body を含めない (`exclude_body_from_sign=True`)。
+        """
+        if self.halted:
+            raise GMOAuthHaltError(f"クライアントは HALT 状態のためリクエストを拒絶しました: {self.halt_reason}")
         if not self.has_credentials():
-            raise GMOPrivateAPIError("GMO_API_KEY または GMO_API_SECRET が未設定です。")
-        timestamp = str(int(time.time() * 1000))
+            raise GMOAuthHaltError("GMO_API_KEY または GMO_API_SECRET が未設定です。")
+
+        ts_val = int(timestamp_ms if timestamp_ms is not None else self._current_timestamp_ms())
+        timestamp = str(ts_val)
         method_up = method.upper()
-        text = f"{timestamp}{method_up}{v1_path}{body_str}"
+        sign_body = "" if exclude_body_from_sign else body_str
+        text = f"{timestamp}{method_up}{v1_path}{sign_body}"
         sign = hmac.new(
             self.api_secret.encode("utf-8"),
             text.encode("utf-8"),
@@ -139,42 +319,159 @@ class GMOPrivateClient:
             "Content-Type": "application/json",
         }
 
+    @staticmethod
+    def serialize_body_strict(body: Optional[Dict[str, Any]]) -> str:
+        """
+        署名対象 JSON 文字列を生成する。
+        - 空白なし `separators=(",", ":")`
+        - 数値の指数表記 (`1e-05`) が混入しないよう Decimal / float を事前正規化
+        """
+        if body is None:
+            return ""
+        cleaned: Dict[str, Any] = {}
+        for k, v in body.items():
+            if isinstance(v, Decimal):
+                cleaned[k] = format_decimal_plain(v)
+            elif isinstance(v, float):
+                cleaned[k] = format_decimal_plain(v)
+            else:
+                cleaned[k] = v
+        body_str = json.dumps(cleaned, separators=(",", ":"), ensure_ascii=False)
+        return body_str
+
     def _request(
         self,
         method: str,
         path: str,
         params: Optional[Dict[str, Any]] = None,
         body: Optional[Dict[str, Any]] = None,
+        priority: int = 3,
+        exclude_body_from_sign: bool = False,
+        allow_post_clock_retry: bool = True,
     ) -> Any:
+        if self.halted:
+            raise GMOAuthHaltError(f"システムは HALT 状態です: {self.halt_reason}")
+
         v1_path = _normalize_v1_path(path)
         url = f"{self.BASE_URL}{v1_path}"
         method_up = method.upper()
-        body_str = json.dumps(body, separators=(",", ":")) if (body is not None and method_up == "POST") else ""
+        body_str = self.serialize_body_strict(body) if (body is not None and method_up in ("POST", "PUT", "DELETE")) else ""
 
-        last_err: Optional[Exception] = None
-        # POST (注文・キャンセル) は二重発注を防ぐため原則リトライせず1回のみ実行、GETのみリトライ許容
         attempts = self.max_retries if method_up == "GET" else 1
+        clock_recalibrated = False
+        last_err: Optional[Exception] = None
 
-        for attempt in range(1, attempts + 1):
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
+            self.token_bucket.acquire(priority=priority)
+            t_send_ms = time.time() * 1000.0
             try:
-                headers = self._build_auth_headers(method_up, v1_path, body_str)
+                headers = self._build_auth_headers(
+                    method=method_up,
+                    v1_path=v1_path,
+                    body_str=body_str,
+                    exclude_body_from_sign=exclude_body_from_sign,
+                )
                 if method_up == "GET":
                     resp = self.session.get(url, params=params, headers=headers, timeout=self.timeout)
+                elif method_up == "PUT":
+                    resp = self.session.put(
+                        url,
+                        data=body_str.encode("utf-8") if body_str else None,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
+                elif method_up == "DELETE":
+                    resp = self.session.delete(
+                        url,
+                        data=body_str.encode("utf-8") if body_str else None,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
                 else:
-                    resp = self.session.post(url, data=body_str, headers=headers, timeout=self.timeout)
+                    resp = self.session.post(
+                        url,
+                        data=body_str.encode("utf-8") if body_str else None,
+                        headers=headers,
+                        timeout=self.timeout,
+                    )
+                t_recv_ms = time.time() * 1000.0
+
+                payload: Dict[str, Any] = {}
+                try:
+                    payload = resp.json() if resp.text else {}
+                except Exception:
+                    payload = {}
+
+                # 正常応答・エラー応答を問わず responsetime / Date ヘッダから時計オフセットを更新
+                self.update_clock_offset_cristian(
+                    t_send_ms=t_send_ms,
+                    t_recv_ms=t_recv_ms,
+                    responsetime_str=payload.get("responsetime") if isinstance(payload, dict) else None,
+                    http_date_header=resp.headers.get("Date") if hasattr(resp, "headers") else None,
+                )
+
+                if resp.status_code == 429:
+                    raise GMORateLimitError(f"HTTP 429 Too Many Requests ({v1_path})")
                 resp.raise_for_status()
-                payload = resp.json()
+
                 if payload.get("status") != 0:
                     messages = payload.get("messages", []) or []
-                    msg_str = f"GMO Private API エラー (path={v1_path}): {messages}"
-                    if any(str(m.get("message_code", "")) == "ERR-201" for m in messages if isinstance(m, dict)):
-                        raise InsufficientAvailableAssetError(msg_str, messages=messages)
-                    raise GMOPrivateAPIError(msg_str, messages=messages)
+                    codes = [str(m.get("message_code", "")) for m in messages if isinstance(m, dict)]
+                    msg_str = f"GMO Private API エラー (path={v1_path}, codes={codes}): {messages}"
+
+                    # 1) ERR-5008 / ERR-5009 (時刻ズレエラー): 即座にオフセットを自己校正して再試行
+                    if any(c in ("ERR-5008", "ERR-5009") for c in codes) and not clock_recalibrated:
+                        clock_recalibrated = True
+                        if method_up == "GET" or allow_post_clock_retry:
+                            logger.warning(
+                                "時計オフセット誤差 (%s) を検知しました。自己校正 (offset=%dms) して再試行します。",
+                                codes,
+                                self.clock_offset_ms,
+                            )
+                            attempt -= 1
+                            continue
+
+                    # 2) ERR-5010〜5012 (APIキー・署名・IP制限等の認証エラー): 即座に HALT（ドライランへのフォールバック厳禁）
+                    if any(c in ("ERR-5010", "ERR-5011", "ERR-5012", "ERR-5001", "ERR-5002") for c in codes):
+                        self.halted = True
+                        self.halt_reason = msg_str
+                        raise GMOAuthHaltError(msg_str, messages=messages, error_codes=codes)
+
+                    # 3) ERR-201 (利用可能残高・ロック不足)
+                    if "ERR-201" in codes:
+                        raise InsufficientAvailableAssetError(msg_str, messages=messages, error_codes=codes)
+
+                    # 4) ERR-5003 (APIレートリミット超過)
+                    if "ERR-5003" in codes:
+                        raise GMORateLimitError(msg_str, messages=messages, error_codes=codes)
+
+                    # 5) ERR-5201〜5206 (メンテナンス・プレオープン ERR-5203)
+                    if any(c.startswith("ERR-520") for c in codes):
+                        raise GMOMaintenanceError(msg_str, messages=messages, error_codes=codes)
+
+                    raise GMOPrivateAPIError(msg_str, messages=messages, error_codes=codes)
+
                 return payload.get("data")
+
+            except (GMOAuthHaltError, InsufficientAvailableAssetError, GMOMaintenanceError):
+                raise
+            except GMORateLimitError:
+                if method_up != "GET":
+                    raise
+                last_err = GMORateLimitError(f"Rate limit on {v1_path}")
+                if attempt < attempts:
+                    time.sleep(self.retry_delay * attempt)
             except GMOPrivateAPIError:
                 raise
             except Exception as exc:
                 last_err = exc
+                if method_up != "GET":
+                    # POST 等の状態変更リクエストで通信タイムアウトが発生した場合は盲目的に再送せず例外を送出
+                    raise GMOOrderOutcomeUnknownError(
+                        f"POST/変更系リクエストで通信タイムアウトまたは不明エラーが発生しました ({method_up} {v1_path}): {exc}"
+                    ) from exc
                 logger.warning(
                     "GMO Private API 通信エラー (%d/%d) %s %s: %s",
                     attempt,
@@ -188,14 +485,60 @@ class GMOPrivateClient:
 
         raise GMOPrivateAPIError(f"GMO Private API 通信失敗 ({method_up} {v1_path}): {last_err}") from last_err
 
+    # ------------------------------------------------------------------
+    # 口座・取引高・WebSocket 認証エンドポイント
+    # ------------------------------------------------------------------
     def get_assets(self) -> List[Dict[str, Any]]:
-        """口座資産残高一覧を取得する (`GET /private/v1/account/assets`)"""
-        data = self._request("GET", "/private/v1/account/assets")
+        """口座資産残高一覧を取得する (`GET /private/v1/account/assets`, Priority 3)"""
+        data = self._request("GET", "/private/v1/account/assets", priority=3)
         if isinstance(data, list):
             return data
         if isinstance(data, dict) and isinstance(data.get("list"), list):
             return data["list"]
         return []
+
+    def get_trading_volume(self) -> Dict[str, Any]:
+        """取引高・手数料率情報を取得する (`GET /private/v1/account/tradingVolume`, Priority 4)"""
+        data = self._request("GET", "/private/v1/account/tradingVolume", priority=4)
+        return data if isinstance(data, dict) else {}
+
+    def create_ws_auth_token(self) -> str:
+        """Private WebSocket 認証トークンを新規発行する (`POST /private/v1/ws-auth`, Priority 3)"""
+        data = self._request("POST", "/private/v1/ws-auth", body={}, priority=3)
+        if isinstance(data, str):
+            return data
+        if isinstance(data, dict):
+            return str(data.get("token", ""))
+        return ""
+
+    def extend_ws_auth_token(self, token: str) -> bool:
+        """
+        Private WebSocket 認証トークンを延長する (`PUT /private/v1/ws-auth`, Priority 3)。
+        ※ GMOコイン仕様: リクエスト body には `{"token": token}` を送るが、
+          HMAC 署名文字列には body を含めない (`exclude_body_from_sign=True`)。
+        """
+        self._request(
+            "PUT",
+            "/private/v1/ws-auth",
+            body={"token": token},
+            priority=3,
+            exclude_body_from_sign=True,
+        )
+        return True
+
+    def delete_ws_auth_token(self, token: str) -> bool:
+        """
+        Private WebSocket 認証トークンを削除する (`DELETE /private/v1/ws-auth`, Priority 3)。
+        ※ `PUT` と同様、HMAC 署名文字列には body を含めない。
+        """
+        self._request(
+            "DELETE",
+            "/private/v1/ws-auth",
+            body={"token": token},
+            priority=3,
+            exclude_body_from_sign=True,
+        )
+        return True
 
     def get_jpy_and_spot_balances(self) -> Dict[str, Any]:
         """日本円余力と現物各銘柄の保有数量・利用可能数量を整形して返す"""
@@ -224,13 +567,16 @@ class GMOPrivateClient:
             "spot_assets": spot_assets,
         }
 
+    # ------------------------------------------------------------------
+    # 注文照会・変更・取消・一括取消エンドポイント
+    # ------------------------------------------------------------------
     def get_active_orders(
         self,
         symbol: Optional[str] = None,
         page: int = 1,
         count: int = 100,
     ) -> List[Dict[str, Any]]:
-        """有効注文一覧を取得する (`GET /private/v1/activeOrders`)"""
+        """有効注文一覧を取得する (`GET /private/v1/activeOrders`, Priority 3)"""
         symbols_to_query = [symbol.upper()] if symbol else list(DEFAULT_SYMBOL_RULES.keys())
         results: List[Dict[str, Any]] = []
         for sym in symbols_to_query:
@@ -238,6 +584,7 @@ class GMOPrivateClient:
                 "GET",
                 "/private/v1/activeOrders",
                 params={"symbol": sym, "page": page, "count": count},
+                priority=3,
             )
             raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             for item in raw_list:
@@ -245,7 +592,7 @@ class GMOPrivateClient:
         return results
 
     def get_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> List[Dict[str, Any]]:
-        """注文ID指定で注文情報を取得する (`GET /private/v1/orders`)"""
+        """注文ID指定で注文情報を取得する (`GET /private/v1/orders`, Priority 3)"""
         if isinstance(order_ids, (str, int)):
             id_list = [str(order_ids)]
         else:
@@ -256,15 +603,67 @@ class GMOPrivateClient:
             "GET",
             "/private/v1/orders",
             params={"orderId": ",".join(id_list[:10])},
+            priority=3,
         )
         raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
         return [self._normalize_order_dict(item) for item in raw_list]
 
-    def cancel_order(self, order_id: Union[str, int]) -> Dict[str, Any]:
-        """注文をキャンセルする (`POST /private/v1/cancelOrder`)"""
+    def change_order(
+        self,
+        order_id: Union[str, int],
+        price: Union[str, int, float, Decimal],
+        losscut_price: Optional[Union[str, int, float, Decimal]] = None,
+    ) -> Dict[str, Any]:
+        """注文価格を変更する (`POST /private/v1/changeOrder`, Priority 2)"""
         oid = int(order_id) if str(order_id).isdigit() else order_id
-        self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid})
+        body: Dict[str, Any] = {
+            "orderId": oid,
+            "price": format_decimal_plain(price),
+        }
+        if losscut_price is not None and _to_decimal(losscut_price) > 0:
+            body["losscutPrice"] = format_decimal_plain(losscut_price)
+        self._request("POST", "/private/v1/changeOrder", body=body, priority=2)
+        return {"order_id": str(order_id), "price": float(_to_decimal(price)), "status": "ORDERED"}
+
+    def cancel_order(self, order_id: Union[str, int]) -> Dict[str, Any]:
+        """単一注文をキャンセルする (`POST /private/v1/cancelOrder`, Priority 2)"""
+        oid = int(order_id) if str(order_id).isdigit() else order_id
+        self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid}, priority=2)
         return {"order_id": str(order_id), "status": "CANCELED"}
+
+    def cancel_orders(self, order_ids: List[Union[str, int]]) -> Dict[str, Any]:
+        """複数注文（最大10件ずつ）を一括キャンセルする (`POST /private/v1/cancelOrders`, Priority 2)"""
+        normalized_ids = [int(x) if str(x).isdigit() else x for x in order_ids if str(x).strip()]
+        if not normalized_ids:
+            return {"success": [], "failed": []}
+        data = self._request(
+            "POST",
+            "/private/v1/cancelOrders",
+            body={"orderIds": normalized_ids[:10]},
+            priority=2,
+        )
+        return data if isinstance(data, dict) else {"success": normalized_ids[:10], "failed": []}
+
+    def cancel_bulk_order(
+        self,
+        symbols: List[str],
+        side: Optional[str] = None,
+        execution_type: Optional[str] = None,
+        desc: Optional[str] = None,
+    ) -> List[str]:
+        """指定銘柄の有効注文を一括キャンセルする (`POST /private/v1/cancelBulkOrder`, Priority 2)"""
+        syms = [s.strip().upper() for s in symbols if s.strip()]
+        body: Dict[str, Any] = {"symbols": syms}
+        if side:
+            body["side"] = side.strip().upper()
+        if execution_type:
+            body["executionType"] = execution_type.strip().upper()
+        if desc:
+            body["desc"] = desc.strip().upper()
+        data = self._request("POST", "/private/v1/cancelBulkOrder", body=body, priority=2)
+        if isinstance(data, list):
+            return [str(x) for x in data]
+        return []
 
     def get_latest_executions(
         self,
@@ -272,22 +671,23 @@ class GMOPrivateClient:
         page: int = 1,
         count: int = 100,
     ) -> List[Dict[str, Any]]:
-        """最新約定一覧を取得する (`GET /private/v1/latestExecutions`)"""
+        """最新約定一覧を取得する (`GET /private/v1/latestExecutions`, Priority 3)"""
         data = self._request(
             "GET",
             "/private/v1/latestExecutions",
             params={"symbol": symbol.upper(), "page": page, "count": count},
+            priority=3,
         )
         raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
         out: List[Dict[str, Any]] = []
         for item in raw_list:
             out.append(
                 {
-                    "execution_id": str(item.get("executionId", "")),
-                    "order_id": str(item.get("orderId", "")),
+                    "execution_id": str(item.get("executionId", item.get("execution_id", ""))),
+                    "order_id": str(item.get("orderId", item.get("order_id", ""))),
                     "symbol": str(item.get("symbol", symbol)).upper(),
                     "side": str(item.get("side", "")).upper(),
-                    "execution_type": str(item.get("executionType", "")).upper(),
+                    "execution_type": str(item.get("executionType", item.get("execution_type", ""))).upper(),
                     "size": float(item.get("size", 0) or 0),
                     "price": float(item.get("price", 0) or 0),
                     "fee": float(item.get("fee", 0) or 0),
@@ -307,14 +707,14 @@ class GMOPrivateClient:
         time_in_force: Optional[str] = None,
         cancel_before: bool = False,
         max_post_only_retries: int = 2,
+        intent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         新規注文を発注する (`POST /private/v1/order`)。
-        - 買付指値: `executionType="LIMIT"`, `timeInForce="SOK"` (Post-Only)
-          ※板が動いて SOK が即時キャンセルされた場合、最新 ticker の best_bid / best_ask - 1 tick へ
-            1ティック調整して最大 `max_post_only_retries` 回まで再試行する。
-        - 損切逆指値: `executionType="STOP"`, `timeInForce="FAK"`, `price`
-        - 利確・成行決済: `executionType="LIMIT"` または `"MARKET"`
+        - Priority 1: `STOP` 逆指値、または `MARKET` / `cancelBefore=True` の緊急決済
+        - Priority 4: 新規 `BUY` 指値
+        - タイムアウトや `ERR-5003` 発生時は盲目的に再送せず、WAL `intents` を `UNKNOWN` に記録して
+          `get_active_orders(sym)` と `get_latest_executions(sym)` を先に照合し、二重発注を100%防ぐ。
         """
         sym = symbol.strip().upper()
         side_up = side.strip().upper()
@@ -335,20 +735,38 @@ class GMOPrivateClient:
         else:
             tif = "FAS"
 
+        prio = 1 if (side_up == "SELL" and (exec_up in ("STOP", "MARKET") or cancel_before)) else 4
         price_dec = round_to_step(_to_decimal(price or 0), tick_size, rounding=ROUND_DOWN) if price is not None else Decimal("0")
         adjust_count = 0
         post_only_adjusted = False
-
         max_attempts = (1 + max(0, int(max_post_only_retries))) if (exec_up == "LIMIT" and tif == "SOK") else 1
+
+        if self.wal_db is not None and intent_id is None:
+            intent_id = self.wal_db.create_intent(
+                kind=f"PLACE_{side_up}_{exec_up}",
+                symbol=sym,
+                payload={
+                    "symbol": sym,
+                    "side": side_up,
+                    "execution_type": exec_up,
+                    "time_in_force": tif,
+                    "size": size_str,
+                    "price": format_decimal_plain(price_dec),
+                    "cancel_before": bool(cancel_before),
+                },
+            )
 
         for attempt in range(max_attempts):
             body: Dict[str, Any] = {
                 "symbol": sym,
                 "side": side_up,
+                "execution_type": exec_up,
                 "executionType": exec_up,
                 "timeInForce": tif,
                 "size": size_str,
             }
+            # GMO Private API の正式キー名のみ残す
+            body.pop("execution_type", None)
             if exec_up in ("LIMIT", "STOP"):
                 body["price"] = format_decimal_plain(price_dec)
             if losscut_price is not None and _to_decimal(losscut_price) > 0:
@@ -358,10 +776,38 @@ class GMOPrivateClient:
             if cancel_before:
                 body["cancelBefore"] = True
 
-            raw_order_id = self._request("POST", "/private/v1/order", body=body)
-            order_id = str(raw_order_id.get("orderId", raw_order_id) if isinstance(raw_order_id, dict) else raw_order_id)
+            try:
+                raw_order_id = self._request(
+                    "POST",
+                    "/private/v1/order",
+                    body=body,
+                    priority=prio,
+                    allow_post_clock_retry=True,
+                )
+            except (GMOOrderOutcomeUnknownError, GMORateLimitError) as exc:
+                if self.wal_db is not None and intent_id:
+                    self.wal_db.update_intent_state(intent_id, "UNKNOWN")
+                # 盲目的再送を行わず、先に activeOrders と latestExecutions を照合して注文が通っていたか確認
+                recovered = self._reconcile_unknown_order_outcome(
+                    symbol=sym,
+                    side=side_up,
+                    execution_type=exec_up,
+                    size_dec=size_dec,
+                    price_dec=price_dec,
+                    intent_id=intent_id,
+                )
+                if recovered is not None:
+                    return recovered
+                raise
+            except Exception:
+                if self.wal_db is not None and intent_id:
+                    self.wal_db.update_intent_state(intent_id, "REJECTED")
+                raise
 
-            # SOK (Post-Only) の場合は即時キャンセルされていないか確認
+            order_id = str(raw_order_id.get("orderId", raw_order_id) if isinstance(raw_order_id, dict) else raw_order_id)
+            if self.wal_db is not None and intent_id:
+                self.wal_db.update_intent_state(intent_id, "SENT_OK", order_id=order_id)
+
             order_info: Dict[str, Any] = {
                 "order_id": order_id,
                 "symbol": sym,
@@ -374,6 +820,7 @@ class GMOPrivateClient:
                 "status": "WAITING",
                 "post_only_adjusted": post_only_adjusted,
                 "adjust_count": adjust_count,
+                "intent_id": intent_id or "",
                 "timestamp": _now_jst().isoformat(timespec="seconds"),
             }
 
@@ -385,6 +832,23 @@ class GMOPrivateClient:
                     order_info["adjust_count"] = adjust_count
             except Exception as exc:
                 logger.debug("発注直後の get_orders 確認スキップ (order_id=%s): %s", order_id, exc)
+
+            if self.wal_db is not None:
+                self.wal_db.upsert_order(
+                    order_id=order_id,
+                    symbol=sym,
+                    side=side_up,
+                    execution_type=exec_up,
+                    state=str(order_info.get("status", "WAITING")),
+                    price=price_dec,
+                    size=size_dec,
+                    executed_size=order_info.get("executed_size", 0.0),
+                    time_in_force=tif,
+                    intent_id=intent_id or "",
+                    raw_data=order_info,
+                )
+                if intent_id:
+                    self.wal_db.update_intent_state(intent_id, "COMMITTED", order_id=order_id)
 
             if tif == "SOK" and order_info.get("status") == "CANCELED" and attempt + 1 < max_attempts:
                 adjust_count += 1
@@ -401,18 +865,60 @@ class GMOPrivateClient:
                 except Exception:
                     price_dec = max(tick_size, price_dec - tick_size)
                 price_dec = max(tick_size, round_to_step(price_dec, tick_size, rounding=ROUND_DOWN))
-                logger.info(
-                    "Post-Only (SOK) 即時失効のため1ティック調整して再発注します (%d/%d): %s price=%s",
-                    adjust_count,
-                    max_post_only_retries,
-                    sym,
-                    format_decimal_plain(price_dec),
-                )
                 continue
 
             return order_info
 
         return order_info
+
+    def _reconcile_unknown_order_outcome(
+        self,
+        symbol: str,
+        side: str,
+        execution_type: str,
+        size_dec: Decimal,
+        price_dec: Decimal,
+        intent_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        POST 発注時にタイムアウトまたは `ERR-5003` が起きた際、
+        盲目的に再送せず `activeOrders` と `latestExecutions` を照合して既に通っていた注文を特定する。
+        """
+        try:
+            active_list = self.get_active_orders(symbol)
+            for ao in active_list:
+                if (
+                    str(ao.get("side", "")).upper() == side
+                    and str(ao.get("execution_type", "")).upper() == execution_type
+                    and abs(_to_decimal(ao.get("size", 0)) - size_dec) <= Decimal("1e-9")
+                ):
+                    if self.wal_db is not None and intent_id:
+                        self.wal_db.update_intent_state(intent_id, "COMMITTED", order_id=str(ao["order_id"]))
+                    return ao
+
+            exec_list = self.get_latest_executions(symbol)
+            for ex in exec_list:
+                if (
+                    str(ex.get("side", "")).upper() == side
+                    and abs(_to_decimal(ex.get("size", 0)) - size_dec) <= Decimal("1e-9")
+                ):
+                    oid = str(ex.get("order_id", ""))
+                    if self.wal_db is not None and intent_id:
+                        self.wal_db.update_intent_state(intent_id, "COMMITTED", order_id=oid)
+                    return {
+                        "order_id": oid,
+                        "symbol": symbol,
+                        "side": side,
+                        "execution_type": execution_type,
+                        "price": float(ex.get("price", price_dec)),
+                        "size": float(size_dec),
+                        "executed_size": float(ex.get("size", size_dec)),
+                        "status": "EXECUTED",
+                        "recovered_from_unknown": True,
+                    }
+        except Exception as rec_exc:
+            logger.warning("UNKNOWN 注文の照合中にエラーが発生しました: %s", rec_exc)
+        return None
 
     @staticmethod
     def _normalize_order_dict(raw: Dict[str, Any]) -> Dict[str, Any]:
@@ -438,14 +944,8 @@ class GMOPrivateClient:
 class PaperBroker:
     """
     `EXECUTION_MODE=DRY_RUN` 用の仮想取引所シミュレータ。
-    - Private API を一切呼ばず、`paper_orders.json` と `portfolio.json` 上で注文・残高ロック・約定を管理する。
-    - Public API のリアルタイム板 (`ask`, `bid`, `last`) と照合し、
-      * 買い指値 (`LIMIT` / `SOK`) の Post-Only 即時失効＆1ティック自動補正
-      * 指値刺さり (`last <= limit_price` または `ask <= limit_price`) と Maker リベート手数料の反映
-      * 損切り逆指値 (`STOP` / `FAK`) の発動 (`bid <= stop_loss_price` または `last <= stop_loss_price`) と Taker 手数料の反映
-      * 利確売り (`LIMIT` / `MARKET`) の約定 (`bid >= take_profit_price` または成行即時約定)
-      * GMOコイン現物特有の「SL注文発注中は保有数量がロックされ、cancel_order しない限り別の売り注文を出せない仕様」
-      を完全に再現する。
+    - `GMOPrivateClient` と完全同一のメソッドインターフェース（`change_order`, `cancel_orders`,
+      `cancel_bulk_order`, `cancel_before=True`, `ws-auth` 含む）を提供。
     """
 
     MODE = "DRY_RUN"
@@ -455,10 +955,15 @@ class PaperBroker:
         paper_orders_path: Union[str, Path] = "paper_orders.json",
         portfolio_path: Union[str, Path] = "portfolio.json",
         public_client: Optional[GMOPublicClient] = None,
+        wal_db: Optional[DatabaseWAL] = None,
     ) -> None:
         self.paper_orders_path = Path(paper_orders_path)
         self.portfolio_path = Path(portfolio_path)
         self.public_client = public_client
+        self.wal_db = wal_db
+        self.clock_offset_ms: int = 0
+        self.halted: bool = False
+        self.halt_reason: str = ""
         self._latest_tickers: Dict[str, Dict[str, Any]] = {}
         self._ensure_state_file()
 
@@ -466,7 +971,6 @@ class PaperBroker:
         return True
 
     def update_market_tickers(self, tickers: Dict[str, Dict[str, Any]]) -> None:
-        """最新の Public API Ticker スナップショットを更新する"""
         if tickers:
             for k, v in tickers.items():
                 self._latest_tickers[str(k).upper()] = dict(v)
@@ -517,14 +1021,15 @@ class PaperBroker:
         return load_json_file(self.portfolio_path)
 
     def get_assets(self) -> List[Dict[str, Any]]:
-        """`portfolio.json` と現在有効な `paper_orders.json` のロック数量から資産一覧を返す"""
         portfolio = self._load_portfolio()
         state = self._ensure_state_file()
         active_orders = [
             o for o in state.get("orders", []) if str(o.get("status", "")).upper() in ("WAITING", "ORDERED")
         ]
 
-        jpy_balance = _to_decimal(portfolio.get("jpy_balance", 10000))
+        jpy_balance = _to_decimal(
+            state["jpy_balance"] if "jpy_balance" in state else portfolio.get("jpy_balance", 10000)
+        )
         locked_jpy = Decimal("0")
         locked_spot: Dict[str, Decimal] = {}
 
@@ -570,6 +1075,18 @@ class PaperBroker:
             )
 
         return assets
+
+    def get_trading_volume(self) -> Dict[str, Any]:
+        return {"jpyVolume": "0", "tierLevel": 1, "limit": []}
+
+    def create_ws_auth_token(self) -> str:
+        return "paper-ws-token-001"
+
+    def extend_ws_auth_token(self, token: str) -> bool:
+        return bool(token)
+
+    def delete_ws_auth_token(self, token: str) -> bool:
+        return bool(token)
 
     def get_jpy_and_spot_balances(self) -> Dict[str, Any]:
         assets = self.get_assets()
@@ -622,15 +1139,11 @@ class PaperBroker:
         cancel_before: bool = False,
         max_post_only_retries: int = 2,
         now_dt: Optional[datetime] = None,
+        intent_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        PaperBroker 上で注文を発注する。
-        - SELL 時は現物保有余力 (`available`) をチェックし、既存の SL 注文等でロックされている場合は
-          本物の GMOコインと同じく `InsufficientAvailableAssetError` を送出する。
-        - BUY `LIMIT` (`SOK` Post-Only) 時に `price >= ask` の場合は SOK 即時キャンセルをシミュレートし、
-          `max_post_only_retries > 0` なら `min(bid, ask - tick_size)` へ1ティック調整して再発注する。
-        - `MARKET` 注文は発注と同時に最新レート（BUYなら `ask`、SELLなら `bid`）で即時約定させる。
-        """
+        if self.halted:
+            raise GMOAuthHaltError(f"PaperBroker is HALTED: {self.halt_reason}")
+
         now_str = _now_jst(now_dt).isoformat(timespec="seconds")
         sym = symbol.strip().upper()
         side_up = side.strip().upper()
@@ -658,6 +1171,10 @@ class PaperBroker:
             else Decimal("0")
         )
 
+        # cancel_before=True が指定された場合、当該銘柄の既存の有効注文を原子的にキャンセルしてロックを解除する
+        if cancel_before:
+            self.cancel_bulk_order([sym], side=side_up)
+
         balances = self.get_jpy_and_spot_balances()
         if side_up == "SELL":
             spot_info = balances["spot_assets"].get(sym, {"amount": 0.0, "available": 0.0, "locked": 0.0})
@@ -667,7 +1184,8 @@ class PaperBroker:
                     f"[ERR-201 PaperBroker] {sym} の売却可能数量が不足しています "
                     f"(要求={format_decimal_plain(size_dec)}, 利用可能={format_decimal_plain(avail_dec)}, "
                     f"SLロック中={format_decimal_plain(spot_info.get('locked', 0.0))})。"
-                    "先に既存の逆指値(STOP)注文を cancel_order してください。"
+                    "先に既存の逆指値(STOP)注文を cancel_order するか cancel_before=True を使用してください。",
+                    messages=[{"message_code": "ERR-201", "message_string": "Insufficient available asset"}],
                 )
         elif side_up == "BUY":
             jpy_avail_dec = _to_decimal(balances.get("jpy_available", 0.0))
@@ -676,7 +1194,8 @@ class PaperBroker:
             if est_price > 0 and req_jpy > jpy_avail_dec + Decimal("1"):
                 raise InsufficientAvailableAssetError(
                     f"[ERR-201 PaperBroker] 日本円余力が不足しています "
-                    f"(必要額≈{int(req_jpy):,}円, 利用可能={int(jpy_avail_dec):,}円)"
+                    f"(必要額≈{int(req_jpy):,}円, 利用可能={int(jpy_avail_dec):,}円)",
+                    messages=[{"message_code": "ERR-201", "message_string": "Insufficient available JPY"}],
                 )
 
         state = self._ensure_state_file()
@@ -693,7 +1212,6 @@ class PaperBroker:
             order_id = str(state["next_order_id"])
             state["next_order_id"] = int(state["next_order_id"]) + 1
 
-            # Post-Only (SOK) 板ぶつかりチェック
             is_sok_crossed = False
             if exec_up == "LIMIT" and tif == "SOK":
                 if side_up == "BUY" and best_ask > 0 and price_dec >= best_ask:
@@ -730,13 +1248,6 @@ class PaperBroker:
                     else:
                         target_p = max(best_ask, best_bid + tick_size) if best_ask > 0 else (best_bid + tick_size)
                         price_dec = max(tick_size, round_to_step(target_p, tick_size, rounding=ROUND_DOWN))
-                    logger.info(
-                        "[PaperBroker] SOK (Post-Only) が板にぶつかったため1ティック調整して再発注します (%d/%d): %s price=%s",
-                        adjust_count,
-                        max_post_only_retries,
-                        sym,
-                        format_decimal_plain(price_dec),
-                    )
                     continue
                 return canceled_order
 
@@ -757,7 +1268,6 @@ class PaperBroker:
                 "timestamp": now_str,
             }
 
-            # MARKET 注文（または FAS LIMIT で既に条件到達している利確売り）は即時約定
             if exec_up == "MARKET":
                 fill_price = (
                     float(best_bid if best_bid > 0 else (last_price if last_price > 0 else price_dec))
@@ -791,6 +1301,26 @@ class PaperBroker:
             return dict(order_record)
 
         raise GMOPrivateAPIError("注文処理が完遂しませんでした。")
+
+    def change_order(
+        self,
+        order_id: Union[str, int],
+        price: Union[str, int, float, Decimal],
+        losscut_price: Optional[Union[str, int, float, Decimal]] = None,
+    ) -> Dict[str, Any]:
+        oid = str(order_id)
+        state = self._ensure_state_file()
+        for o in state.get("orders", []):
+            if str(o.get("order_id", "")) == oid:
+                if str(o.get("status", "")).upper() not in ("WAITING", "ORDERED"):
+                    raise GMOPrivateAPIError(f"非アクティブ注文は変更できません: {oid}")
+                sym = str(o.get("symbol", "")).upper()
+                tick = _to_decimal(DEFAULT_SYMBOL_RULES.get(sym, {}).get("tick_size", "1"))
+                p_dec = round_to_step(_to_decimal(price), tick, rounding=ROUND_DOWN)
+                o["price"] = float(p_dec)
+                self._save_state(state)
+                return dict(o)
+        raise GMOPrivateAPIError(f"[PaperBroker] 変更対象の注文IDが見つかりません: {oid}")
 
     def _fill_order_in_state(
         self,
@@ -842,20 +1372,53 @@ class PaperBroker:
             "timestamp": now_str,
         }
         state["executions"].append(execution_entry)
+        if self.wal_db is not None:
+            try:
+                self.wal_db.record_execution(
+                    execution_id=exec_id,
+                    order_id=str(order_record["order_id"]),
+                    symbol=sym,
+                    side=str(order_record.get("side", "")).upper(),
+                    size=exec_size_d,
+                    price=fill_price_d,
+                    fee_jpy=fee_jpy_d,
+                    execution_type=str(order_record.get("execution_type", "")).upper(),
+                )
+            except Exception:
+                pass
         return execution_entry
+
+    def simulate_partial_fill(
+        self,
+        order_id: Union[str, int],
+        filled_size: float,
+        fill_price: Optional[float] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        oid = str(order_id)
+        now_str = _now_jst(now_dt).isoformat(timespec="seconds")
+        state = self._ensure_state_file()
+        for o in state.get("orders", []):
+            if str(o.get("order_id", "")) == oid:
+                p = float(fill_price if fill_price is not None else (o.get("price") or 0))
+                is_maker = str(o.get("execution_type", "")).upper() == "LIMIT"
+                exec_entry = self._fill_order_in_state(
+                    state=state,
+                    order_record=o,
+                    fill_price=p,
+                    is_maker=is_maker,
+                    now_str=now_str,
+                    fill_size=filled_size,
+                )
+                self._save_state(state)
+                return exec_entry
+        raise GMOPrivateAPIError(f"[PaperBroker] 部分約定対象の注文IDが見つかりません: {oid}")
 
     def evaluate_paper_orders(
         self,
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
         now_dt: Optional[datetime] = None,
     ) -> List[Dict[str, Any]]:
-        """
-        Public API のリアルタイム Ticker (`ask`, `bid`, `last`) と照合し、
-        待機中の Paper 注文の約定判定を実行する。
-        - BUY `LIMIT`: `last <= limit_price` または `ask <= limit_price` で約定 (Maker)
-        - SELL `STOP`: `bid <= stop_loss_price` または `last <= stop_loss_price` で逆指値発動・約定 (Taker)
-        - SELL `LIMIT`: `bid >= take_profit_price` または `last >= take_profit_price` で利確約定 (Maker)
-        """
         if tickers:
             self.update_market_tickers(tickers)
 
@@ -963,6 +1526,49 @@ class PaperBroker:
                 return dict(o)
         raise GMOPrivateAPIError(f"[PaperBroker] 指定された注文IDが見つかりません: {oid}")
 
+    def cancel_orders(self, order_ids: List[Union[str, int]]) -> Dict[str, Any]:
+        success = []
+        failed = []
+        for oid in order_ids[:10]:
+            try:
+                self.cancel_order(oid)
+                success.append(str(oid))
+            except Exception as exc:
+                failed.append({"orderId": str(oid), "error": str(exc)})
+        return {"success": success, "failed": failed}
+
+    def cancel_bulk_order(
+        self,
+        symbols: List[str],
+        side: Optional[str] = None,
+        execution_type: Optional[str] = None,
+        desc: Optional[str] = None,
+    ) -> List[str]:
+        sym_set = {s.strip().upper() for s in symbols if s.strip()}
+        side_up = side.strip().upper() if side else None
+        exec_up = execution_type.strip().upper() if execution_type else None
+        state = self._ensure_state_file()
+        canceled_ids: List[str] = []
+        now_str = _now_jst().isoformat(timespec="seconds")
+
+        for o in state.get("orders", []):
+            if str(o.get("status", "")).upper() not in ("WAITING", "ORDERED"):
+                continue
+            if sym_set and str(o.get("symbol", "")).upper() not in sym_set:
+                continue
+            if side_up and str(o.get("side", "")).upper() != side_up:
+                continue
+            if exec_up and str(o.get("execution_type", "")).upper() != exec_up:
+                continue
+            o["status"] = "CANCELED"
+            o["remaining_size"] = 0.0
+            o["canceled_at"] = now_str
+            canceled_ids.append(str(o["order_id"]))
+
+        if canceled_ids:
+            self._save_state(state)
+        return canceled_ids
+
     def get_latest_executions(
         self,
         symbol: str,
@@ -980,17 +1586,15 @@ def create_broker_client(
     execution_mode: Optional[str] = None,
     base_dir: Optional[Path] = None,
     public_client: Optional[GMOPublicClient] = None,
+    wal_db: Optional[DatabaseWAL] = None,
 ) -> Union[GMOPrivateClient, PaperBroker]:
-    """
-    `EXECUTION_MODE` (`DRY_RUN` または `LIVE`) に応じて適切なブローカークライアントを生成する。
-    デフォルトは常に安全な `DRY_RUN` (`PaperBroker`)。
-    """
     mode = (execution_mode or os.getenv("EXECUTION_MODE", "DRY_RUN")).strip().upper()
     root = Path(base_dir) if base_dir is not None else Path(__file__).resolve().parent.parent
     if mode == "LIVE":
-        return GMOPrivateClient(public_client=public_client)
+        return GMOPrivateClient(public_client=public_client, wal_db=wal_db)
     return PaperBroker(
         paper_orders_path=root / "paper_orders.json",
         portfolio_path=root / "portfolio.json",
         public_client=public_client,
+        wal_db=wal_db,
     )

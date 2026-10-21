@@ -3,13 +3,16 @@
 .env.*
 !.env.example
 
-# 実行ログ・デーモンロック・ペーパートレード一時注文
+# 実行ログ・デーモンロック・ペーパートレード一時注文・SQLite WAL
 logs/
 *.log
 *.lock
 v2_daemon.lock
 paper_orders.json
 daemon_state.json
+*.db
+*.db-wal
+*.db-shm
 
 # Python キャッシュ・仮想環境
 __pycache__/
