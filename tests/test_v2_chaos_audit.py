@@ -2633,11 +2633,20 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         import pandas as pd
         from web_dashboard import WebDashboardService, create_dashboard_http_server
 
-        # 1. run_v2_web.ps1 が Pure ASCII であること
-        ps1_path = Path(__file__).resolve().parent.parent / "run_v2_web.ps1"
+        # 1. run_v2_web.ps1 / launch_hidden.vbs / register_v2_task.ps1 が Pure ASCII かつ完全非表示 (wscript.exe + launch_hidden.vbs) であること
+        base_repo_dir = Path(__file__).resolve().parent.parent
+        ps1_path = base_repo_dir / "run_v2_web.ps1"
+        vbs_path = base_repo_dir / "launch_hidden.vbs"
+        reg_path = base_repo_dir / "register_v2_task.ps1"
         self.assertTrue(ps1_path.exists())
-        raw_ps1 = ps1_path.read_bytes()
-        self.assertTrue(all(b < 128 for b in raw_ps1), "run_v2_web.ps1 must be 100% Pure ASCII")
+        self.assertTrue(vbs_path.exists())
+        self.assertTrue(reg_path.exists())
+        self.assertTrue(all(b < 128 for b in ps1_path.read_bytes()), "run_v2_web.ps1 must be 100% Pure ASCII")
+        self.assertTrue(all(b < 128 for b in vbs_path.read_bytes()), "launch_hidden.vbs must be 100% Pure ASCII")
+        self.assertTrue(all(b < 128 for b in reg_path.read_bytes()), "register_v2_task.ps1 must be 100% Pure ASCII")
+        self.assertIn("shell.Run(cmd, 0, True)", vbs_path.read_text(encoding="ascii"))
+        self.assertIn("wscript.exe", reg_path.read_text(encoding="ascii"))
+        self.assertIn("launch_hidden.vbs", reg_path.read_text(encoding="ascii"))
 
         class _DummyPublicClient:
             def get_tickers(self, symbols=None):

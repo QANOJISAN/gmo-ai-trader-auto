@@ -75,9 +75,10 @@ if (-not $NoBrowser -and -not $Background) {
 if ($Background) {
     $TaskName = "GMO-AI-Trader-v2-Web"
     $SelfScript = Join-Path $ProjectDir "run_v2_web.ps1"
+    $HiddenVbs = Join-Path $ProjectDir "launch_hidden.vbs"
     $TaskAction = New-ScheduledTaskAction `
-        -Execute "powershell.exe" `
-        -Argument ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"" + $SelfScript + "`" -BindHost " + $BindHost + " -Port " + $Port.ToString() + " -NoBrowser") `
+        -Execute "wscript.exe" `
+        -Argument ("//B //NoLogo `"" + $HiddenVbs + "`" `"" + $SelfScript + "`" -BindHost " + $BindHost + " -Port " + $Port.ToString() + " -NoBrowser") `
         -WorkingDirectory $ProjectDir
     $TaskTriggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
     $TaskSettings = New-ScheduledTaskSettingsSet `

@@ -9,6 +9,7 @@ $env:PYTHONDONTWRITEBYTECODE = "1"
 
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RunnerScript = Join-Path $ProjectDir "run_v2_daemon.ps1"
+$HiddenVbs = Join-Path $ProjectDir "launch_hidden.vbs"
 
 if ($Unregister) {
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -19,11 +20,14 @@ if ($Unregister) {
 if (-not (Test-Path -LiteralPath $RunnerScript)) {
     throw ("Runner script not found: " + $RunnerScript)
 }
+if (-not (Test-Path -LiteralPath $HiddenVbs)) {
+    throw ("Hidden launcher VBS not found: " + $HiddenVbs)
+}
 
-# Register v2 daemon to start at user logon and check every 15 minutes (lockfile prevents duplicate instances)
+# Register v2 daemon using wscript.exe + launch_hidden.vbs (SW_HIDE=0) so Windows Terminal never opens a visible window
 $Action = New-ScheduledTaskAction `
-    -Execute "powershell.exe" `
-    -Argument ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"" + $RunnerScript + "`"") `
+    -Execute "wscript.exe" `
+    -Argument ("//B //NoLogo `"" + $HiddenVbs + "`" `"" + $RunnerScript + "`"") `
     -WorkingDirectory $ProjectDir
 
 $TriggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
