@@ -2619,6 +2619,164 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             finally:
                 daemon.shutdown()
 
+    def test_web_dashboard_api_and_pause_resume_lifecycle(self) -> None:
+        """
+        v2 ローカルWebダッシュボード (web_dashboard.py & run_v2_web.ps1) の統合検証:
+        1. `run_v2_web.ps1` が Pure ASCII である検証
+        2. HTTP サーバー (`GET /`, `GET /api/status`, `GET /api/chart`, `POST /api/control`) のエンドツーエンド応答検証
+        3. `PAUSE` -> `RESUME` ボタン操作で次サイクルを待たずに `is_paused` が即時反転し、同時に DB キューにも登録されること
+        4. `FLATTEN_ALL` 2段階承認 (`nonce` 発行 -> `FLATTEN_CONFIRM`) の動作確認
+        """
+        import json
+        import threading
+        import urllib.request
+        import pandas as pd
+        from web_dashboard import WebDashboardService, create_dashboard_http_server
+
+        # 1. run_v2_web.ps1 が Pure ASCII であること
+        ps1_path = Path(__file__).resolve().parent.parent / "run_v2_web.ps1"
+        self.assertTrue(ps1_path.exists())
+        raw_ps1 = ps1_path.read_bytes()
+        self.assertTrue(all(b < 128 for b in raw_ps1), "run_v2_web.ps1 must be 100% Pure ASCII")
+
+        class _DummyPublicClient:
+            def get_tickers(self, symbols=None):
+                return {
+                    "BTC": {"symbol": "BTC", "last": 14500000.0, "bid": 14495000.0, "ask": 14505000.0, "high": 14600000.0, "low": 14300000.0, "volume": 120.0, "spread_pct": 0.068},
+                    "XRP": {"symbol": "XRP", "last": 200.0, "bid": 199.9, "ask": 200.1, "high": 205.0, "low": 195.0, "volume": 500000.0, "spread_pct": 0.10},
+                }
+
+            def get_klines(self, symbol="BTC", interval="1hour", limit=72, reference_dt=None):
+                base_ms = int(datetime(2026, 10, 22, 12, 0, 0, tzinfo=JST).timestamp() * 1000)
+                rows = []
+                for i in range(24):
+                    rows.append(
+                        {
+                            "open_time": base_ms + i * 3600 * 1000,
+                            "open": 14400000.0 + i * 2000,
+                            "high": 14410000.0 + i * 2000,
+                            "low": 14390000.0 + i * 2000,
+                            "close": 14405000.0 + i * 2000,
+                            "volume": 5.0,
+                        }
+                    )
+                return pd.DataFrame(rows)
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            # 保有建玉 (XRP) と 隔離端数 (ETH DUST_QUARANTINED) を両方セット
+            pf = daemon.oco_manager.load_portfolio()
+            pf["jpy_balance"] = 10025
+            pf["peak_equity_jpy"] = 10025
+            pf["positions"] = [
+                {
+                    "symbol": "XRP",
+                    "side": "BUY",
+                    "size": 20.0,
+                    "entry_price": 195.0,
+                    "current_price": 200.0,
+                    "take_profit_price": 215.0,
+                    "stop_loss_price": 189.0,
+                    "sl_order_id": "9001",
+                    "state": "SL_ACTIVE",
+                    "opened_at": "2026-10-22T18:00:00+09:00",
+                },
+                {
+                    "symbol": "ETH",
+                    "side": "BUY",
+                    "size": 0.0007,
+                    "entry_price": 0.0,
+                    "current_price": 0.0,
+                    "take_profit_price": 0.0,
+                    "stop_loss_price": 0.0,
+                    "sl_order_id": "",
+                    "state": "DUST_QUARANTINED",
+                    "opened_at": "2026-10-22T17:30:00+09:00",
+                },
+            ]
+            daemon.oco_manager.save_portfolio(pf)
+
+            svc = WebDashboardService(base_dir=tmp_dir, public_client=_DummyPublicClient())
+            server, _ = create_dashboard_http_server(host="127.0.0.1", port=0, service=svc)
+            port = server.server_address[1]
+            t = threading.Thread(target=server.serve_forever, daemon=True)
+            t.start()
+            base_url = f"http://127.0.0.1:{port}"
+
+            try:
+                # (1) GET / (HTML UI)
+                with urllib.request.urlopen(f"{base_url}/", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    html = resp.read().decode("utf-8")
+                    self.assertIn("GMO AI Trader v2", html)
+                    self.assertIn("priceChartCanvas", html)
+
+                # (2) GET /api/status
+                with urllib.request.urlopen(f"{base_url}/api/status", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    st = json.loads(resp.read().decode("utf-8"))
+                    self.assertFalse(st["daemon"]["is_paused"])
+                    self.assertEqual(len(st["positions"]["active"]), 1)
+                    self.assertEqual(st["positions"]["active"][0]["symbol"], "XRP")
+                    self.assertEqual(len(st["positions"]["quarantined_dust"]), 1)
+                    self.assertEqual(st["positions"]["quarantined_dust"][0]["symbol"], "ETH")
+                    self.assertEqual(st["equity_summary"]["pattern_a"]["max_allocation_pct"], 0.45)
+
+                # (3) GET /api/chart?symbol=XRP&interval=1hour
+                with urllib.request.urlopen(f"{base_url}/api/chart?symbol=XRP&interval=1hour", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    ch = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(ch["symbol"], "XRP")
+                    self.assertEqual(len(ch["candles"]), 24)
+                    self.assertTrue(ch["overlays"]["has_position"])
+                    self.assertEqual(ch["overlays"]["entry_price"], 195.0)
+                    self.assertEqual(ch["overlays"]["stop_loss_price"], 189.0)
+                    self.assertEqual(ch["overlays"]["take_profit_price"], 215.0)
+
+                # (4) POST /api/control: PAUSE -> 即座に /api/status が is_paused=True になり、RESUME で is_paused=False に戻ること
+                def _post_ctrl(payload: dict) -> dict:
+                    req = urllib.request.Request(
+                        f"{base_url}/api/control",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        return json.loads(r.read().decode("utf-8"))
+
+                pause_res = _post_ctrl({"command": "PAUSE"})
+                self.assertTrue(pause_res["ok"])
+                self.assertTrue(pause_res["is_paused"])
+
+                with urllib.request.urlopen(f"{base_url}/api/status", timeout=5) as resp:
+                    st_paused = json.loads(resp.read().decode("utf-8"))
+                    self.assertTrue(st_paused["daemon"]["is_paused"])
+
+                resume_res = _post_ctrl({"command": "RESUME"})
+                self.assertTrue(resume_res["ok"])
+                self.assertFalse(resume_res["is_paused"])
+
+                with urllib.request.urlopen(f"{base_url}/api/status", timeout=5) as resp:
+                    st_resumed = json.loads(resp.read().decode("utf-8"))
+                    self.assertFalse(st_resumed["daemon"]["is_paused"])
+
+                # (5) POST /api/control: FLATTEN_ALL 2段階承認発行
+                flt_req = _post_ctrl({"command": "FLATTEN_ALL"})
+                self.assertTrue(flt_req["ok"])
+                self.assertIn("nonce", flt_req["result"])
+                flt_conf = _post_ctrl({"command": "FLATTEN_CONFIRM", "nonce": flt_req["result"]["nonce"]})
+                self.assertTrue(flt_conf["ok"])
+            finally:
+                server.shutdown()
+                server.server_close()
+                svc.close()
+                daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

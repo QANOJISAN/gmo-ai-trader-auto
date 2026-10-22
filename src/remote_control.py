@@ -623,10 +623,23 @@ class RemoteControlManager:
             payload=payload,
             now_ts_ms=int(now_jst.timestamp() * 1000),
         )
+        # PAUSE / RESUME の場合はデーモンの次サイクル (最大15秒後) を待たずとも
+        # Webダッシュボード・ポートフォリオ台帳に即座に反映されるよう is_paused フラグも同期する
+        if cmd in ("PAUSE", "RESUME"):
+            target_paused = cmd == "PAUSE"
+            self.is_paused = target_paused
+            try:
+                pf_sync = self.oco_manager.load_portfolio()
+                if isinstance(pf_sync, dict):
+                    pf_sync["is_paused"] = target_paused
+                    self.oco_manager.save_portfolio(pf_sync, now_dt=now_jst)
+            except Exception as sync_exc:
+                logger.warning("PAUSE/RESUME 即時台帳同期警告: %s", sync_exc)
         return {
             "command": cmd,
             "status": "QUEUED_FOR_DAEMON",
             "queued_to_wal": True,
+            "is_paused": (True if cmd == "PAUSE" else (False if cmd == "RESUME" else self.is_paused)),
             "queue_nonce": queue_nonce,
             "target_nonce": arg_nonce,
             "actor_id": verified_actor,

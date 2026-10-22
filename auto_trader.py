@@ -1020,6 +1020,7 @@ class AutoTraderDaemon:
             }
 
         try:
+            self.remote_control.poll_and_execute_db_commands(now_dt=now_jst)
             pf = self.oco_manager.load_portfolio()
             held_symbols = [
                 str(p.get("symbol", "")).upper()
