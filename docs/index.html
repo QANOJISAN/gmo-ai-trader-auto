@@ -613,13 +613,21 @@
       <button class="btn" style="padding:4px 10px;" onclick="closeQrModal()">✕ 閉じる</button>
     </div>
     <p style="font-size:0.8rem; color:var(--text-secondary);">
-      スマホのカメラで以下のQRコードを読み取って開き、ブラウザメニューから<b>「ホーム画面に追加（アプリをインストール）」</b>を選ぶと、フルスクリーンのv2専用アプリとして起動できます（自宅Wi-Fi・外出先4G/5G 共通）。
+      スマホのカメラで以下のQRコードを読み取って開き、ブラウザメニューから<b>「ホーム画面に追加（アプリをインストール）」</b>を選ぶと、フルスクリーンの専用アプリとして起動できます。
     </p>
-    <div class="qr-card" style="max-width:340px; margin:0 auto; width:100%;">
-      <div style="font-size:0.85rem; font-weight:700; color:#d8b4fe;">📱 GMO AI Trader v2 スマホ専用アプリ（GitHub Pages PWA）</div>
-      <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
-      <a id="qrGhLink" href="https://qanojisan.github.io/gmo-ai-trader-auto/" target="_blank" style="font-family:monospace; font-size:0.82rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
-      <div style="font-size:0.74rem; color:var(--text-secondary);">最新スナップショット＆リアルタイムチャートを高速表示（PC操作は <code style="color:#6ee7b7;">http://127.0.0.1:8080</code>）</div>
+    <div class="qr-grid">
+      <div class="qr-card">
+        <div style="font-size:0.82rem; font-weight:700; color:#6ee7b7;">🏠 自宅Wi-Fi（リアルタイム操作＆監視）</div>
+        <div id="qrLanHolder" class="qr-svg-holder">読み込み中...</div>
+        <a id="qrLanLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">http://192.168.11.3:8080</a>
+        <div style="font-size:0.72rem; color:var(--text-secondary);">PAUSE / RESUME 等の全ボタン操作が可能</div>
+      </div>
+      <div class="qr-card">
+        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（v2専用 GitHub Pages）</div>
+        <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
+        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
+        <div style="font-size:0.72rem; color:var(--text-secondary);">外出先から最新スナップショット＆チャートを確認</div>
+      </div>
     </div>
     <div style="background:#090d16; border:1px solid #1e293b; border-radius:8px; padding:10px 12px; font-size:0.76rem; color:var(--text-secondary);">
       <b>📲 スマホへのアプリ追加手順：</b><br>
@@ -736,50 +744,54 @@ async function fetchWithTimeout(url, options={}, timeoutMs=2000) {
 }
 
 async function fetchStatus() {
-  // 1. GitHub Pages (*.github.io) または HTTPS 静的配信環境の場合は、
-  //    Mixed Content ブロックや LAN タイムアウト待ちを完全にスキップし、待ち時間 0 秒で status_snapshot.json を即時表示
-  if (location.hostname.endsWith("github.io") || location.protocol === "https:") {
+  // 1. 同一オリジン (/api/status) への通信を試行 (PC local / 自宅Wi-Fi LAN 直接アクセス時)
+  if (!location.hostname.endsWith("github.io")) {
     try {
-      const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
-      if (snapRes.ok) {
-        const snapData = await snapRes.json();
+      const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (res.ok && ct.includes("json")) {
+        const data = await res.json();
         activeApiBase = ".";
-        isStaticSnapshotMode = true;
-        latestStatusData = snapData;
-        updateDashboardUI(snapData);
+        isStaticSnapshotMode = false;
+        latestStatusData = data;
+        updateDashboardUI(data);
         return;
       }
-    } catch (err) {
-      console.error("Snapshot fetch error:", err);
-    }
-    return;
+    } catch (_) {}
   }
 
-  // 2. PC ローカル環境 (http://127.0.0.1:8080 等): 同一オリジン /api/status へ直接通信
+  // 2. GitHub Pages 等から開いている場合、まず status_snapshot.json を読み込みつつ、自宅Wi-Fi LAN API への直接接続も試行
+  let snapData = null;
   try {
-    const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
-    const ct = (res.headers.get("content-type") || "").toLowerCase();
-    if (res.ok && ct.includes("json")) {
-      const data = await res.json();
-      activeApiBase = ".";
+    const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+    if (snapRes.ok) {
+      snapData = await snapRes.json();
+      if (snapData && snapData.network_info) {
+        latestNetworkInfo = snapData.network_info;
+      }
+    }
+  } catch (_) {}
+
+  const lanCandidate = (latestNetworkInfo && latestNetworkInfo.lan_url) || "http://192.168.11.3:8080";
+  try {
+    const lanRes = await fetchWithTimeout(`${lanCandidate}/api/status?_t=${Date.now()}`, { cache: "no-store", mode: "cors" }, 1800);
+    if (lanRes.ok) {
+      const liveData = await lanRes.json();
+      activeApiBase = lanCandidate;
       isStaticSnapshotMode = false;
-      latestStatusData = data;
-      updateDashboardUI(data);
+      latestStatusData = liveData;
+      updateDashboardUI(liveData);
       return;
     }
   } catch (_) {}
 
-  // 3. フォールバック: status_snapshot.json
-  try {
-    const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
-    if (snapRes.ok) {
-      const snapData = await snapRes.json();
-      activeApiBase = ".";
-      isStaticSnapshotMode = true;
-      latestStatusData = snapData;
-      updateDashboardUI(snapData);
-    }
-  } catch (_) {}
+  // 3. 外出先 (4G/5G) または HTTPS 混在制限時は status_snapshot.json で表示
+  if (snapData) {
+    activeApiBase = ".";
+    isStaticSnapshotMode = true;
+    latestStatusData = snapData;
+    updateDashboardUI(snapData);
+  }
 }
 
 async function fetchChart() {
@@ -886,18 +898,18 @@ function updateDashboardUI(data) {
   if (d.is_paused) {
     bDaemon.textContent = "⏸️ 一時停止中 (PAUSED)";
     bDaemon.className = "badge badge-paused";
-    btnPause.disabled = true; btnResume.disabled = false;
-    btnPauseM.disabled = true; btnResumeM.disabled = false;
+    btnPause.disabled = true; btnResume.disabled = isStaticSnapshotMode;
+    btnPauseM.disabled = true; btnResumeM.disabled = isStaticSnapshotMode;
   } else if (d.is_running) {
     bDaemon.textContent = "🟢 稼働中 (ACTIVE)";
     bDaemon.className = "badge badge-active";
-    btnPause.disabled = false; btnResume.disabled = true;
-    btnPauseM.disabled = false; btnResumeM.disabled = true;
+    btnPause.disabled = isStaticSnapshotMode; btnResume.disabled = true;
+    btnPauseM.disabled = isStaticSnapshotMode; btnResumeM.disabled = true;
   } else {
     bDaemon.textContent = "⚪ 待機中";
     bDaemon.className = "badge badge-stopped";
-    btnPause.disabled = false; btnResume.disabled = false;
-    btnPauseM.disabled = false; btnResumeM.disabled = false;
+    btnPause.disabled = isStaticSnapshotMode; btnResume.disabled = isStaticSnapshotMode;
+    btnPauseM.disabled = isStaticSnapshotMode; btnResumeM.disabled = isStaticSnapshotMode;
   }
 
   document.getElementById("badgeRegime").textContent = `${d.market_regime || "NEUTRAL"}`;
@@ -1198,11 +1210,9 @@ function drawEquityChart(curve) {
   });
 }
 
-const READONLY_PWA_GUIDE_MSG = "📱 外出先（GitHub Pages閲覧専用モード）です。操作はPCダッシュボード（127.0.0.1:8080）から実行してください";
-
 async function sendControl(command, nonce="") {
   if (isStaticSnapshotMode) {
-    showToast(READONLY_PWA_GUIDE_MSG, true);
+    showToast("外出先（GitHub Pages閲覧モード）からは操作できません。自宅Wi-Fi接続時に操作してください。", true);
     return null;
   }
   try {
@@ -1226,10 +1236,6 @@ async function sendControl(command, nonce="") {
 }
 
 function confirmCancelEntries() {
-  if (isStaticSnapshotMode) {
-    showToast(READONLY_PWA_GUIDE_MSG, true);
-    return;
-  }
   if (!confirm("現在待機中の未約定買い指値（PENDING_BUY）をすべてキャンセルしますか？\n（※保有中ポジションと逆指値STOP注文は維持されます）")) {
     return;
   }
@@ -1238,7 +1244,7 @@ function confirmCancelEntries() {
 
 async function openFlattenModal() {
   if (isStaticSnapshotMode) {
-    showToast(READONLY_PWA_GUIDE_MSG, true);
+    showToast("外出先（GitHub Pages閲覧モード）からは操作できません。", true);
     return;
   }
   const modal = document.getElementById("flattenModal");
@@ -1273,27 +1279,34 @@ async function confirmFlattenAll() {
 
 async function openQrModal() {
   document.getElementById("qrModal").style.display = "flex";
-  const ghUrl = (latestNetworkInfo && latestNetworkInfo.github_pages_url) || "https://qanojisan.github.io/gmo-ai-trader-auto/";
+  const lanUrl = latestNetworkInfo.lan_url || "http://192.168.11.3:8080";
+  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader-auto/";
+  const lanLink = document.getElementById("qrLanLink");
   const ghLink = document.getElementById("qrGhLink");
-  if (ghLink) {
-    ghLink.href = ghUrl;
-    ghLink.textContent = ghUrl;
-  }
+  lanLink.href = lanUrl;
+  lanLink.textContent = lanUrl;
+  ghLink.href = ghUrl;
+  ghLink.textContent = ghUrl;
 
   try {
-    let r2 = null;
-    if (!isStaticSnapshotMode) {
-      r2 = await fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(ghUrl)}`, {}, 2000).catch(() => null);
+    const [r1, r2] = await Promise.all([
+      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(lanUrl)}`, {}, 2000).catch(() => fetch("./qr-lan.svg")),
+      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(ghUrl)}`, {}, 2000).catch(() => fetch("./qr-gh.svg"))
+    ]);
+    if (r1 && r1.ok) {
+      const t1 = await r1.text();
+      if (t1.includes("<svg")) document.getElementById("qrLanHolder").innerHTML = t1;
+    } else {
+      const f1 = await fetch("./qr-lan.svg");
+      if (f1.ok) document.getElementById("qrLanHolder").innerHTML = await f1.text();
     }
     if (r2 && r2.ok) {
       const t2 = await r2.text();
-      if (t2.includes("<svg")) {
-        document.getElementById("qrGhHolder").innerHTML = t2;
-        return;
-      }
+      if (t2.includes("<svg")) document.getElementById("qrGhHolder").innerHTML = t2;
+    } else {
+      const f2 = await fetch("./qr-gh.svg");
+      if (f2.ok) document.getElementById("qrGhHolder").innerHTML = await f2.text();
     }
-    const f2 = await fetch("./qr-gh.svg");
-    if (f2.ok) document.getElementById("qrGhHolder").innerHTML = await f2.text();
   } catch (_) {}
 }
 
