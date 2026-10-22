@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-23T03:28:41+09:00",
+  "timestamp": "2026-10-23T03:43:47+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -108,9 +108,9 @@
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 258,
     "remaining_hours": 20,
-    "remaining_minutes": 31,
-    "remaining_total_seconds": 22365078,
-    "countdown_text": "第1回締め(2027/7/9) 残り 258日 20時間 31分",
+    "remaining_minutes": 16,
+    "remaining_total_seconds": 22364172,
+    "countdown_text": "第1回締め(2027/7/9) 残り 258日 20時間 16分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -121,8 +121,8 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 372803.0,
-        "estimated_value_jpy": 285.8,
+        "current_bid": 372550.0,
+        "estimated_value_jpy": 285.6,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
     ]
@@ -163,7 +163,6 @@
     "status": "RADAR_SKIPPED_AI"
   },
   "logs": [
-    "2026-10-22 20:10:52,164 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 20:25:57,988 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 20:41:03,715 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 20:56:09,322 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
@@ -192,99 +191,100 @@
     "2026-10-23 02:43:23,952 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 02:58:29,600 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 03:13:35,558 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
-    "2026-10-23 03:28:41,183 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
+    "2026-10-23 03:28:41,183 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-23 03:43:46,956 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12724320.0,
-      "bid": 12724244.0,
+      "ask": 12732160.0,
+      "bid": 12732159.0,
       "high": 13397513.0,
       "low": 12677103.0,
-      "last": 12723811.0,
-      "volume": 179.37563,
-      "trading_value_24h": 2282341614.13,
-      "spread": 76.0,
-      "spread_pct": 0.0006,
-      "timestamp": "2026-10-22T18:28:39.906Z"
+      "last": 12731040.0,
+      "volume": 179.39699,
+      "trading_value_24h": 2283910255.57,
+      "spread": 1.0,
+      "spread_pct": 0.0,
+      "timestamp": "2026-10-22T18:43:45.758Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 372826.0,
-      "bid": 372803.0,
+      "ask": 372776.0,
+      "bid": 372550.0,
       "high": 395299.0,
       "low": 370000.0,
-      "last": 372804.0,
-      "volume": 3578.6828,
-      "trading_value_24h": 1334147262.57,
-      "spread": 23.0,
-      "spread_pct": 0.0062,
-      "timestamp": "2026-10-22T18:28:39.532Z"
+      "last": 372436.0,
+      "volume": 3580.7831,
+      "trading_value_24h": 1333612534.63,
+      "spread": 226.0,
+      "spread_pct": 0.0607,
+      "timestamp": "2026-10-22T18:43:46.718Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 42918.0,
-      "bid": 42822.0,
+      "ask": 42939.0,
+      "bid": 42909.0,
       "high": 45589.0,
       "low": 42729.0,
-      "last": 42920.0,
-      "volume": 236.192,
-      "trading_value_24h": 10137360.64,
-      "spread": 96.0,
-      "spread_pct": 0.2242,
-      "timestamp": "2026-10-22T18:28:40.081Z"
+      "last": 42918.0,
+      "volume": 236.752,
+      "trading_value_24h": 10160922.34,
+      "spread": 30.0,
+      "spread_pct": 0.0699,
+      "timestamp": "2026-10-22T18:43:46.396Z"
     },
     "LTC": {
       "symbol": "LTC",
-      "ask": 9126.0,
-      "bid": 9111.0,
+      "ask": 9139.0,
+      "bid": 9134.0,
       "high": 9810.0,
       "low": 9126.0,
-      "last": 9126.0,
-      "volume": 1083.44,
-      "trading_value_24h": 9887473.44,
-      "spread": 15.0,
-      "spread_pct": 0.1646,
-      "timestamp": "2026-10-22T18:28:40.093Z"
+      "last": 9130.0,
+      "volume": 1087.3,
+      "trading_value_24h": 9927049.0,
+      "spread": 5.0,
+      "spread_pct": 0.0547,
+      "timestamp": "2026-10-22T18:43:46.397Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 204.435,
-      "bid": 204.384,
+      "ask": 204.599,
+      "bid": 204.598,
       "high": 219.149,
-      "low": 204.301,
-      "last": 204.435,
-      "volume": 2713818.0,
-      "trading_value_24h": 554799382.83,
-      "spread": 0.051000000000016144,
-      "spread_pct": 0.025,
-      "timestamp": "2026-10-22T18:28:40.711Z"
+      "low": 204.3,
+      "last": 204.599,
+      "volume": 2689017.0,
+      "trading_value_24h": 550170189.18,
+      "spread": 0.0009999999999763531,
+      "spread_pct": 0.0005,
+      "timestamp": "2026-10-22T18:43:46.530Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.282,
-      "bid": 12.276,
+      "ask": 12.306,
+      "bid": 12.293,
       "high": 13.137,
       "low": 12.218,
-      "last": 12.278,
-      "volume": 3147817.0,
-      "trading_value_24h": 38648897.13,
-      "spread": 0.006000000000000227,
-      "spread_pct": 0.0489,
-      "timestamp": "2026-10-22T18:28:40.511Z"
+      "last": 12.306,
+      "volume": 3207834.0,
+      "trading_value_24h": 39475605.2,
+      "spread": 0.0129999999999999,
+      "spread_pct": 0.1058,
+      "timestamp": "2026-10-22T18:43:46.608Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16203.0,
-      "bid": 16202.0,
+      "ask": 16248.0,
+      "bid": 16243.0,
       "high": 17130.0,
       "low": 16155.0,
-      "last": 16226.0,
-      "volume": 15880.13,
-      "trading_value_24h": 257670989.38,
-      "spread": 1.0,
-      "spread_pct": 0.0062,
-      "timestamp": "2026-10-22T18:28:40.211Z"
+      "last": 16244.0,
+      "volume": 15853.63,
+      "trading_value_24h": 257526365.72,
+      "spread": 5.0,
+      "spread_pct": 0.0308,
+      "timestamp": "2026-10-22T18:43:46.604Z"
     }
   },
   "static_snapshot": true
