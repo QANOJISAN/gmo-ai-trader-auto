@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0b0f19"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="lineGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="108" fill="url(#bgGrad)" stroke="#38bdf8" stroke-width="12"/>
+  <g opacity="0.18" stroke="#94a3b8" stroke-width="3">
+    <line x1="64" y1="140" x2="448" y2="140"/>
+    <line x1="64" y1="256" x2="448" y2="256"/>
+    <line x1="64" y1="372" x2="448" y2="372"/>
+  </g>
+  <!-- Candlesticks -->
+  <g>
+    <line x1="128" y1="270" x2="128" y2="390" stroke="#ef4444" stroke-width="10" stroke-linecap="round"/>
+    <rect x="110" y="295" width="36" height="65" rx="6" fill="#ef4444"/>
+    <line x1="216" y1="210" x2="216" y2="340" stroke="#10b981" stroke-width="10" stroke-linecap="round"/>
+    <rect x="198" y="235" width="36" height="75" rx="6" fill="#10b981"/>
+    <line x1="304" y1="170" x2="304" y2="290" stroke="#10b981" stroke-width="10" stroke-linecap="round"/>
+    <rect x="286" y="190" width="36" height="70" rx="6" fill="#10b981"/>
+    <line x1="392" y1="105" x2="392" y2="235" stroke="#38bdf8" stroke-width="10" stroke-linecap="round"/>
+    <rect x="374" y="125" width="36" height="80" rx="6" fill="#38bdf8"/>
+  </g>
+  <!-- Trend curve -->
+  <path d="M 96 376 L 192 290 L 288 240 L 412 128" fill="none" stroke="url(#lineGrad)" stroke-width="16" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="412" cy="128" r="18" fill="#10b981" stroke="#0b0f19" stroke-width="6"/>
+  <text x="256" y="454" text-anchor="middle" fill="#f1f5f9" font-family="Segoe UI, sans-serif" font-weight="800" font-size="48">AI TRADER v2</text>
+</svg>

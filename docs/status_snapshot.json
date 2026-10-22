@@ -1,0 +1,281 @@
+{
+  "timestamp": "2026-10-22T19:05:45+09:00",
+  "network_info": {
+    "lan_ip": "192.168.11.3",
+    "port": 8080,
+    "lan_url": "http://192.168.11.3:8080",
+    "local_url": "http://127.0.0.1:8080",
+    "github_pages_url": "https://qanojisan.github.io/gmo-ai-trader/"
+  },
+  "daemon": {
+    "is_running": true,
+    "launcher_pid": 16468,
+    "execution_mode": "LIVE",
+    "is_paused": false,
+    "market_regime": "RISK_OFF_CRASH",
+    "regime_detail": {
+      "regime": "RISK_OFF_CRASH",
+      "allow_new_buy": false,
+      "should_cancel_pending_buys": true,
+      "in_hysteresis_cooldown": false,
+      "cooldown_until": "2026-10-22T19:30:21+09:00",
+      "btc_change_1h_pct": -0.32,
+      "btc_change_4h_pct": -1.4,
+      "btc_rsi_4h": 41.96,
+      "breadth_ratio": 0.0,
+      "reasons": [
+        "市場Breadth悪化 (0/10 = 0.0% < 25%)"
+      ]
+    },
+    "circuit_breakers": {
+      "l1_ws_sequence": "OK",
+      "l2_api_health": "OK",
+      "l3_daily_loss": {
+        "level": "L3",
+        "blocked": false,
+        "daily_starting_equity_jpy": 10025.0,
+        "daily_loss_limit_jpy": -300.75,
+        "daily_realized_pnl_jpy": 0.0,
+        "daily_unrealized_pnl_jpy": 0.0,
+        "daily_total_pnl_jpy": 0.0,
+        "paused_until": null
+      },
+      "l4_weekly_streak": {
+        "level": "L4",
+        "blocked": false,
+        "weekly_starting_equity_jpy": 10025.0,
+        "weekly_loss_limit_jpy": -601.5,
+        "consecutive_losses": 0,
+        "weekly_pnl_jpy": 0.0,
+        "paused_until": null,
+        "reasons": []
+      },
+      "l5_kill_switch": {
+        "latched": false,
+        "conservative_equity_jpy": 10025.0,
+        "peak_equity_jpy": 10025.0,
+        "threshold_jpy": 8521.0,
+        "headroom_jpy": 1504.0
+      }
+    }
+  },
+  "equity_summary": {
+    "initial_capital_jpy": 10000.0,
+    "jpy_balance": 10025.0,
+    "locked_pending_jpy": 0.0,
+    "positions_eval_jpy": 0.0,
+    "total_equity_jpy": 10025.0,
+    "conservative_liquidation_jpy": 10025.0,
+    "total_pnl_jpy": 25.0,
+    "total_pnl_pct": 0.25,
+    "realized_pnl_total_jpy": 0.0,
+    "unrealized_pnl_total_jpy": 0.0,
+    "peak_equity_jpy": 10025.0,
+    "l5_kill_switch_jpy": 8521.0,
+    "pattern_a": {
+      "max_allocation_pct": 0.45,
+      "max_position_jpy": 4511.0,
+      "max_concurrent_positions": 2,
+      "risk_1r_normal_jpy": 150.0,
+      "risk_1r_stressed_jpy": 200.0
+    },
+    "equity_curve": [
+      {
+        "index": 0,
+        "label": "開始",
+        "equity_jpy": 10000.0,
+        "pnl_jpy": 0,
+        "symbol": "INIT"
+      },
+      {
+        "index": 1,
+        "label": "現在",
+        "equity_jpy": 10025.0,
+        "pnl_jpy": 25.0,
+        "symbol": "NOW",
+        "reason": "CURRENT"
+      }
+    ]
+  },
+  "campaign": {
+    "current_phase": "PHASE1_ACTIVE",
+    "phase_label_ja": "第1回 運用期間（通常稼働中）",
+    "phase1_end_jst": "2027-07-09T00:00:00+09:00",
+    "phase1_freeze_start_jst": "2027-07-08T22:00:00+09:00",
+    "phase2_start_jst": "2027-07-10T00:00:00+09:00",
+    "phase2_end_jst": "2027-12-10T00:00:00+09:00",
+    "phase2_freeze_start_jst": "2027-12-09T22:00:00+09:00",
+    "pre_deadline_freeze_hours": 2.0,
+    "remaining_days": 259,
+    "remaining_hours": 4,
+    "remaining_minutes": 54,
+    "remaining_total_seconds": 22395254,
+    "countdown_text": "第1回締め(2027/7/9) 残り 259日 04時間 54分",
+    "phase1_settled": false,
+    "phase2_settled": false
+  },
+  "positions": {
+    "active": [],
+    "quarantined_dust": [
+      {
+        "symbol": "ETH",
+        "size": 0.00076653866858138,
+        "state": "DUST_QUARANTINED",
+        "current_bid": 378162.0,
+        "estimated_value_jpy": 289.9,
+        "opened_at": "2026-10-22T17:30:20+09:00"
+      }
+    ]
+  },
+  "pending_orders": [],
+  "closed_trades": [],
+  "latest_decision": {
+    "timestamp": "2026-10-22T17:30:21+09:00",
+    "action": "HOLD",
+    "symbol": "NONE",
+    "order_type": "NONE",
+    "limit_price": 0,
+    "size": 0,
+    "take_profit_price": 0,
+    "stop_loss_price": 0,
+    "expected_cost_jpy": 0,
+    "expected_loss_jpy": 0,
+    "risk_reward_ratio": 0.0,
+    "confidence": 0.5,
+    "provider": "radar_gate_hold",
+    "execution_mode": "LIVE",
+    "radar_triggers": [],
+    "regime_info": {
+      "regime": "RISK_OFF_CRASH",
+      "allow_new_buy": false,
+      "should_cancel_pending_buys": true,
+      "in_hysteresis_cooldown": false,
+      "cooldown_until": "2026-10-22T19:30:21+09:00",
+      "btc_change_1h_pct": -0.32,
+      "btc_change_4h_pct": -1.4,
+      "btc_rsi_4h": 41.96,
+      "breadth_ratio": 0.0,
+      "reasons": [
+        "市場Breadth悪化 (0/10 = 0.0% < 25%)"
+      ]
+    },
+    "reasoning": "トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "status": "RADAR_SKIPPED_AI"
+  },
+  "logs": [
+    "2026-10-22 17:27:50,934 [INFO] auto_trader: Live Probe 完了: {'probed_at': '2026-10-22T17:27:48+09:00', 'execution_mode': 'LIVE', 'probe_symbol': 'XRP', 'probe_size': '1', 'probe_limit_price': '177.65', 'probe_modified_price': '177.649', 'clock_offset_ms': -1414, 'schema_compatibility': {'assets_schema_valid': True, 'active_orders_schema_valid': True, 'trading_volume_schema_valid': True}, 'limit_change_order_supported': True, 'limit_change_order_preserves_order_id': True, 'stop_change_order_supported': True, 'cancel_before_supported': True, 'ws_auth_put_delete_supported': True, 'trading_volume_supported': True, 'fee_schedule': {'tier_level': 1, 'jpy_volume_30d': '0', 'spot_fees': {'BTC': {'maker_fee': '-0.0001', 'taker_fee': '0.0005'}, 'ETH': {'maker_fee': '-0.0001', 'taker_fee': '0.0005'}, 'BCH': {'maker_fee': '-0.0003', 'taker_fee': '0.0009'}, 'LTC': {'maker_fee': '-0.0003', 'taker_fee': '0.0009'}, 'XRP': {'maker_fee': '-0.0001', 'taker_fee': '0.0005'}, 'DOGE': {'maker_fee': '-0.0003', 'taker_fee': '0.0009'}, 'SOL': {'maker_fee': '-0.0003', 'taker_fee': '0.0009'}}}, 'cleanup_verified_zero_residual_orders': True, 'residual_probe_orders_count': 0, 'cleaned_order_ids': ['9068603366', '9068603367', '9068603368'], 'cancel_before_market_fak_sell_only_enforced': True}",
+    "2026-10-22 17:30:21,680 [INFO] auto_trader: 初回 3-Way Reconciliation 完了: {'status': 'RECONCILED', 'degraded_reconciling': False, 'elapsed_ms': 826.6, 'timestamp': '2026-10-22T17:30:20+09:00', 'exchange_jpy': 10025.0, 'jpy_diff': 25.0, 'actions_taken': ['ETH: 最小ロット未満の端数残高 (0.00076653866858138) を DUST_QUARANTINED に隔離', '日本円残高同期: 10000円 -> 10025.0円'], 'discrepancies': [], 'orphan_orders_handled': [], 'ghost_orders_resolved': [], 'naked_positions_protected': [], 'dust_quarantined': ['ETH'], 'fee_adjustment_applied': None}",
+    "2026-10-22 17:30:24,070 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 17:32:35,173 [INFO] auto_trader: === GMO AI Trader v2 デーモン起動 (mode=LIVE, fast=15s, radar=900s, expiry=4.0h) ===",
+    "2026-10-22 17:32:37,991 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 17:59:08,957 [INFO] auto_trader: 初回 3-Way Reconciliation 完了: {'status': 'RECONCILED', 'degraded_reconciling': False, 'elapsed_ms': 832.85, 'timestamp': '2026-10-22T17:59:08+09:00', 'exchange_jpy': 10025.0, 'jpy_diff': 0.0, 'actions_taken': [], 'discrepancies': [], 'orphan_orders_handled': [], 'ghost_orders_resolved': [], 'naked_positions_protected': [], 'dust_quarantined': [], 'fee_adjustment_applied': None}",
+    "2026-10-22 17:59:11,470 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:00:33,969 [INFO] auto_trader: 初回 3-Way Reconciliation 完了: {'status': 'RECONCILED', 'degraded_reconciling': False, 'elapsed_ms': 823.22, 'timestamp': '2026-10-22T18:00:33+09:00', 'exchange_jpy': 10025.0, 'jpy_diff': 0.0, 'actions_taken': [], 'discrepancies': [], 'orphan_orders_handled': [], 'ghost_orders_resolved': [], 'naked_positions_protected': [], 'dust_quarantined': [], 'fee_adjustment_applied': None}",
+    "2026-10-22 18:00:36,488 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:01:55,874 [INFO] auto_trader: === GMO AI Trader v2 デーモン起動 (mode=LIVE, fast=15s, radar=900s, expiry=4.0h) ===",
+    "2026-10-22 18:01:58,968 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:05:05,415 [INFO] auto_trader: === GMO AI Trader v2 デーモン起動 (mode=LIVE, fast=15s, radar=900s, expiry=4.0h) ===",
+    "2026-10-22 18:05:08,379 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:20:13,497 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:35:19,100 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:40:25,933 [INFO] auto_trader: === GMO AI Trader v2 デーモン起動 (mode=LIVE, fast=15s, radar=900s, expiry=4.0h) ===",
+    "2026-10-22 18:40:28,580 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 18:55:33,984 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-22 19:04:54,722 [INFO] auto_trader: === GMO AI Trader v2 デーモン起動 (mode=LIVE, fast=15s, radar=900s, expiry=4.0h) ===",
+    "2026-10-22 19:04:57,554 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
+  ],
+  "tickers": {
+    "BTC": {
+      "symbol": "BTC",
+      "ask": 12870379.0,
+      "bid": 12870378.0,
+      "high": 13397513.0,
+      "low": 12815704.0,
+      "last": 12870379.0,
+      "volume": 184.46446,
+      "trading_value_24h": 2374127512.23,
+      "spread": 1.0,
+      "spread_pct": 0.0,
+      "timestamp": "2026-10-22T10:05:42.857Z"
+    },
+    "ETH": {
+      "symbol": "ETH",
+      "ask": 378374.0,
+      "bid": 378162.0,
+      "high": 395299.0,
+      "low": 376137.0,
+      "last": 378386.0,
+      "volume": 2729.2593,
+      "trading_value_24h": 1032713509.49,
+      "spread": 212.0,
+      "spread_pct": 0.0561,
+      "timestamp": "2026-10-22T10:05:42.462Z"
+    },
+    "BCH": {
+      "symbol": "BCH",
+      "ask": 43341.0,
+      "bid": 43271.0,
+      "high": 45589.0,
+      "low": 42947.0,
+      "last": 43251.0,
+      "volume": 272.973,
+      "trading_value_24h": 11806355.22,
+      "spread": 70.0,
+      "spread_pct": 0.1618,
+      "timestamp": "2026-10-22T10:05:42.708Z"
+    },
+    "LTC": {
+      "symbol": "LTC",
+      "ask": 9329.0,
+      "bid": 9308.0,
+      "high": 9810.0,
+      "low": 9300.0,
+      "last": 9328.0,
+      "volume": 777.47,
+      "trading_value_24h": 7252240.16,
+      "spread": 21.0,
+      "spread_pct": 0.2256,
+      "timestamp": "2026-10-22T10:05:42.939Z"
+    },
+    "XRP": {
+      "symbol": "XRP",
+      "ask": 209.098,
+      "bid": 209.05,
+      "high": 219.149,
+      "low": 208.0,
+      "last": 209.099,
+      "volume": 3186727.0,
+      "trading_value_24h": 666341428.97,
+      "spread": 0.04800000000000182,
+      "spread_pct": 0.023,
+      "timestamp": "2026-10-22T10:05:42.846Z"
+    },
+    "DOGE": {
+      "symbol": "DOGE",
+      "ask": 12.439,
+      "bid": 12.432,
+      "high": 13.137,
+      "low": 12.385,
+      "last": 12.441,
+      "volume": 2937983.0,
+      "trading_value_24h": 36551446.5,
+      "spread": 0.006999999999999673,
+      "spread_pct": 0.0563,
+      "timestamp": "2026-10-22T10:05:42.361Z"
+    },
+    "SOL": {
+      "symbol": "SOL",
+      "ask": 16392.0,
+      "bid": 16388.0,
+      "high": 17130.0,
+      "low": 16263.0,
+      "last": 16393.0,
+      "volume": 14705.38,
+      "trading_value_24h": 241065294.34,
+      "spread": 4.0,
+      "spread_pct": 0.0244,
+      "timestamp": "2026-10-22T10:05:42.656Z"
+    }
+  },
+  "static_snapshot": true
+}

@@ -1,0 +1,1239 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="AI Trader v2">
+<meta name="theme-color" content="#0b0f19">
+<link rel="manifest" href="manifest.json">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
+<link rel="icon" type="image/svg+xml" href="icon.svg">
+<title>GMO AI Trader v2 — 24/7 自動売買アプリ</title>
+<style>
+  :root {
+    --bg-main: #0b0f19;
+    --bg-card: #111827;
+    --bg-card-alt: #1e293b;
+    --border-color: #26334d;
+    --text-primary: #f1f5f9;
+    --text-secondary: #94a3b8;
+    --accent-blue: #38bdf8;
+    --accent-green: #10b981;
+    --accent-red: #ef4444;
+    --accent-amber: #f59e0b;
+    --accent-purple: #a855f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body {
+    background: var(--bg-main);
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Hiragino Sans", "Yu Gothic UI", "Meiryo", sans-serif;
+    line-height: 1.5;
+    padding-bottom: 92px;
+  }
+  .topbar {
+    background: rgba(15, 23, 42, 0.94);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border-color);
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 16px 10px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    position: sticky;
+    top: 0;
+    z-index: 100;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .brand-logo {
+    width: 30px;
+    height: 30px;
+    border-radius: 7px;
+  }
+  .brand h1 {
+    font-size: 1.05rem;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+  }
+  .badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 0.74rem;
+    font-weight: 700;
+    border: 1px solid transparent;
+  }
+  .badge-live { background: rgba(239,68,68,0.18); color: #fca5a5; border-color: rgba(239,68,68,0.45); }
+  .badge-dry { background: rgba(56,189,248,0.18); color: #7dd3fc; border-color: rgba(56,189,248,0.45); }
+  .badge-active { background: rgba(16,185,129,0.18); color: #6ee7b7; border-color: rgba(16,185,129,0.45); }
+  .badge-paused { background: rgba(245,158,11,0.22); color: #fcd34d; border-color: rgba(245,158,11,0.55); }
+  .badge-stopped { background: rgba(148,163,184,0.18); color: #cbd5e1; border-color: rgba(148,163,184,0.4); }
+  .badge-regime { background: rgba(168,85,247,0.18); color: #d8b4fe; border-color: rgba(168,85,247,0.45); }
+  .badge-campaign { background: rgba(56,189,248,0.14); color: #bae6fd; border-color: rgba(56,189,248,0.35); }
+
+  .container {
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  /* Control Bar (Desktop & Tablet) */
+  .control-bar {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 13px 16px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  }
+  .control-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .btn {
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    padding: 8px 14px;
+    font-size: 0.84rem;
+    font-weight: 700;
+    color: var(--text-primary);
+    background: var(--bg-card-alt);
+    transition: all 0.15s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+  }
+  .btn:hover:not(:disabled) { filter: brightness(1.12); }
+  .btn:active:not(:disabled) { transform: scale(0.98); }
+  .btn:disabled { opacity: 0.42; cursor: not-allowed; }
+  .btn-pause { background: #b45309; border-color: #f59e0b; color: #fff; }
+  .btn-resume { background: #047857; border-color: #10b981; color: #fff; }
+  .btn-cancel { background: #1e3a8a; border-color: #3b82f6; color: #dbeafe; }
+  .btn-flatten { background: #7f1d1d; border-color: #ef4444; color: #fee2e2; }
+  .btn-qr { background: rgba(56,189,248,0.16); border-color: #38bdf8; color: #bae6fd; }
+  .btn-refresh { background: #1e293b; border-color: #475569; color: #e2e8f0; }
+
+  .toast {
+    position: fixed;
+    top: 68px;
+    right: 16px;
+    left: 16px;
+    max-width: 480px;
+    margin: 0 auto;
+    padding: 11px 16px;
+    border-radius: 10px;
+    font-size: 0.84rem;
+    font-weight: 700;
+    background: rgba(15, 23, 42, 0.96);
+    border: 1px solid #38bdf8;
+    color: #e0f2fe;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.6);
+    z-index: 300;
+    display: none;
+    text-align: center;
+  }
+
+  /* Summary KPI Grid */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 12px;
+  }
+  .kpi-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 13px 15px;
+  }
+  .kpi-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    margin-bottom: 3px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .kpi-value {
+    font-size: 1.35rem;
+    font-weight: 800;
+    letter-spacing: 0.01em;
+  }
+  .kpi-sub {
+    font-size: 0.74rem;
+    color: var(--text-secondary);
+    margin-top: 4px;
+  }
+  .pos-val { color: var(--accent-green); }
+  .neg-val { color: var(--accent-red); }
+
+  /* Main 2-Column Layout */
+  .main-grid {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 14px;
+  }
+  @media (max-width: 1080px) {
+    .main-grid { grid-template-columns: 1fr; }
+  }
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 12px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .card-header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    padding-bottom: 8px;
+  }
+  .card-title {
+    font-size: 0.92rem;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  /* Chart Controls */
+  .chart-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    align-items: center;
+  }
+  .chip {
+    cursor: pointer;
+    padding: 4px 9px;
+    border-radius: 6px;
+    font-size: 0.75rem;
+    font-weight: 700;
+    background: var(--bg-card-alt);
+    color: var(--text-secondary);
+    border: 1px solid var(--border-color);
+  }
+  .chip.active {
+    background: rgba(56,189,248,0.2);
+    color: #38bdf8;
+    border-color: #38bdf8;
+  }
+  .chart-canvas-wrap {
+    position: relative;
+    width: 100%;
+    height: 340px;
+    background: #090d16;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  .eq-canvas-wrap {
+    position: relative;
+    width: 100%;
+    height: 165px;
+    background: #090d16;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    overflow: hidden;
+  }
+  canvas { width: 100%; height: 100%; display: block; }
+
+  /* Tables */
+  .table-wrap { overflow-x: auto; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+  th, td {
+    padding: 7px 9px;
+    text-align: left;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  th { color: var(--text-secondary); font-weight: 600; background: rgba(255,255,255,0.02); }
+
+  /* Log Viewer */
+  .log-box {
+    background: #070a12;
+    border: 1px solid #1e293b;
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: "Consolas", "Monaco", monospace;
+    font-size: 0.74rem;
+    color: #cbd5e1;
+    max-height: 210px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  /* Mobile Fixed Bottom Action Bar */
+  .mobile-bottom-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: rgba(15, 23, 42, 0.96);
+    backdrop-filter: blur(12px);
+    border-top: 1px solid var(--border-color);
+    padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px)) 10px;
+    display: none;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 6px;
+    z-index: 150;
+  }
+  .mobile-bottom-bar .btn {
+    padding: 9px 4px;
+    font-size: 0.74rem;
+    border-radius: 8px;
+    flex-direction: column;
+    gap: 2px;
+  }
+  @media (max-width: 768px) {
+    .control-bar { display: none; }
+    .mobile-bottom-bar { display: grid; }
+    .kpi-grid { grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .kpi-value { font-size: 1.15rem; }
+    .chart-canvas-wrap { height: 260px; }
+  }
+
+  /* Modals */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.78);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 250;
+    padding: 16px;
+  }
+  .modal {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    max-width: 580px;
+    width: 100%;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 50px rgba(0,0,0,0.65);
+  }
+  .modal-danger { border: 2px solid var(--accent-red); }
+  .nonce-box {
+    background: #090d16;
+    border: 1px dashed #ef4444;
+    padding: 10px;
+    border-radius: 8px;
+    font-family: monospace;
+    font-size: 0.88rem;
+    color: #fde047;
+    text-align: center;
+  }
+  .qr-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 14px;
+  }
+  .qr-card {
+    background: #090d16;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 12px;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+  }
+  .qr-svg-holder svg {
+    width: 168px;
+    height: 168px;
+    border-radius: 8px;
+  }
+</style>
+</head>
+<body>
+
+<div id="toastMsg" class="toast"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <img src="icon.svg" alt="icon" class="brand-logo">
+    <h1>GMO AI Trader v2</h1>
+    <span id="badgeMode" class="badge badge-live">LIVE</span>
+    <span id="badgeDaemon" class="badge badge-active">🟢 稼働中</span>
+    <span id="badgeRegime" class="badge badge-regime">NEUTRAL</span>
+  </div>
+  <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+    <span id="badgeCampaign" class="badge badge-campaign">🏁 第1回締め計算中...</span>
+    <button class="btn btn-qr" style="padding:5px 10px; font-size:0.76rem;" onclick="openQrModal()">📱 スマホアプリ接続</button>
+    <button class="btn btn-refresh" style="padding:5px 10px; font-size:0.76rem;" onclick="forceRefreshPwa()">🔄 更新</button>
+    <span id="clockJst" style="font-size:0.76rem; color:var(--text-secondary); font-family:monospace;">--:-- JST</span>
+  </div>
+</header>
+
+<main class="container">
+
+  <!-- PC・タブレット向け操作コントロールバー -->
+  <section class="control-bar">
+    <div>
+      <div style="font-size:0.88rem; font-weight:700;">⚡ リアルタイム運用制御（デーモン無停止・0秒同期）</div>
+      <div id="controlStatusDesc" style="font-size:0.76rem; color:var(--text-secondary);">
+        一時停止（PAUSE）中も保有建玉の逆指値（STOP）と利確（TP）監視は継続されます。
+      </div>
+    </div>
+    <div class="control-buttons">
+      <button id="btnPause" class="btn btn-pause" onclick="sendControl('PAUSE')">⏸️ 一時停止 (PAUSE)</button>
+      <button id="btnResume" class="btn btn-resume" onclick="sendControl('RESUME')">▶️ 売買再開 (RESUME)</button>
+      <button id="btnCancelEntries" class="btn btn-cancel" onclick="confirmCancelEntries()">🧹 待機買い指値クリア</button>
+      <button id="btnFlattenAll" class="btn btn-flatten" onclick="openFlattenModal()">🚨 緊急全決済 (2段階承認)</button>
+    </div>
+  </section>
+
+  <!-- 資産・パターンA複利・防衛ライン KPI -->
+  <section class="kpi-grid">
+    <div class="kpi-card">
+      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 10,000円</span></div>
+      <div id="kpiTotalEquity" class="kpi-value">10,025 円</div>
+      <div id="kpiCashDetail" class="kpi-sub">現金: 10,025 円 / 拘束: 0 円</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">+0.25%</span></div>
+      <div id="kpiTotalPnl" class="kpi-value pos-val">+25 円</div>
+      <div id="kpiRealizedDetail" class="kpi-sub">確定: +0 円 / 含み: +0 円</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label"><span>📈 パターンA複利枠(45%)</span><span>最大2銘柄</span></div>
+      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">4,511 円 / 枠</div>
+      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): 150 円</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label"><span>🛡️ HWM & L5防衛線</span><span id="kpiL5Status">正常</span></div>
+      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">8,521 円</div>
+      <div id="kpiPeakDetail" class="kpi-sub">最高資産: 10,025 円 (余裕 +1,504 円)</div>
+    </div>
+    <div class="kpi-card">
+      <div class="kpi-label"><span>🚦 L3日次 / L4週次制限</span><span id="kpiCbBadge">稼働許可</span></div>
+      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: +0 円 / 制限 -301 円</div>
+      <div id="kpiWeeklyPnl" class="kpi-sub">週次: +0 円 (制限 -602 円) / 連敗: 0回</div>
+    </div>
+  </section>
+
+  <!-- メイン2カラム: 左=価格推移チャート、右=資産推移＆AI判定 -->
+  <section class="main-grid">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">
+          <span>📉 GMOコイン 現物チャート</span>
+          <span id="chartTickerSummary" style="font-size:0.8rem; color:var(--accent-blue); font-family:monospace;"></span>
+        </div>
+        <div class="chart-toolbar">
+          <div id="symbolChips" style="display:flex; gap:4px; flex-wrap:wrap;"></div>
+          <span style="color:#475569;">|</span>
+          <div id="intervalChips" style="display:flex; gap:4px;"></div>
+        </div>
+      </div>
+      <div class="chart-canvas-wrap">
+        <canvas id="priceChartCanvas"></canvas>
+      </div>
+      <div style="font-size:0.74rem; color:var(--text-secondary); display:flex; justify-content:space-between; flex-wrap:wrap;">
+        <span>💡 保有建玉の Entry(青) / TP利確(緑) / SL逆指値(赤) / 待機指値(黄) を自動描画</span>
+        <span id="chartUpdatedTime"></span>
+      </div>
+    </div>
+
+    <div style="display:flex; flex-direction:column; gap:14px;">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">📈 総資産推移 (Equity Curve)</div>
+          <span id="campaignPhaseBadge" style="font-size:0.73rem; color:var(--accent-blue);">PHASE1_ACTIVE</span>
+        </div>
+        <div class="eq-canvas-wrap">
+          <canvas id="equityChartCanvas"></canvas>
+        </div>
+        <div style="font-size:0.73rem; color:var(--text-secondary);">
+          ・第1回締め: 2027-07-09 00:00 JST (2時間前凍結 ➔ 全決済)<br>
+          ・第2回期間: 2027-07-10 00:00 〜 2027-12-10 00:00 JST
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">🧠 最新レーダー＆AI判定</div>
+          <span id="aiDecAction" class="badge badge-stopped">HOLD</span>
+        </div>
+        <div id="aiDecMeta" style="font-size:0.75rem; color:var(--text-secondary);"></div>
+        <div id="aiDecReasoning" style="font-size:0.79rem; background:#090d16; padding:9px; border-radius:8px; border:1px solid #1e293b; max-height:130px; overflow-y:auto;">
+          読み込み中...
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 保有ポジション ＆ 待機注文一覧 -->
+  <section class="main-grid">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">🛡️ 保有中ポジション (有効建玉 ＆ 逆指値保護状態)</div>
+        <span id="activePosCount" style="font-size:0.76rem; color:var(--text-secondary);">0 銘柄</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>銘柄</th>
+              <th>数量</th>
+              <th>取得単価</th>
+              <th>現在Bid</th>
+              <th>評価額</th>
+              <th>含み損益</th>
+              <th>SL / TP</th>
+              <th>段階</th>
+            </tr>
+          </thead>
+          <tbody id="activePositionsBody">
+            <tr><td colspan="8" style="text-align:center; color:var(--text-secondary);">現在保有中の有効ポジションはありません</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="dustQuarantineBox" style="font-size:0.74rem; color:var(--text-secondary); padding-top:4px;"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">⏳ 待機中指値注文 (`pending_orders`)</div>
+        <span id="pendingOrdCount" style="font-size:0.76rem; color:var(--text-secondary);">0 件</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>銘柄</th>
+              <th>指値価格</th>
+              <th>数量(約定)</th>
+              <th>拘束額</th>
+              <th>予定SL / TP</th>
+              <th>状態</th>
+            </tr>
+          </thead>
+          <tbody id="pendingOrdersBody">
+            <tr><td colspan="6" style="text-align:center; color:var(--text-secondary);">現在待機中の指値注文はありません</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- 決済履歴 ＆ リアルタイム稼働ログ -->
+  <section class="main-grid">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">🏆 直近の確定決済履歴 (`closed_trades`)</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>決済日時</th>
+              <th>銘柄</th>
+              <th>数量</th>
+              <th>Entry ➔ Exit</th>
+              <th>確定損益</th>
+              <th>理由</th>
+            </tr>
+          </thead>
+          <tbody id="closedTradesBody">
+            <tr><td colspan="6" style="text-align:center; color:var(--text-secondary);">まだ確定した決済履歴はありません</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">📜 リアルタイム稼働ログ (`logs/v2_auto_*.log`)</div>
+      </div>
+      <div id="logViewer" class="log-box">ログ読み込み中...</div>
+    </div>
+  </section>
+
+</main>
+
+<!-- スマホ専用 固定ボトムアクションバー (親指操作対応) -->
+<nav class="mobile-bottom-bar">
+  <button id="btnPauseMobile" class="btn btn-pause" onclick="sendControl('PAUSE')">
+    <span>⏸️</span><span>一時停止</span>
+  </button>
+  <button id="btnResumeMobile" class="btn btn-resume" onclick="sendControl('RESUME')">
+    <span>▶️</span><span>売買再開</span>
+  </button>
+  <button id="btnCancelMobile" class="btn btn-cancel" onclick="confirmCancelEntries()">
+    <span>🧹</span><span>指値クリア</span>
+  </button>
+  <button id="btnFlattenMobile" class="btn btn-flatten" onclick="openFlattenModal()">
+    <span>🚨</span><span>緊急全決済</span>
+  </button>
+</nav>
+
+<!-- スマホアプリ接続・QRコードモーダル -->
+<div id="qrModal" class="modal-backdrop" onclick="if(event.target===this)closeQrModal()">
+  <div class="modal">
+    <div style="display:flex; justify-content:space-between; align-items:center;">
+      <h3 style="font-size:1.05rem;">📱 スマートフォン専用アプリ（PWA）接続・インストール</h3>
+      <button class="btn" style="padding:4px 10px;" onclick="closeQrModal()">✕ 閉じる</button>
+    </div>
+    <p style="font-size:0.8rem; color:var(--text-secondary);">
+      スマホのカメラで以下のQRコードを読み取って開き、ブラウザメニューから<b>「ホーム画面に追加（アプリをインストール）」</b>を選ぶと、フルスクリーンの専用アプリとして起動できます。
+    </p>
+    <div class="qr-grid">
+      <div class="qr-card">
+        <div style="font-size:0.82rem; font-weight:700; color:#6ee7b7;">🏠 自宅Wi-Fi（リアルタイム操作＆監視）</div>
+        <div id="qrLanHolder" class="qr-svg-holder">読み込み中...</div>
+        <a id="qrLanLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">http://192.168.11.3:8080</a>
+        <div style="font-size:0.72rem; color:var(--text-secondary);">PAUSE / RESUME 等の全ボタン操作が可能</div>
+      </div>
+      <div class="qr-card">
+        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（GitHub Pages 閲覧）</div>
+        <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
+        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader/</a>
+        <div style="font-size:0.72rem; color:var(--text-secondary);">外出先から最新スナップショット＆チャートを確認</div>
+      </div>
+    </div>
+    <div style="background:#090d16; border:1px solid #1e293b; border-radius:8px; padding:10px 12px; font-size:0.76rem; color:var(--text-secondary);">
+      <b>📲 スマホへのアプリ追加手順：</b><br>
+      ・<b>iPhone (Safari)</b>：下部中央の「共有ボタン（□に↑）」➔ <b>「ホーム画面に追加」</b><br>
+      ・<b>Android (Chrome)</b>：右上メニュー「⋮」➔ <b>「アプリをインストール」または「ホーム画面に追加」</b>
+    </div>
+  </div>
+</div>
+
+<!-- 2段階承認 FLATTEN_ALL モーダル -->
+<div id="flattenModal" class="modal-backdrop" onclick="if(event.target===this)closeFlattenModal()">
+  <div class="modal modal-danger">
+    <h3 style="color:#fca5a5;">🚨 緊急全決済 (FLATTEN_ALL) — 2段階承認</h3>
+    <p style="font-size:0.84rem; color:var(--text-secondary);">
+      この操作を実行すると、<b>全ての未約定買い指値をキャンセル</b>し、<b>現在保有中の全ポジションを即時成行（MARKET）で全決済</b>した上で、新規エントリーを一時停止（PAUSE）します。
+    </p>
+    <div id="flattenNonceDisplay" class="nonce-box">ワンタイム承認コード発行中...</div>
+    <div style="display:flex; justify-content:flex-end; gap:10px;">
+      <button class="btn" onclick="closeFlattenModal()">キャンセル</button>
+      <button id="btnConfirmFlattenNow" class="btn btn-flatten" disabled onclick="confirmFlattenAll()">⚠️ 本当に全決済を実行する</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Service Worker 登録
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(() => {});
+  });
+}
+
+const SYMBOLS = ["BTC", "ETH", "XRP", "SOL", "DOGE", "BCH", "LTC"];
+const INTERVALS = [
+  { key: "15min", label: "15m" },
+  { key: "1hour", label: "1h" },
+  { key: "4hour", label: "4h" },
+  { key: "1day",  label: "1D" }
+];
+
+let selectedSymbol = "BTC";
+let selectedInterval = "1hour";
+let currentFlattenNonce = "";
+let lastChartData = null;
+let lastEquityCurve = [];
+let isStaticSnapshotMode = false;
+let latestNetworkInfo = {
+  lan_url: "http://192.168.11.3:8080",
+  github_pages_url: "https://qanojisan.github.io/gmo-ai-trader/"
+};
+
+function fmtJpy(val, showSign=false) {
+  const n = Number(val || 0);
+  const sign = showSign && n > 0 ? "+" : "";
+  return sign + Math.round(n).toLocaleString("ja-JP") + " 円";
+}
+
+function fmtPrice(val) {
+  const n = Number(val || 0);
+  if (n >= 1000) return n.toLocaleString("ja-JP", { maximumFractionDigits: 1 });
+  return n.toLocaleString("ja-JP", { maximumFractionDigits: 4 });
+}
+
+function showToast(msg, isError=false) {
+  const el = document.getElementById("toastMsg");
+  el.style.display = "block";
+  el.style.borderColor = isError ? "#ef4444" : "#38bdf8";
+  el.textContent = msg;
+  setTimeout(() => { el.style.display = "none"; }, 5000);
+}
+
+function renderToolbarChips(tickers={}) {
+  const symWrap = document.getElementById("symbolChips");
+  symWrap.innerHTML = "";
+  SYMBOLS.forEach(sym => {
+    const btn = document.createElement("button");
+    btn.className = "chip" + (sym === selectedSymbol ? " active" : "");
+    const t = tickers[sym];
+    const pStr = t && t.last ? ` ${fmtPrice(t.last)}` : "";
+    btn.textContent = sym + pStr;
+    btn.onclick = () => {
+      selectedSymbol = sym;
+      renderToolbarChips(tickers);
+      fetchChart();
+    };
+    symWrap.appendChild(btn);
+  });
+
+  const ivWrap = document.getElementById("intervalChips");
+  ivWrap.innerHTML = "";
+  INTERVALS.forEach(item => {
+    const btn = document.createElement("button");
+    btn.className = "chip" + (item.key === selectedInterval ? " active" : "");
+    btn.textContent = item.label;
+    btn.onclick = () => {
+      selectedInterval = item.key;
+      renderToolbarChips(tickers);
+      fetchChart();
+    };
+    ivWrap.appendChild(btn);
+  });
+}
+
+async function fetchStatus() {
+  try {
+    const res = await fetch(`./api/status?_t=${Date.now()}`, { cache: "no-store" });
+    if (!res.ok) throw new Error("API status not available");
+    const data = await res.json();
+    isStaticSnapshotMode = false;
+    updateDashboardUI(data);
+    return;
+  } catch (_) {
+    // 外出先 (GitHub Pages 静的配信環境) の場合は status_snapshot.json へ自動フォールバック
+    try {
+      const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+      if (snapRes.ok) {
+        const snapData = await snapRes.json();
+        isStaticSnapshotMode = true;
+        updateDashboardUI(snapData);
+      }
+    } catch (err) {
+      console.error("Snapshot fallback error:", err);
+    }
+  }
+}
+
+async function fetchChart() {
+  try {
+    if (!isStaticSnapshotMode) {
+      const res = await fetch(`./api/chart?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&_t=${Date.now()}`, { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        lastChartData = data;
+        drawPriceChart(data);
+        return;
+      }
+    }
+    // 静的スナップショットフォールバック
+    const snapRes = await fetch(`./chart_snapshots.json?_t=${Date.now()}`, { cache: "no-store" });
+    if (snapRes.ok) {
+      const map = await snapRes.json();
+      const ch = map[`${selectedSymbol}_${selectedInterval}`] || map[`${selectedSymbol}_1hour`] || map["BTC_1hour"];
+      if (ch) {
+        lastChartData = ch;
+        drawPriceChart(ch);
+      }
+    }
+  } catch (err) {
+    console.error("Chart fetch error:", err);
+  }
+}
+
+function updateDashboardUI(data) {
+  if (!data || !data.daemon) return;
+  const d = data.daemon;
+  const eq = data.equity_summary || {};
+  const camp = data.campaign || {};
+
+  if (data.network_info) {
+    latestNetworkInfo = data.network_info;
+  }
+
+  document.getElementById("clockJst").textContent = (data.timestamp || "").slice(11, 19) + " JST";
+
+  const bMode = document.getElementById("badgeMode");
+  bMode.textContent = isStaticSnapshotMode ? `${d.execution_mode || "LIVE"} (外出先閲覧)` : (d.execution_mode || "LIVE");
+  bMode.className = "badge " + (d.execution_mode === "LIVE" ? "badge-live" : "badge-dry");
+
+  const bDaemon = document.getElementById("badgeDaemon");
+  const btnPause = document.getElementById("btnPause");
+  const btnResume = document.getElementById("btnResume");
+  const btnPauseM = document.getElementById("btnPauseMobile");
+  const btnResumeM = document.getElementById("btnResumeMobile");
+
+  if (d.is_paused) {
+    bDaemon.textContent = "⏸️ 一時停止中 (PAUSED)";
+    bDaemon.className = "badge badge-paused";
+    btnPause.disabled = true; btnResume.disabled = isStaticSnapshotMode;
+    btnPauseM.disabled = true; btnResumeM.disabled = isStaticSnapshotMode;
+  } else if (d.is_running) {
+    bDaemon.textContent = "🟢 稼働中 (ACTIVE)";
+    bDaemon.className = "badge badge-active";
+    btnPause.disabled = isStaticSnapshotMode; btnResume.disabled = true;
+    btnPauseM.disabled = isStaticSnapshotMode; btnResumeM.disabled = true;
+  } else {
+    bDaemon.textContent = "⚪ 待機中";
+    bDaemon.className = "badge badge-stopped";
+    btnPause.disabled = isStaticSnapshotMode; btnResume.disabled = isStaticSnapshotMode;
+    btnPauseM.disabled = isStaticSnapshotMode; btnResumeM.disabled = isStaticSnapshotMode;
+  }
+
+  document.getElementById("badgeRegime").textContent = `${d.market_regime || "NEUTRAL"}`;
+  document.getElementById("badgeCampaign").textContent = `🏁 ${camp.countdown_text || ""}`;
+  document.getElementById("campaignPhaseBadge").textContent = `${camp.current_phase || "PHASE1_ACTIVE"}`;
+
+  document.getElementById("kpiInitCap").textContent = `初期 ${fmtJpy(eq.initial_capital_jpy)}`;
+  document.getElementById("kpiTotalEquity").textContent = fmtJpy(eq.total_equity_jpy);
+  document.getElementById("kpiCashDetail").textContent =
+    `現金: ${fmtJpy(eq.jpy_balance)} / 拘束: ${fmtJpy(eq.locked_pending_jpy)} / 建玉: ${fmtJpy(eq.positions_eval_jpy)}`;
+
+  const totalPnl = Number(eq.total_pnl_jpy || 0);
+  const elPnl = document.getElementById("kpiTotalPnl");
+  elPnl.textContent = fmtJpy(totalPnl, true);
+  elPnl.className = "kpi-value " + (totalPnl >= 0 ? "pos-val" : "neg-val");
+  const pnlPct = Number(eq.total_pnl_pct || 0);
+  document.getElementById("kpiTotalPnlPct").textContent = (pnlPct >= 0 ? "+" : "") + pnlPct.toFixed(2) + "%";
+  document.getElementById("kpiRealizedDetail").textContent =
+    `確定: ${fmtJpy(eq.realized_pnl_total_jpy, true)} / 含み: ${fmtJpy(eq.unrealized_pnl_total_jpy, true)}`;
+
+  const pa = eq.pattern_a || {};
+  document.getElementById("kpiMaxAlloc").textContent = `${fmtJpy(pa.max_position_jpy)} / 枠`;
+  document.getElementById("kpiRisk1R").textContent =
+    `1R許容損失(1.5%): ${fmtJpy(pa.risk_1r_normal_jpy)} (上限2%: ${fmtJpy(pa.risk_1r_stressed_jpy)})`;
+
+  const l5 = (d.circuit_breakers || {}).l5_kill_switch || {};
+  document.getElementById("kpiL5Floor").textContent = fmtJpy(eq.l5_kill_switch_jpy);
+  document.getElementById("kpiPeakDetail").textContent =
+    `最高資産(HWM): ${fmtJpy(eq.peak_equity_jpy)} (余裕 ${fmtJpy(l5.headroom_jpy, true)})`;
+  document.getElementById("kpiL5Status").textContent = l5.latched ? "🚨 L5発動" : "🛡️ 正常";
+
+  const l3 = (d.circuit_breakers || {}).l3_daily_loss || {};
+  const l4 = (d.circuit_breakers || {}).l4_weekly_streak || {};
+  document.getElementById("kpiDailyPnl").textContent =
+    `日次: ${fmtJpy(l3.daily_total_pnl_jpy, true)} / 制限 ${fmtJpy(l3.daily_loss_limit_jpy)}`;
+  document.getElementById("kpiWeeklyPnl").textContent =
+    `週次: ${fmtJpy(l4.weekly_pnl_jpy, true)} (制限 ${fmtJpy(l4.weekly_loss_limit_jpy)}) / 連敗: ${l4.consecutive_losses || 0}回`;
+  document.getElementById("kpiCbBadge").textContent = (l3.blocked || l4.blocked || l5.latched) ? "⛔ 制限中" : "🟢 稼働許可";
+
+  renderToolbarChips(data.tickers || {});
+
+  lastEquityCurve = eq.equity_curve || [];
+  drawEquityChart(lastEquityCurve);
+
+  const dec = data.latest_decision || {};
+  const act = String(dec.action || "HOLD").toUpperCase();
+  const elAct = document.getElementById("aiDecAction");
+  elAct.textContent = `${act} (${dec.symbol || "NONE"})`;
+  elAct.className = "badge " + (act === "BUY" ? "badge-active" : (act === "SELL" ? "badge-live" : "badge-stopped"));
+  document.getElementById("aiDecMeta").textContent =
+    `判定: ${(dec.timestamp || "--").replace("T", " ")} | 確信度: ${dec.confidence !== undefined ? dec.confidence : "--"}`;
+  document.getElementById("aiDecReasoning").textContent = dec.reasoning || "判定履歴なし";
+
+  const actPos = (data.positions && data.positions.active) || [];
+  document.getElementById("activePosCount").textContent = `${actPos.length} / ${(pa.max_concurrent_positions || 2)} 枠`;
+  const posBody = document.getElementById("activePositionsBody");
+  if (actPos.length === 0) {
+    posBody.innerHTML = `<tr><td colspan="8" style="text-align:center; color:var(--text-secondary);">現在保有中の有効ポジションはありません</td></tr>`;
+  } else {
+    posBody.innerHTML = actPos.map(p => {
+      const cls = p.unrealized_pnl_jpy >= 0 ? "pos-val" : "neg-val";
+      return `<tr>
+        <td><b>${p.symbol}</b></td>
+        <td>${p.size}</td>
+        <td>${fmtPrice(p.entry_price)} 円</td>
+        <td>${fmtPrice(p.current_bid)} 円</td>
+        <td>${fmtJpy(p.eval_jpy)}</td>
+        <td class="${cls}"><b>${fmtJpy(p.unrealized_pnl_jpy, true)} (${p.unrealized_pnl_pct >= 0 ? "+" : ""}${p.unrealized_pnl_pct}%)</b></td>
+        <td>SL: <span style="color:#fca5a5;">${fmtPrice(p.stop_loss_price)}</span> / TP: <span style="color:#6ee7b7;">${fmtPrice(p.take_profit_price)}</span></td>
+        <td><span class="badge badge-campaign">${p.trailing_stage}</span></td>
+      </tr>`;
+    }).join("");
+  }
+
+  const dustList = (data.positions && data.positions.quarantined_dust) || [];
+  const dustBox = document.getElementById("dustQuarantineBox");
+  if (dustList.length > 0) {
+    dustBox.innerHTML = `📦 最小注文単位未満の隔離端数 (DUST_QUARANTINED — 保有枠・SL対象外): ` +
+      dustList.map(d => `${d.symbol}: ${d.size} (約 ${d.estimated_value_jpy} 円)`).join(" / ");
+  } else {
+    dustBox.textContent = "";
+  }
+
+  const pend = data.pending_orders || [];
+  document.getElementById("pendingOrdCount").textContent = `${pend.length} 件`;
+  const pendBody = document.getElementById("pendingOrdersBody");
+  if (pend.length === 0) {
+    pendBody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-secondary);">現在待機中の指値注文はありません</td></tr>`;
+  } else {
+    pendBody.innerHTML = pend.map(o => `<tr>
+      <td><b>${o.symbol}</b></td>
+      <td>${fmtPrice(o.limit_price)} 円</td>
+      <td>${o.size} (${o.executed_size})</td>
+      <td>${fmtJpy(o.reserved_jpy)}</td>
+      <td>SL: ${fmtPrice(o.stop_loss_price)} / TP: ${fmtPrice(o.take_profit_price)}</td>
+      <td><span class="badge badge-paused">${o.state}</span></td>
+    </tr>`).join("");
+  }
+
+  const closed = data.closed_trades || [];
+  const closedBody = document.getElementById("closedTradesBody");
+  if (closed.length === 0) {
+    closedBody.innerHTML = `<tr><td colspan="6" style="text-align:center; color:var(--text-secondary);">まだ確定した決済履歴はありません</td></tr>`;
+  } else {
+    closedBody.innerHTML = closed.slice(0, 12).map(t => {
+      const pnl = Number(t.pnl_jpy || 0);
+      const cls = pnl >= 0 ? "pos-val" : "neg-val";
+      return `<tr>
+        <td>${String(t.closed_at || "").replace("T", " ").slice(0, 19)}</td>
+        <td><b>${t.symbol || ""}</b></td>
+        <td>${t.size || 0}</td>
+        <td>${fmtPrice(t.entry_price)} ➔ ${fmtPrice(t.exit_price)}</td>
+        <td class="${cls}"><b>${fmtJpy(pnl, true)}</b></td>
+        <td>${t.reason || ""}</td>
+      </tr>`;
+    }).join("");
+  }
+
+  const logLines = data.logs || [];
+  const logEl = document.getElementById("logViewer");
+  logEl.textContent = logLines.length ? logLines.join("\n") : "ログはまだありません";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function drawPriceChart(chartData) {
+  const canvas = document.getElementById("priceChartCanvas");
+  if (!canvas || !chartData) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const W = rect.width;
+  const H = rect.height;
+
+  ctx.fillStyle = "#090d16";
+  ctx.fillRect(0, 0, W, H);
+
+  const candles = chartData.candles || [];
+  const t = chartData.ticker || {};
+  const ov = chartData.overlays || {};
+
+  document.getElementById("chartTickerSummary").textContent =
+    t.last ? `${chartData.symbol}/JPY  ${fmtPrice(t.last)} 円 (Bid:${fmtPrice(t.bid)} / Ask:${fmtPrice(t.ask)})` : `${chartData.symbol}/JPY`;
+  document.getElementById("chartUpdatedTime").textContent =
+    `更新: ${(chartData.timestamp || "").replace("T", " ").slice(0, 19)}`;
+
+  if (candles.length === 0) {
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "13px sans-serif";
+    ctx.fillText("ローソク足データがありません", W / 2 - 80, H / 2);
+    return;
+  }
+
+  const padL = 12, padR = 82, padT = 18, padB = 26;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  let minP = Infinity, maxP = -Infinity;
+  candles.forEach(c => {
+    if (c.low < minP) minP = c.low;
+    if (c.high > maxP) maxP = c.high;
+  });
+  [ov.entry_price, ov.stop_loss_price, ov.take_profit_price, ov.limit_price].forEach(p => {
+    if (p && p > 0) {
+      if (p < minP) minP = p;
+      if (p > maxP) maxP = p;
+    }
+  });
+  if (maxP <= minP) { maxP = minP + 10; minP = Math.max(0, minP - 10); }
+  const margin = (maxP - minP) * 0.08;
+  minP -= margin;
+  maxP += margin;
+
+  const yOf = (price) => padT + plotH - ((price - minP) / (maxP - minP)) * plotH;
+
+  ctx.strokeStyle = "rgba(148,163,184,0.1)";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = "#64748b";
+  ctx.font = "10px monospace";
+  for (let i = 0; i <= 4; i++) {
+    const pVal = minP + ((maxP - minP) * i) / 4;
+    const y = yOf(pVal);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.fillText(fmtPrice(pVal), padL + plotW + 5, y + 3);
+  }
+
+  const n = candles.length;
+  const stepX = plotW / Math.max(1, n);
+  const bodyW = Math.max(2, Math.min(11, stepX * 0.68));
+
+  candles.forEach((c, idx) => {
+    const cx = padL + idx * stepX + stepX / 2;
+    const isUp = c.close >= c.open;
+    const col = isUp ? "#10b981" : "#ef4444";
+    ctx.strokeStyle = col;
+    ctx.fillStyle = col;
+
+    ctx.beginPath();
+    ctx.moveTo(cx, yOf(c.high));
+    ctx.lineTo(cx, yOf(c.low));
+    ctx.stroke();
+
+    const yOpen = yOf(c.open);
+    const yClose = yOf(c.close);
+    const topY = Math.min(yOpen, yClose);
+    const bh = Math.max(1.5, Math.abs(yClose - yOpen));
+    ctx.fillRect(cx - bodyW / 2, topY, bodyW, bh);
+
+    if (idx === 0 || idx === Math.floor(n / 2) || idx === n - 1) {
+      ctx.fillStyle = "#64748b";
+      ctx.font = "10px monospace";
+      ctx.fillText(c.time_label || "", Math.max(padL, cx - 26), H - 7);
+    }
+  });
+
+  const drawHorizontalOverlay = (price, color, label) => {
+    if (!price || price <= 0) return;
+    const y = yOf(price);
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.font = "bold 10px monospace";
+    ctx.fillText(`${label}: ${fmtPrice(price)}`, padL + 6, Math.max(12, y - 4));
+    ctx.restore();
+  };
+
+  drawHorizontalOverlay(ov.entry_price, "#38bdf8", "ENTRY");
+  drawHorizontalOverlay(ov.take_profit_price, "#10b981", "TP利確");
+  drawHorizontalOverlay(ov.stop_loss_price, "#ef4444", "SL逆指値");
+  drawHorizontalOverlay(ov.limit_price, "#f59e0b", "待機指値");
+}
+
+function drawEquityChart(curve) {
+  const canvas = document.getElementById("equityChartCanvas");
+  if (!canvas || !curve || curve.length === 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  const W = rect.width;
+  const H = rect.height;
+
+  ctx.fillStyle = "#090d16";
+  ctx.fillRect(0, 0, W, H);
+
+  const padL = 12, padR = 70, padT = 16, padB = 20;
+  const plotW = W - padL - padR;
+  const plotH = H - padT - padB;
+
+  let minE = Infinity, maxE = -Infinity;
+  curve.forEach(pt => {
+    const v = Number(pt.equity_jpy || 10000);
+    if (v < minE) minE = v;
+    if (v > maxE) maxE = v;
+  });
+  if (maxE <= minE) { maxE = minE + 100; minE = Math.max(0, minE - 100); }
+  const margin = (maxE - minE) * 0.15;
+  minE -= margin;
+  maxE += margin;
+
+  const yOf = (val) => padT + plotH - ((val - minE) / (maxE - minE)) * plotH;
+  const xOf = (idx) => padL + (curve.length <= 1 ? plotW / 2 : (idx / (curve.length - 1)) * plotW);
+
+  ctx.beginPath();
+  curve.forEach((pt, idx) => {
+    const x = xOf(idx), y = yOf(pt.equity_jpy);
+    if (idx === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = "#38bdf8";
+  ctx.lineWidth = 2.2;
+  ctx.stroke();
+
+  curve.forEach((pt, idx) => {
+    const x = xOf(idx), y = yOf(pt.equity_jpy);
+    ctx.fillStyle = "#38bdf8";
+    ctx.beginPath();
+    ctx.arc(x, y, 3.2, 0, Math.PI * 2);
+    ctx.fill();
+    if (idx === 0 || idx === curve.length - 1) {
+      ctx.fillStyle = "#cbd5e1";
+      ctx.font = "10px monospace";
+      ctx.fillText(fmtJpy(pt.equity_jpy), padL + plotW + 5, y + 4);
+    }
+  });
+}
+
+async function sendControl(command, nonce="") {
+  if (isStaticSnapshotMode) {
+    showToast("外出先（GitHub Pages閲覧モード）からは操作できません。自宅Wi-Fi接続時に操作してください。", true);
+    return null;
+  }
+  try {
+    const res = await fetch("./api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, nonce })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      showToast(`エラー: ${data.error || "コマンド実行失敗"}`, true);
+      return null;
+    }
+    showToast(data.message || `コマンド ${command} を実行しました`);
+    await fetchStatus();
+    return data;
+  } catch (err) {
+    showToast(`通信エラー: ${err}`, true);
+    return null;
+  }
+}
+
+function confirmCancelEntries() {
+  if (!confirm("現在待機中の未約定買い指値（PENDING_BUY）をすべてキャンセルしますか？\n（※保有中ポジションと逆指値STOP注文は維持されます）")) {
+    return;
+  }
+  sendControl("CANCEL_ENTRIES");
+}
+
+async function openFlattenModal() {
+  if (isStaticSnapshotMode) {
+    showToast("外出先（GitHub Pages閲覧モード）からは操作できません。", true);
+    return;
+  }
+  const modal = document.getElementById("flattenModal");
+  const box = document.getElementById("flattenNonceDisplay");
+  const btn = document.getElementById("btnConfirmFlattenNow");
+  modal.style.display = "flex";
+  box.textContent = "ワンタイム承認コードを発行中...";
+  btn.disabled = true;
+  currentFlattenNonce = "";
+
+  const data = await sendControl("FLATTEN_ALL");
+  if (data && data.result && data.result.nonce) {
+    currentFlattenNonce = data.result.nonce;
+    box.textContent = `承認コード: ${currentFlattenNonce}\n(有効期限: ${(data.result.expires_at || "").replace("T", " ")})`;
+    btn.disabled = false;
+  } else {
+    box.textContent = "承認コードの発行に失敗しました";
+  }
+}
+
+function closeFlattenModal() {
+  document.getElementById("flattenModal").style.display = "none";
+  currentFlattenNonce = "";
+}
+
+async function confirmFlattenAll() {
+  if (!currentFlattenNonce) return;
+  const nonce = currentFlattenNonce;
+  closeFlattenModal();
+  await sendControl("FLATTEN_CONFIRM", nonce);
+}
+
+async function openQrModal() {
+  document.getElementById("qrModal").style.display = "flex";
+  const lanUrl = latestNetworkInfo.lan_url || "http://192.168.11.3:8080";
+  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader/";
+  const lanLink = document.getElementById("qrLanLink");
+  const ghLink = document.getElementById("qrGhLink");
+  lanLink.href = lanUrl;
+  lanLink.textContent = lanUrl;
+  ghLink.href = ghUrl;
+  ghLink.textContent = ghUrl;
+
+  try {
+    const [r1, r2] = await Promise.all([
+      fetch(`./api/qr?text=${encodeURIComponent(lanUrl)}`),
+      fetch(`./api/qr?text=${encodeURIComponent(ghUrl)}`)
+    ]);
+    if (r1.ok) document.getElementById("qrLanHolder").innerHTML = await r1.text();
+    if (r2.ok) document.getElementById("qrGhHolder").innerHTML = await r2.text();
+  } catch (_) {}
+}
+
+function closeQrModal() {
+  document.getElementById("qrModal").style.display = "none";
+}
+
+async function forceRefreshPwa() {
+  try {
+    if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+      navigator.serviceWorker.controller.postMessage({ type: 'CLEAR_CACHE' });
+    }
+    if ('caches' in window) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(k => caches.delete(k)));
+    }
+  } catch (_) {}
+  await Promise.all([fetchStatus(), fetchChart()]);
+  showToast("🔄 キャッシュをクリアし、最新データを取得しました");
+}
+
+window.addEventListener("resize", () => {
+  if (lastChartData) drawPriceChart(lastChartData);
+  if (lastEquityCurve) drawEquityChart(lastEquityCurve);
+});
+
+fetchStatus();
+fetchChart();
+setInterval(() => {
+  fetchStatus();
+  fetchChart();
+}, 15000);
+</script>
+</body>
+</html>

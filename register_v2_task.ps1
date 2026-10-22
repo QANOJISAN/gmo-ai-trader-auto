@@ -61,4 +61,32 @@ try {
 }
 
 Write-Host ("[OK] Registered scheduled task: " + $TaskName)
+
+$WebRunner = Join-Path $ProjectDir "run_v2_web.ps1"
+if (Test-Path -LiteralPath $WebRunner) {
+    $WebTaskName = "GMO-AI-Trader-v2-Web"
+    $WebAction = New-ScheduledTaskAction `
+        -Execute "wscript.exe" `
+        -Argument ("//B //NoLogo `"" + $HiddenVbs + "`" `"" + $WebRunner + "`" -BindHost 0.0.0.0 -Port 8080 -NoBrowser") `
+        -WorkingDirectory $ProjectDir
+    try {
+        Register-ScheduledTask `
+            -TaskName $WebTaskName `
+            -Action $WebAction `
+            -Trigger @($TriggerLogon, $TriggerRepeat) `
+            -Settings $Settings `
+            -Description "GMO Coin Spot 24/7 Local & Smartphone PWA Dashboard (v2)" `
+            -Force | Out-Null
+    } catch {
+        Register-ScheduledTask `
+            -TaskName $WebTaskName `
+            -Action $WebAction `
+            -Trigger @($TriggerRepeat) `
+            -Settings $Settings `
+            -Description "GMO Coin Spot 24/7 Local & Smartphone PWA Dashboard (v2)" `
+            -Force | Out-Null
+    }
+    Write-Host ("[OK] Registered scheduled task: " + $WebTaskName)
+}
+
 Write-Host ("Note: Before switching v2 to LIVE mode, disable v1 task (GMO-AI-Trader-Daily) and run migrate_from_v1.py --execute.")

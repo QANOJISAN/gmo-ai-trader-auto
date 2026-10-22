@@ -2780,6 +2780,68 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 self.assertIn("nonce", flt_req["result"])
                 flt_conf = _post_ctrl({"command": "FLATTEN_CONFIRM", "nonce": flt_req["result"]["nonce"]})
                 self.assertTrue(flt_conf["ok"])
+
+                # (6) PWA 必須エンドポイント検証 (/manifest.json, /sw.js, /icon-192.png, /icon-512.png, /icon.svg, /api/qr)
+                with urllib.request.urlopen(f"{base_url}/manifest.json", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    manifest = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(manifest["name"], "GMO AI Trader v2")
+                    self.assertEqual(manifest["short_name"], "AI Trader v2")
+                    self.assertEqual(manifest["display"], "standalone")
+                    self.assertEqual(manifest["orientation"], "portrait")
+                    self.assertEqual(manifest["background_color"], "#0b0f19")
+                    self.assertEqual(manifest["theme_color"], "#0b0f19")
+                    self.assertGreaterEqual(len(manifest["icons"]), 2)
+
+                with urllib.request.urlopen(f"{base_url}/sw.js", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    sw_code = resp.read().decode("utf-8")
+                    self.assertIn("CLEAR_CACHE", sw_code)
+                    self.assertIn("skipWaiting", sw_code)
+
+                with urllib.request.urlopen(f"{base_url}/icon-192.png", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    png192 = resp.read()
+                    self.assertTrue(png192.startswith(b"\x89PNG\r\n\x1a\n"))
+                    self.assertGreater(len(png192), 500)
+
+                with urllib.request.urlopen(f"{base_url}/icon-512.png", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    png512 = resp.read()
+                    self.assertTrue(png512.startswith(b"\x89PNG\r\n\x1a\n"))
+                    self.assertGreater(len(png512), len(png192))
+
+                with urllib.request.urlopen(f"{base_url}/icon.svg", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    svg_txt = resp.read().decode("utf-8")
+                    self.assertIn("<svg", svg_txt)
+
+                with urllib.request.urlopen(f"{base_url}/api/qr?text=http%3A%2F%2F192.168.11.3%3A8080", timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                    qr_svg = resp.read().decode("utf-8")
+                    self.assertIn("<svg", qr_svg)
+                    self.assertIn("<rect", qr_svg)
+
+                # (7) network_info および 静的PWAスナップショット出力 (docs/) 検証
+                self.assertIn("network_info", st)
+                self.assertIn("lan_ip", st["network_info"])
+                self.assertIn("lan_url", st["network_info"])
+
+                export_res = svc.export_static_pwa_bundle(output_dir=tmp_dir / "docs")
+                self.assertTrue(export_res["ok"])
+                for fname in (
+                    "index.html",
+                    "manifest.json",
+                    "sw.js",
+                    "icon-192.png",
+                    "icon-512.png",
+                    "icon.svg",
+                    "status_snapshot.json",
+                    "chart_snapshots.json",
+                ):
+                    self.assertTrue((tmp_dir / "docs" / fname).exists(), f"Missing exported file: {fname}")
+                snap_json = json.loads((tmp_dir / "docs" / "status_snapshot.json").read_text(encoding="utf-8"))
+                self.assertTrue(snap_json["static_snapshot"])
             finally:
                 server.shutdown()
                 server.server_close()

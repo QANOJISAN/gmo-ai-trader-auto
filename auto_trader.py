@@ -1087,6 +1087,7 @@ class AutoTraderDaemon:
 
             if not radar_eval["should_call_ai"] and not force_ai:
                 logger.info("📡 レーダースキャン完了: %s", radar_eval["reason_summary"])
+                self._sync_pwa_snapshot()
                 self.record_api_success()
                 return {
                     "status": "RADAR_SKIPPED_AI",
@@ -1266,6 +1267,7 @@ class AutoTraderDaemon:
                 portfolio_path=self.portfolio_path,
                 history_csv_path=self.history_csv_path,
             )
+            self._sync_pwa_snapshot()
             # 3階層通知: HOLD の場合はスパム防止のため DAILY_DIGEST バッファへ送り、BUY/SELL/MODIFY は即時通知
             if action == "HOLD":
                 self.notification_dispatcher.dispatch(
@@ -1294,6 +1296,21 @@ class AutoTraderDaemon:
                 "error": str(exc),
                 "circuit_breaker": cb_info,
             }
+
+    def _sync_pwa_snapshot(self) -> None:
+        """本番ワークスペース稼働時に docs/ 以下の静的PWAスナップショットを最新状態へ同期する（秘密情報は一切含めない）"""
+        if self.base_dir != BASE_DIR:
+            return
+        try:
+            from web_dashboard import WebDashboardService
+
+            svc = WebDashboardService(base_dir=self.base_dir, public_client=self.public_client)
+            try:
+                svc.export_static_pwa_bundle(output_dir=self.base_dir / "docs")
+            finally:
+                svc.close()
+        except Exception as exc:
+            logger.debug("PWA snapshot sync skipped: %s", exc)
 
     def run_forever(self, max_cycles: Optional[int] = None) -> None:
         """24時間常駐メインループ（15秒ごとに高速ループ、5分ごとに3-Way照合、15分ごとに中速レーダーループを実行）"""

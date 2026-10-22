@@ -1,5 +1,5 @@
 param(
-    [string]$BindHost = "127.0.0.1",
+    [string]$BindHost = "0.0.0.0",
     [int]$Port = 8080,
     [switch]$NoBrowser,
     [switch]$Background
@@ -20,6 +20,7 @@ if (-not (Test-Path -LiteralPath $LogDir)) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 }
 
+$BrowserHost = if ($BindHost -eq "0.0.0.0") { "127.0.0.1" } else { $BindHost }
 $WebLockFile = Join-Path $ProjectDir "v2_web.lock"
 if (Test-Path -LiteralPath $WebLockFile) {
     $ExistingPidText = ""
@@ -32,7 +33,7 @@ if (Test-Path -LiteralPath $WebLockFile) {
     if ([int]::TryParse($ExistingPidText, [ref]$ExistingPid) -and $ExistingPid -gt 0 -and $ExistingPid -ne $PID) {
         $RunningProc = Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue
         if ($null -ne $RunningProc) {
-            $Url = "http://" + $BindHost + ":" + $Port
+            $Url = "http://" + $BrowserHost + ":" + $Port
             Write-Host ("[OK] GMO AI Trader v2 Web Dashboard is already running (PID=" + $ExistingPid + ") at " + $Url)
             if (-not $NoBrowser) {
                 Start-Process $Url | Out-Null
@@ -94,7 +95,7 @@ if ($Background) {
     }
     Start-ScheduledTask -TaskName $TaskName
     Start-Sleep -Seconds 2
-    $Url = "http://" + $BindHost + ":" + $Port
+    $Url = "http://" + $BrowserHost + ":" + $Port
     Write-Host ("[OK] Started GMO AI Trader v2 Web Dashboard task (" + $TaskName + ") at " + $Url)
     if (-not $NoBrowser) {
         Start-Process $Url | Out-Null
