@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-23T06:44:54+09:00",
+  "timestamp": "2026-10-23T07:00:00+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -107,10 +107,10 @@
     "phase2_freeze_start_jst": "2027-12-09T22:00:00+09:00",
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 258,
-    "remaining_hours": 17,
-    "remaining_minutes": 15,
-    "remaining_total_seconds": 22353305,
-    "countdown_text": "第1回締め(2027/7/9) 残り 258日 17時間 15分",
+    "remaining_hours": 16,
+    "remaining_minutes": 59,
+    "remaining_total_seconds": 22352399,
+    "countdown_text": "第1回締め(2027/7/9) 残り 258日 16時間 59分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -121,8 +121,8 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 374996.0,
-        "estimated_value_jpy": 287.4,
+        "current_bid": 375015.0,
+        "estimated_value_jpy": 287.5,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
     ]
@@ -163,7 +163,6 @@
     "status": "RADAR_SKIPPED_AI"
   },
   "logs": [
-    "2026-10-22 23:27:06,837 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 23:42:12,760 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 23:57:18,732 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 00:12:24,647 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
@@ -192,99 +191,100 @@
     "2026-10-23 05:59:37,510 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 06:14:42,884 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 06:29:48,471 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
-    "2026-10-23 06:44:54,324 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
+    "2026-10-23 06:44:54,324 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-23 07:00:00,235 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12770799.0,
-      "bid": 12769680.0,
+      "ask": 12771360.0,
+      "bid": 12770551.0,
       "high": 12778080.0,
       "low": 12735999.0,
-      "last": 12770237.0,
-      "volume": 176.0424,
-      "trading_value_24h": 2248103170.05,
-      "spread": 1119.0,
-      "spread_pct": 0.0088,
-      "timestamp": "2026-10-22T21:44:52.203Z"
+      "last": 12770799.0,
+      "volume": 175.76414,
+      "trading_value_24h": 2244648503.35,
+      "spread": 809.0,
+      "spread_pct": 0.0063,
+      "timestamp": "2026-10-22T21:59:58.723Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 375122.0,
-      "bid": 374996.0,
+      "ask": 375020.0,
+      "bid": 375015.0,
       "high": 376211.0,
       "low": 373130.0,
-      "last": 375122.0,
-      "volume": 3697.033,
-      "trading_value_24h": 1386838413.03,
-      "spread": 126.0,
-      "spread_pct": 0.0336,
-      "timestamp": "2026-10-22T21:44:52.469Z"
+      "last": 375020.0,
+      "volume": 3705.2042,
+      "trading_value_24h": 1389525679.08,
+      "spread": 5.0,
+      "spread_pct": 0.0013,
+      "timestamp": "2026-10-22T21:59:59.413Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 43017.0,
-      "bid": 42989.0,
-      "high": 42914.0,
-      "low": 42914.0,
-      "last": 42914.0,
-      "volume": 231.135,
-      "trading_value_24h": 9918927.39,
-      "spread": 28.0,
-      "spread_pct": 0.0651,
-      "timestamp": "2026-10-22T21:44:52.965Z"
+      "ask": 42993.0,
+      "bid": 42952.0,
+      "high": 42969.0,
+      "low": 42858.0,
+      "last": 42969.0,
+      "volume": 286.125,
+      "trading_value_24h": 12294505.12,
+      "spread": 41.0,
+      "spread_pct": 0.0955,
+      "timestamp": "2026-10-22T21:59:58.129Z"
     },
     "LTC": {
       "symbol": "LTC",
-      "ask": 9212.0,
-      "bid": 9184.0,
+      "ask": 9205.0,
+      "bid": 9183.0,
       "high": 9212.0,
       "low": 9170.0,
       "last": 9212.0,
-      "volume": 1807.92,
-      "trading_value_24h": 16654559.04,
-      "spread": 28.0,
-      "spread_pct": 0.3049,
-      "timestamp": "2026-10-22T21:44:52.700Z"
+      "volume": 1807.46,
+      "trading_value_24h": 16650321.52,
+      "spread": 22.0,
+      "spread_pct": 0.2396,
+      "timestamp": "2026-10-22T21:59:58.707Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 204.75,
-      "bid": 204.695,
+      "ask": 205.065,
+      "bid": 204.998,
       "high": 205.524,
       "low": 203.696,
-      "last": 204.462,
-      "volume": 2696930.0,
-      "trading_value_24h": 551419701.66,
-      "spread": 0.05500000000000682,
-      "spread_pct": 0.0269,
-      "timestamp": "2026-10-22T21:44:52.633Z"
+      "last": 205.065,
+      "volume": 2711071.0,
+      "trading_value_24h": 555945774.62,
+      "spread": 0.06700000000000728,
+      "spread_pct": 0.0327,
+      "timestamp": "2026-10-22T21:59:59.259Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.339,
-      "bid": 12.331,
+      "ask": 12.357,
+      "bid": 12.356,
       "high": 12.373,
       "low": 12.3,
-      "last": 12.339,
-      "volume": 3330233.0,
-      "trading_value_24h": 41091744.99,
-      "spread": 0.008000000000000895,
-      "spread_pct": 0.0649,
-      "timestamp": "2026-10-22T21:44:52.086Z"
+      "last": 12.357,
+      "volume": 3390110.0,
+      "trading_value_24h": 41891589.27,
+      "spread": 0.0009999999999994458,
+      "spread_pct": 0.0081,
+      "timestamp": "2026-10-22T21:59:59.008Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16238.0,
-      "bid": 16237.0,
+      "ask": 16254.0,
+      "bid": 16253.0,
       "high": 16298.0,
       "low": 16188.0,
-      "last": 16238.0,
-      "volume": 15850.78,
-      "trading_value_24h": 257384965.64,
+      "last": 16254.0,
+      "volume": 15744.76,
+      "trading_value_24h": 255915329.04,
       "spread": 1.0,
       "spread_pct": 0.0062,
-      "timestamp": "2026-10-22T21:44:52.961Z"
+      "timestamp": "2026-10-22T21:59:58.520Z"
     }
   },
   "static_snapshot": true
