@@ -38,7 +38,7 @@ if (-not $IsOneShotTool) {
         $ExistingPid = 0
         if ([int]::TryParse($ExistingPidText, [ref]$ExistingPid) -and $ExistingPid -gt 0 -and $ExistingPid -ne $PID) {
             $RunningProc = Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue
-            if ($null -ne $RunningProc) {
+            if ($null -ne $RunningProc -and $RunningProc.ProcessName -match "^(powershell|pwsh|python)") {
                 Write-Host ("[SKIP] GMO AI Trader v2 daemon is already running (PID=" + $ExistingPid + "). Exiting.")
                 exit 0
             }

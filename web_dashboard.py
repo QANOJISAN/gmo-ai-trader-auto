@@ -76,14 +76,24 @@ DEFAULT_PRE_DEADLINE_FREEZE_HOURS = 2.0
 DEFAULT_GITHUB_PAGES_URL = "https://qanojisan.github.io/gmo-ai-trader-auto/"
 
 _GIT_PUSH_LOCK = threading.Lock()
+_LAST_GIT_PUSH_MONO: float = 0.0
+DEFAULT_GIT_PUSH_MIN_INTERVAL_SEC: float = 300.0
 
 
-def push_docs_snapshot_async(base_dir: Path) -> None:
+def push_docs_snapshot_async(
+    base_dir: Path,
+    force: bool = False,
+    min_interval_sec: float = DEFAULT_GIT_PUSH_MIN_INTERVAL_SEC,
+) -> None:
     """
     本番ワークスペース (`BASE_DIR`) で `docs/` が更新された際、
-    バックグラウンドスレッドで `docs/` の変更のみを GitHub (`origin main`) へ自動コミット＆プッシュする。
-    （※単体テストの一時ディレクトリやリモート未設定環境では何もしない）
+    バックグラウンドスレッド＋プロセス間排他ロック (`v2_git_push.lock`) で
+    `docs/` の変更のみを GitHub (`origin main`) へ自動コミット＆プッシュする。
+    - `force=False`（定時レーダー周期等）の場合は最小間隔 `min_interval_sec` (デフォルト300秒) でスロットリング。
+    - `force=True`（PAUSE/RESUME操作時・約定時）の場合はスロットリングをバイパスして即時Push。
+    - 単体テストの一時ディレクトリやリモート未設定環境では何もしない。
     """
+    global _LAST_GIT_PUSH_MONO
     try:
         resolved = Path(base_dir).resolve()
         if resolved != BASE_DIR.resolve() or not (resolved / ".git").exists():
@@ -91,10 +101,39 @@ def push_docs_snapshot_async(base_dir: Path) -> None:
     except Exception:
         return
 
+    now_mono = time.monotonic()
+    if not force and _LAST_GIT_PUSH_MONO > 0.0 and (now_mono - _LAST_GIT_PUSH_MONO) < min_interval_sec:
+        return
+
     def _worker() -> None:
+        global _LAST_GIT_PUSH_MONO
         if not _GIT_PUSH_LOCK.acquire(blocking=False):
             return
+        file_lock = SingleInstanceLock(resolved / "v2_git_push.lock")
         try:
+            if not file_lock.acquire():
+                return
+
+            stamp_file = resolved / "v2_git_push.last"
+            if not force and stamp_file.exists():
+                try:
+                    last_epoch = float(stamp_file.read_text(encoding="utf-8").strip() or "0")
+                    if (time.time() - last_epoch) < min_interval_sec:
+                        return
+                except Exception:
+                    pass
+
+            # 万一異常終了した git プロセスの古い .git/index.lock (120秒以上前) が残っていれば安全に除去
+            git_index_lock = resolved / ".git" / "index.lock"
+            if git_index_lock.exists():
+                try:
+                    if (time.time() - git_index_lock.stat().st_mtime) > 120.0:
+                        git_index_lock.unlink(missing_ok=True)
+                    else:
+                        return
+                except Exception:
+                    return
+
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             r_remote = subprocess.run(
                 ["git", "-C", str(resolved), "remote", "get-url", "origin"],
@@ -139,16 +178,23 @@ def push_docs_snapshot_async(base_dir: Path) -> None:
                 timeout=20,
                 creationflags=creation_flags,
             )
-            subprocess.run(
+            r_push = subprocess.run(
                 ["git", "-C", str(resolved), "push", "origin", "main"],
                 capture_output=True,
                 text=True,
                 timeout=30,
                 creationflags=creation_flags,
             )
+            if r_push.returncode == 0:
+                _LAST_GIT_PUSH_MONO = time.monotonic()
+                try:
+                    stamp_file.write_text(f"{time.time():.3f}", encoding="utf-8")
+                except Exception:
+                    pass
         except Exception as exc:
             logger.debug("Auto push docs skipped: %s", exc)
         finally:
+            file_lock.release()
             _GIT_PUSH_LOCK.release()
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -1232,9 +1278,9 @@ class WebDashboardService:
         pf_after = self.oco_manager.load_portfolio()
         is_paused_after = bool(pf_after.get("is_paused", False))
 
-        # 状態変更後に docs/status_snapshot.json も非同期更新＆GitHub Pagesへ自動Push
+        # 状態変更後に docs/status_snapshot.json も非同期更新＆GitHub Pagesへ即時Push (force_push=True)
         try:
-            self.export_static_pwa_bundle(include_charts=False, now_dt=now_jst, auto_push=True)
+            self.export_static_pwa_bundle(include_charts=False, now_dt=now_jst, auto_push=True, force_push=True)
         except Exception:
             pass
 
@@ -1269,6 +1315,7 @@ class WebDashboardService:
         include_charts: bool = True,
         now_dt: Optional[datetime] = None,
         auto_push: bool = False,
+        force_push: bool = False,
     ) -> Dict[str, Any]:
         """
         外出先 (GitHub Pages 等) からスマートフォン PWA として閲覧するための静的アセット一式と
@@ -1308,7 +1355,7 @@ class WebDashboardService:
             atomic_write_text(chart_snap_path, dumps_json(charts_map, indent=None))
 
         if auto_push and target_dir.resolve() == self.docs_dir.resolve():
-            push_docs_snapshot_async(self.base_dir)
+            push_docs_snapshot_async(self.base_dir, force=force_push)
 
         return {
             "ok": True,
@@ -1943,21 +1990,13 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <button class="btn" style="padding:4px 10px;" onclick="closeQrModal()">✕ 閉じる</button>
     </div>
     <p style="font-size:0.8rem; color:var(--text-secondary);">
-      スマホのカメラで以下のQRコードを読み取って開き、ブラウザメニューから<b>「ホーム画面に追加（アプリをインストール）」</b>を選ぶと、フルスクリーンの専用アプリとして起動できます。
+      スマホのカメラで以下のQRコードを読み取って開き、ブラウザメニューから<b>「ホーム画面に追加（アプリをインストール）」</b>を選ぶと、フルスクリーンのv2専用アプリとして起動できます（自宅Wi-Fi・外出先4G/5G 共通）。
     </p>
-    <div class="qr-grid">
-      <div class="qr-card">
-        <div style="font-size:0.82rem; font-weight:700; color:#6ee7b7;">🏠 自宅Wi-Fi（リアルタイム操作＆監視）</div>
-        <div id="qrLanHolder" class="qr-svg-holder">読み込み中...</div>
-        <a id="qrLanLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">http://192.168.11.3:8080</a>
-        <div style="font-size:0.72rem; color:var(--text-secondary);">PAUSE / RESUME 等の全ボタン操作が可能</div>
-      </div>
-      <div class="qr-card">
-        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（v2専用 GitHub Pages）</div>
-        <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
-        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
-        <div style="font-size:0.72rem; color:var(--text-secondary);">外出先から最新スナップショット＆チャートを確認</div>
-      </div>
+    <div class="qr-card" style="max-width:340px; margin:0 auto; width:100%;">
+      <div style="font-size:0.85rem; font-weight:700; color:#d8b4fe;">📱 GMO AI Trader v2 スマホ専用アプリ（GitHub Pages PWA）</div>
+      <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
+      <a id="qrGhLink" href="https://qanojisan.github.io/gmo-ai-trader-auto/" target="_blank" style="font-family:monospace; font-size:0.82rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
+      <div style="font-size:0.74rem; color:var(--text-secondary);">最新スナップショット＆リアルタイムチャートを高速表示（PC操作は <code style="color:#6ee7b7;">http://127.0.0.1:8080</code>）</div>
     </div>
     <div style="background:#090d16; border:1px solid #1e293b; border-radius:8px; padding:10px 12px; font-size:0.76rem; color:var(--text-secondary);">
       <b>📲 スマホへのアプリ追加手順：</b><br>
@@ -2074,54 +2113,50 @@ async function fetchWithTimeout(url, options={}, timeoutMs=2000) {
 }
 
 async function fetchStatus() {
-  // 1. 同一オリジン (/api/status) への通信を試行 (PC local / 自宅Wi-Fi LAN 直接アクセス時)
-  if (!location.hostname.endsWith("github.io")) {
+  // 1. GitHub Pages (*.github.io) または HTTPS 静的配信環境の場合は、
+  //    Mixed Content ブロックや LAN タイムアウト待ちを完全にスキップし、待ち時間 0 秒で status_snapshot.json を即時表示
+  if (location.hostname.endsWith("github.io") || location.protocol === "https:") {
     try {
-      const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
-      const ct = (res.headers.get("content-type") || "").toLowerCase();
-      if (res.ok && ct.includes("json")) {
-        const data = await res.json();
+      const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+      if (snapRes.ok) {
+        const snapData = await snapRes.json();
         activeApiBase = ".";
-        isStaticSnapshotMode = false;
-        latestStatusData = data;
-        updateDashboardUI(data);
+        isStaticSnapshotMode = true;
+        latestStatusData = snapData;
+        updateDashboardUI(snapData);
         return;
       }
-    } catch (_) {}
+    } catch (err) {
+      console.error("Snapshot fetch error:", err);
+    }
+    return;
   }
 
-  // 2. GitHub Pages 等から開いている場合、まず status_snapshot.json を読み込みつつ、自宅Wi-Fi LAN API への直接接続も試行
-  let snapData = null;
+  // 2. PC ローカル環境 (http://127.0.0.1:8080 等): 同一オリジン /api/status へ直接通信
   try {
-    const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
-    if (snapRes.ok) {
-      snapData = await snapRes.json();
-      if (snapData && snapData.network_info) {
-        latestNetworkInfo = snapData.network_info;
-      }
-    }
-  } catch (_) {}
-
-  const lanCandidate = (latestNetworkInfo && latestNetworkInfo.lan_url) || "http://192.168.11.3:8080";
-  try {
-    const lanRes = await fetchWithTimeout(`${lanCandidate}/api/status?_t=${Date.now()}`, { cache: "no-store", mode: "cors" }, 1800);
-    if (lanRes.ok) {
-      const liveData = await lanRes.json();
-      activeApiBase = lanCandidate;
+    const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
+    const ct = (res.headers.get("content-type") || "").toLowerCase();
+    if (res.ok && ct.includes("json")) {
+      const data = await res.json();
+      activeApiBase = ".";
       isStaticSnapshotMode = false;
-      latestStatusData = liveData;
-      updateDashboardUI(liveData);
+      latestStatusData = data;
+      updateDashboardUI(data);
       return;
     }
   } catch (_) {}
 
-  // 3. 外出先 (4G/5G) または HTTPS 混在制限時は status_snapshot.json で表示
-  if (snapData) {
-    activeApiBase = ".";
-    isStaticSnapshotMode = true;
-    latestStatusData = snapData;
-    updateDashboardUI(snapData);
-  }
+  // 3. フォールバック: status_snapshot.json
+  try {
+    const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+    if (snapRes.ok) {
+      const snapData = await snapRes.json();
+      activeApiBase = ".";
+      isStaticSnapshotMode = true;
+      latestStatusData = snapData;
+      updateDashboardUI(snapData);
+    }
+  } catch (_) {}
 }
 
 async function fetchChart() {
@@ -2228,18 +2263,18 @@ function updateDashboardUI(data) {
   if (d.is_paused) {
     bDaemon.textContent = "⏸️ 一時停止中 (PAUSED)";
     bDaemon.className = "badge badge-paused";
-    btnPause.disabled = true; btnResume.disabled = isStaticSnapshotMode;
-    btnPauseM.disabled = true; btnResumeM.disabled = isStaticSnapshotMode;
+    btnPause.disabled = true; btnResume.disabled = false;
+    btnPauseM.disabled = true; btnResumeM.disabled = false;
   } else if (d.is_running) {
     bDaemon.textContent = "🟢 稼働中 (ACTIVE)";
     bDaemon.className = "badge badge-active";
-    btnPause.disabled = isStaticSnapshotMode; btnResume.disabled = true;
-    btnPauseM.disabled = isStaticSnapshotMode; btnResumeM.disabled = true;
+    btnPause.disabled = false; btnResume.disabled = true;
+    btnPauseM.disabled = false; btnResumeM.disabled = true;
   } else {
     bDaemon.textContent = "⚪ 待機中";
     bDaemon.className = "badge badge-stopped";
-    btnPause.disabled = isStaticSnapshotMode; btnResume.disabled = isStaticSnapshotMode;
-    btnPauseM.disabled = isStaticSnapshotMode; btnResumeM.disabled = isStaticSnapshotMode;
+    btnPause.disabled = false; btnResume.disabled = false;
+    btnPauseM.disabled = false; btnResumeM.disabled = false;
   }
 
   document.getElementById("badgeRegime").textContent = `${d.market_regime || "NEUTRAL"}`;
@@ -2540,9 +2575,11 @@ function drawEquityChart(curve) {
   });
 }
 
+const READONLY_PWA_GUIDE_MSG = "📱 外出先（GitHub Pages閲覧専用モード）です。操作はPCダッシュボード（127.0.0.1:8080）から実行してください";
+
 async function sendControl(command, nonce="") {
   if (isStaticSnapshotMode) {
-    showToast("外出先（GitHub Pages閲覧モード）からは操作できません。自宅Wi-Fi接続時に操作してください。", true);
+    showToast(READONLY_PWA_GUIDE_MSG, true);
     return null;
   }
   try {
@@ -2566,6 +2603,10 @@ async function sendControl(command, nonce="") {
 }
 
 function confirmCancelEntries() {
+  if (isStaticSnapshotMode) {
+    showToast(READONLY_PWA_GUIDE_MSG, true);
+    return;
+  }
   if (!confirm("現在待機中の未約定買い指値（PENDING_BUY）をすべてキャンセルしますか？\n（※保有中ポジションと逆指値STOP注文は維持されます）")) {
     return;
   }
@@ -2574,7 +2615,7 @@ function confirmCancelEntries() {
 
 async function openFlattenModal() {
   if (isStaticSnapshotMode) {
-    showToast("外出先（GitHub Pages閲覧モード）からは操作できません。", true);
+    showToast(READONLY_PWA_GUIDE_MSG, true);
     return;
   }
   const modal = document.getElementById("flattenModal");
@@ -2609,34 +2650,27 @@ async function confirmFlattenAll() {
 
 async function openQrModal() {
   document.getElementById("qrModal").style.display = "flex";
-  const lanUrl = latestNetworkInfo.lan_url || "http://192.168.11.3:8080";
-  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader-auto/";
-  const lanLink = document.getElementById("qrLanLink");
+  const ghUrl = (latestNetworkInfo && latestNetworkInfo.github_pages_url) || "https://qanojisan.github.io/gmo-ai-trader-auto/";
   const ghLink = document.getElementById("qrGhLink");
-  lanLink.href = lanUrl;
-  lanLink.textContent = lanUrl;
-  ghLink.href = ghUrl;
-  ghLink.textContent = ghUrl;
+  if (ghLink) {
+    ghLink.href = ghUrl;
+    ghLink.textContent = ghUrl;
+  }
 
   try {
-    const [r1, r2] = await Promise.all([
-      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(lanUrl)}`, {}, 2000).catch(() => fetch("./qr-lan.svg")),
-      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(ghUrl)}`, {}, 2000).catch(() => fetch("./qr-gh.svg"))
-    ]);
-    if (r1 && r1.ok) {
-      const t1 = await r1.text();
-      if (t1.includes("<svg")) document.getElementById("qrLanHolder").innerHTML = t1;
-    } else {
-      const f1 = await fetch("./qr-lan.svg");
-      if (f1.ok) document.getElementById("qrLanHolder").innerHTML = await f1.text();
+    let r2 = null;
+    if (!isStaticSnapshotMode) {
+      r2 = await fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(ghUrl)}`, {}, 2000).catch(() => null);
     }
     if (r2 && r2.ok) {
       const t2 = await r2.text();
-      if (t2.includes("<svg")) document.getElementById("qrGhHolder").innerHTML = t2;
-    } else {
-      const f2 = await fetch("./qr-gh.svg");
-      if (f2.ok) document.getElementById("qrGhHolder").innerHTML = await f2.text();
+      if (t2.includes("<svg")) {
+        document.getElementById("qrGhHolder").innerHTML = t2;
+        return;
+      }
     }
+    const f2 = await fetch("./qr-gh.svg");
+    if (f2.ok) document.getElementById("qrGhHolder").innerHTML = await f2.text();
   } catch (_) {}
 }
 

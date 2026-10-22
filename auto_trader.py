@@ -584,8 +584,9 @@ class AutoTraderDaemon:
 
         events: List[Dict[str, Any]] = []
 
-        # 0. portfolio.json に campaign_schedule メタデータが未登録の場合は自動初期化
+        # 0. portfolio.json に campaign_schedule メタデータが未登録の場合は自動初期化 ＆ SQLite WAL とフラグ双方向同期
         pf_init = self.oco_manager.load_portfolio()
+        pf_dirty = False
         camp_meta = pf_init.get("campaign_schedule")
         if not isinstance(camp_meta, dict) or not camp_meta.get("phase1_end_jst"):
             pf_init["campaign_schedule"] = {
@@ -595,7 +596,41 @@ class AutoTraderDaemon:
                 "pre_deadline_freeze_hours": self.pre_deadline_freeze_hours,
                 "current_phase": self.campaign_phase,
             }
+            pf_dirty = True
+
+        for flag_k in ("phase1_settled", "phase2_started", "phase2_settled"):
+            pf_flag = bool(pf_init.get(flag_k, False))
+            wal_flag = False
+            if self.db_wal is not None:
+                try:
+                    wal_flag = bool(self.db_wal.get_meta(flag_k, False))
+                except Exception:
+                    wal_flag = False
+            if wal_flag and not pf_flag:
+                pf_init[flag_k] = True
+                pf_dirty = True
+            elif pf_flag and not wal_flag and self.db_wal is not None:
+                try:
+                    self.db_wal.set_meta(flag_k, True)
+                except Exception:
+                    pass
+
+        if pf_dirty:
             self.oco_manager.save_portfolio(pf_init, now_dt=now_jst)
+
+        # 0b. 2027-07-09 00:00:00 JST 以降にまだ Phase 1 全決済が未完了の場合（24時間超の停電復旧時も含む）は最優先で Phase 1 締めを実行
+        if now_jst >= p1_end and not bool(pf_init.get("phase1_settled", False)):
+            events.extend(
+                self._execute_deadline_settlement(
+                    phase_label="PHASE1",
+                    settlement_reason="PHASE1_DEADLINE_SETTLEMENT",
+                    report_filename="PERFORMANCE_REPORT_PHASE1.md",
+                    settled_flag_key="phase1_settled",
+                    now_dt=now_jst,
+                    tickers=tickers,
+                )
+            )
+            pf_init = self.oco_manager.load_portfolio()
 
         # 1. 第1回 通常稼働期間 (< 2027-07-08 22:00:00 JST)
         if now_jst < p1_freeze_start:
@@ -632,18 +667,6 @@ class AutoTraderDaemon:
         # 3. 第1回 運用期限到達＆24時間検証・改良休止ウィンドウ (2027-07-09 00:00:00 <= now < 2027-07-10 00:00:00 JST)
         if p1_end <= now_jst < p2_start:
             self.campaign_phase = "PHASE1_COMPLETED_INTERMISSION"
-            pf = self.oco_manager.load_portfolio()
-            if not pf.get("phase1_settled", False):
-                events.extend(
-                    self._execute_deadline_settlement(
-                        phase_label="PHASE1",
-                        settlement_reason="PHASE1_DEADLINE_SETTLEMENT",
-                        report_filename="PERFORMANCE_REPORT_PHASE1.md",
-                        settled_flag_key="phase1_settled",
-                        now_dt=now_jst,
-                        tickers=tickers,
-                    )
-                )
             return {
                 "phase": "PHASE1_COMPLETED_INTERMISSION",
                 "allow_new_buy": False,
@@ -945,7 +968,7 @@ class AutoTraderDaemon:
                 )
 
             if events:
-                self._sync_pwa_snapshot(include_charts=False)
+                self._sync_pwa_snapshot(include_charts=False, force_push=True)
 
             self.record_api_success()
             return {
@@ -1270,7 +1293,7 @@ class AutoTraderDaemon:
                 portfolio_path=self.portfolio_path,
                 history_csv_path=self.history_csv_path,
             )
-            self._sync_pwa_snapshot()
+            self._sync_pwa_snapshot(include_charts=True, force_push=True)
             # 3階層通知: HOLD の場合はスパム防止のため DAILY_DIGEST バッファへ送り、BUY/SELL/MODIFY は即時通知
             if action == "HOLD":
                 self.notification_dispatcher.dispatch(
@@ -1300,24 +1323,32 @@ class AutoTraderDaemon:
                 "circuit_breaker": cb_info,
             }
 
-    def _sync_pwa_snapshot(self, include_charts: bool = True) -> None:
-        """本番ワークスペース稼働時に docs/ 以下の静的PWAスナップショットを最新状態へ同期し、GitHub Pagesへ非同期Pushする"""
+    def _sync_pwa_snapshot(self, include_charts: bool = True, force_push: bool = False) -> None:
+        """
+        本番ワークスペース稼働時に docs/ 以下の静的PWAスナップショットを最新状態へ同期し、
+        GitHub Pagesへ非同期Pushする（メイン売買ループを0msもブロックしない完全バックグラウンド実行）。
+        """
         if self.base_dir != BASE_DIR:
             return
-        try:
-            from web_dashboard import WebDashboardService
 
-            svc = WebDashboardService(base_dir=self.base_dir, public_client=self.public_client)
+        def _bg_export() -> None:
             try:
-                svc.export_static_pwa_bundle(
-                    output_dir=self.base_dir / "docs",
-                    include_charts=include_charts,
-                    auto_push=True,
-                )
-            finally:
-                svc.close()
-        except Exception as exc:
-            logger.debug("PWA snapshot sync skipped: %s", exc)
+                from web_dashboard import WebDashboardService
+
+                svc = WebDashboardService(base_dir=self.base_dir, public_client=self.public_client)
+                try:
+                    svc.export_static_pwa_bundle(
+                        output_dir=self.base_dir / "docs",
+                        include_charts=include_charts,
+                        auto_push=True,
+                        force_push=force_push,
+                    )
+                finally:
+                    svc.close()
+            except Exception as exc:
+                logger.debug("PWA snapshot sync skipped: %s", exc)
+
+        threading.Thread(target=_bg_export, daemon=True).start()
 
     def run_forever(self, max_cycles: Optional[int] = None) -> None:
         """24時間常駐メインループ（15秒ごとに高速ループ、5分ごとに3-Way照合、15分ごとに中速レーダーループを実行）"""

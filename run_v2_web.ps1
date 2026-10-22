@@ -32,7 +32,7 @@ if (Test-Path -LiteralPath $WebLockFile) {
     $ExistingPid = 0
     if ([int]::TryParse($ExistingPidText, [ref]$ExistingPid) -and $ExistingPid -gt 0 -and $ExistingPid -ne $PID) {
         $RunningProc = Get-Process -Id $ExistingPid -ErrorAction SilentlyContinue
-        if ($null -ne $RunningProc) {
+        if ($null -ne $RunningProc -and $RunningProc.ProcessName -match "^(powershell|pwsh|python)") {
             $Url = "http://" + $BrowserHost + ":" + $Port
             Write-Host ("[OK] GMO AI Trader v2 Web Dashboard is already running (PID=" + $ExistingPid + ") at " + $Url)
             if (-not $NoBrowser) {

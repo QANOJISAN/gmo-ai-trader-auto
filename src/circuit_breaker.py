@@ -260,6 +260,7 @@ class MultiTierCircuitBreaker:
         self.l5_consecutive_breach_count: int = 0
         self.l5_kill_switch_latched: bool = False
         self.l5_last_conservative_equity_jpy: Decimal = Decimal("10000")
+        self.hwm_candidate_readings: List[Decimal] = []
 
     # ------------------------------------------------------------------
     # L1: 個別銘柄一時除外（スプレッド急拡大・データ遅延）
@@ -523,10 +524,27 @@ class MultiTierCircuitBreaker:
 
             t_info = tickers_map.get(sym, {})
             best_bid_raw = t_info.get("bid", t_info.get("best_bid"))
+            best_ask_raw = t_info.get("ask", t_info.get("best_ask"))
             best_bid_dec = _to_decimal(best_bid_raw)
+            best_ask_dec = _to_decimal(best_ask_raw)
+            ref_price_dec = _to_decimal(pos.get("current_price") or pos.get("entry_price", 0))
+
+            is_quote_corrupt = False
             if best_bid_dec <= Decimal("0"):
+                is_quote_corrupt = True
+            elif best_ask_dec > Decimal("0") and (
+                best_bid_dec > best_ask_dec
+                or ((best_ask_dec - best_bid_dec) / best_bid_dec) > Decimal("0.10")
+            ):
+                # Crossed book (bid > ask) または 10% 超の異常スプレッド欠損
+                is_quote_corrupt = True
+            elif ref_price_dec > Decimal("0") and best_bid_dec > (ref_price_dec * Decimal("1.50")):
+                # 単発 +50% 超の異常ティッカースパイク（通信ノイズ・板バグ）
+                is_quote_corrupt = True
+
+            if is_quote_corrupt:
                 all_bids_valid = False
-                best_bid_dec = _to_decimal(pos.get("current_price") or pos.get("entry_price", 0))
+                best_bid_dec = ref_price_dec if ref_price_dec > Decimal("0") else max(best_bid_dec, Decimal("0"))
 
             rule = self.symbol_rules.get(sym, {})
             taker_fee_dec = max(_to_decimal(rule.get("taker_fee", "0.0009")), Decimal("0"))
@@ -555,23 +573,48 @@ class MultiTierCircuitBreaker:
 
         init_cap = _to_decimal(portfolio.get("initial_capital_jpy", 10000))
         prev_peak = max(_to_decimal(portfolio.get("peak_equity_jpy", 0)), init_cap, Decimal("10000"))
+        has_active_positions = any(
+            str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+            and _to_decimal(p.get("size", 0)) > Decimal("0")
+            for p in (portfolio.get("positions", []) or [])
+        )
+
         peak_updated = False
-        if bids_valid and conservative_eq > prev_peak:
-            peak_equity = conservative_eq
-            peak_updated = True
+        if not has_active_positions:
+            # ポジションフラット時（確定現金100%）はティッカーノイズの影響を受けないため即時HWM反映
+            self.hwm_candidate_readings.clear()
+            if bids_valid and conservative_eq > prev_peak:
+                peak_equity = conservative_eq
+                peak_updated = True
+            else:
+                peak_equity = prev_peak
         else:
-            peak_equity = prev_peak
+            # 保有建玉あり（含み益評価込み）の場合は、単発価格スパイクによるHWM汚染を防ぐため
+            # 正常なBest Bidのもとで 3回連続 prev_peak を上回った場合の最小値でHWMを更新する
+            if bids_valid and conservative_eq > prev_peak:
+                self.hwm_candidate_readings.append(conservative_eq)
+                if len(self.hwm_candidate_readings) > 3:
+                    self.hwm_candidate_readings = self.hwm_candidate_readings[-3:]
+                if len(self.hwm_candidate_readings) >= 3:
+                    confirmed_peak = min(self.hwm_candidate_readings)
+                    if confirmed_peak > prev_peak:
+                        peak_equity = confirmed_peak
+                        peak_updated = True
+                    else:
+                        peak_equity = prev_peak
+                else:
+                    peak_equity = prev_peak
+            else:
+                self.hwm_candidate_readings.clear()
+                peak_equity = prev_peak
 
         peak_val_num = int(peak_equity) if peak_equity == peak_equity.to_integral() else float(round(peak_equity, 2))
         if portfolio.get("peak_equity_jpy") != peak_val_num:
             portfolio["peak_equity_jpy"] = peak_val_num
             peak_updated = True
 
-        base_threshold = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", self.l5_kill_switch_equity_jpy))
-        if base_threshold <= Decimal("0"):
-            base_threshold = self.l5_kill_switch_equity_jpy
         hwm_threshold = (peak_equity * Decimal("0.85")).quantize(Decimal("0.01"))
-        threshold = max(self.l5_kill_switch_equity_jpy, base_threshold, hwm_threshold)
+        threshold = max(self.l5_kill_switch_equity_jpy, hwm_threshold)
         thresh_val_num = int(threshold) if threshold == threshold.to_integral() else float(round(threshold, 2))
         if portfolio.get("drawdown_kill_switch_jpy") != thresh_val_num:
             portfolio["drawdown_kill_switch_jpy"] = thresh_val_num

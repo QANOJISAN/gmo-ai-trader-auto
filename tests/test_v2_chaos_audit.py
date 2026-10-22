@@ -2860,6 +2860,127 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 svc.close()
                 daemon.shutdown()
 
+    def test_round9_non_disruptive_post_golive_comprehensive_audit(self) -> None:
+        """
+        Round 9: 本番稼働後・無停止総合監査 (Non-Disruptive Post-Go-Live Comprehensive Audit)
+        - [監査1] ステルスラッパー (run_v2_daemon.ps1 / run_v2_web.ps1) の PID 再利用耐性 (ProcessName 検証)
+        - [監査3] Git Auto-Push のプロセス間ロック (v2_git_push.lock) ＆ メインループ非ブロッキング検証
+        - [監査4] GitHub Pages (*.github.io) 上での LAN IP タイムアウト完全スキップ＆閲覧専用ガイダンス検証
+        - [監査5] High-Water Mark (peak_equity_jpy) の単発価格スパイク・板逆転汚染防御＆3回連続確認ロジック検証
+        - [監査6] 第1回・第2回 運用期限の SQLite WAL 双方向復元＆24時間超停電ジャンプ時の Phase 1 優先決済保証
+        """
+        from web_dashboard import DASHBOARD_HTML, push_docs_snapshot_async
+        from src.circuit_breaker import SingleInstanceLock
+
+        base_repo_dir = Path(__file__).resolve().parent.parent
+
+        # [監査1] run_v2_daemon.ps1 / run_v2_web.ps1 の ProcessName 検証ガード確認
+        daemon_ps1 = (base_repo_dir / "run_v2_daemon.ps1").read_text(encoding="ascii")
+        web_ps1 = (base_repo_dir / "run_v2_web.ps1").read_text(encoding="ascii")
+        self.assertIn('ProcessName -match "^(powershell|pwsh|python)"', daemon_ps1)
+        self.assertIn('ProcessName -match "^(powershell|pwsh|python)"', web_ps1)
+
+        # [監査4] GitHub Pages (*.github.io) での LAN タイムアウト完全スキップ＆閲覧専用トーストメッセージ確認
+        self.assertIn('location.hostname.endsWith("github.io") || location.protocol === "https:"', DASHBOARD_HTML)
+        self.assertIn(
+            "📱 外出先（GitHub Pages閲覧専用モード）です。操作はPCダッシュボード（127.0.0.1:8080）から実行してください",
+            DASHBOARD_HTML,
+        )
+
+        # [監査5] High-Water Mark (peak_equity_jpy) 単発価格スパイク汚染防御 ＆ 3回連続確認
+        cb = MultiTierCircuitBreaker(l5_kill_switch_equity_jpy=8500.0)
+        pf_hwm = {
+            "initial_capital_jpy": 10000,
+            "jpy_balance": 6025,
+            "peak_equity_jpy": 10025,
+            "drawdown_kill_switch_jpy": 8521.25,
+            "positions": [
+                {
+                    "symbol": "XRP",
+                    "size": 20.0,
+                    "entry_price": 200.0,
+                    "current_price": 200.0,
+                    "state": "SL_ACTIVE",
+                }
+            ],
+        }
+        # (a) 1サイクルだけ XRP Bid が 2,000円 (10倍スパイク異常値) に跳ねた場合 -> bids_valid=False で棄却され peak_equity_jpy は 10,025 のまま
+        r_spike = cb.evaluate_l5_hard_kill_switch(pf_hwm, {"XRP": {"bid": 2000.0, "ask": 2001.0}})
+        self.assertFalse(r_spike["bids_valid"])
+        self.assertEqual(pf_hwm["peak_equity_jpy"], 10025)
+        # その後 3サイクル正常価格 (200円) に戻っても L5 キルスイッチが誤発動しないこと
+        for _ in range(3):
+            r_norm = cb.evaluate_l5_hard_kill_switch(pf_hwm, {"XRP": {"bid": 200.0, "ask": 200.1}})
+            self.assertFalse(r_norm["latched"])
+            self.assertEqual(r_norm["consecutive_breaches"], 0)
+
+        # (b) 正常な価格範囲 (+25%: 250円, 総資産約 11,020.5円) で推移した場合:
+        # 1〜2回目ではまだ HWM は更新されず、3回連続確認された時点で HWM が更新されること
+        r_up1 = cb.evaluate_l5_hard_kill_switch(pf_hwm, {"XRP": {"bid": 250.0, "ask": 250.1}})
+        self.assertEqual(pf_hwm["peak_equity_jpy"], 10025)
+        r_up2 = cb.evaluate_l5_hard_kill_switch(pf_hwm, {"XRP": {"bid": 252.0, "ask": 252.1}})
+        self.assertEqual(pf_hwm["peak_equity_jpy"], 10025)
+        r_up3 = cb.evaluate_l5_hard_kill_switch(pf_hwm, {"XRP": {"bid": 251.0, "ask": 251.1}})
+        self.assertGreater(pf_hwm["peak_equity_jpy"], 11000)
+        self.assertTrue(r_up3["peak_updated"])
+
+        # [監査3 & 監査6] 一時ディレクトリ上での Git Push ロック非干渉 ＆ 運用期限 WAL 復元・停電ジャンプ決済検証
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            # Audit 3: 一時ディレクトリで push_docs_snapshot_async を呼んでも即座に return しブロックしないこと
+            t_start = time.monotonic()
+            push_docs_snapshot_async(tmp_dir, force=True)
+            self.assertLess(time.monotonic() - t_start, 0.05)
+
+            git_lock_a = SingleInstanceLock(tmp_dir / "v2_git_push.lock")
+            git_lock_b = SingleInstanceLock(tmp_dir / "v2_git_push.lock")
+            self.assertTrue(git_lock_a.acquire())
+            self.assertFalse(git_lock_b.acquire())
+            git_lock_a.release()
+            self.assertTrue(git_lock_b.acquire())
+            git_lock_b.release()
+
+            # Audit 6: 2027-07-08 21:00 に建玉を保有したまま PC が停電し、2027-07-10 00:05 (Phase 2 開始後) に復帰した場合でも
+            # Phase 1 の全決済と PERFORMANCE_REPORT_PHASE1.md 生成が漏れなく先に実行されること
+            daemon = AutoTraderDaemon(base_dir=tmp_dir, execution_mode="DRY_RUN", dry_run_notify=True)
+            try:
+                t_pre = datetime(2027, 7, 8, 21, 0, 0, tzinfo=JST)
+                tk = {"XRP": {"bid": 200.0, "ask": 200.1, "last": 200.0}}
+                daemon.broker.update_market_tickers(tk)
+                daemon.oco_manager.place_new_buy_order(
+                    {
+                        "action": "BUY",
+                        "symbol": "XRP",
+                        "limit_price": 200.0,
+                        "size": 20.0,
+                        "take_profit_price": 220.0,
+                        "stop_loss_price": 192.0,
+                        "expected_loss_jpy": 160,
+                    },
+                    tickers=tk,
+                    now_dt=t_pre,
+                )
+                daemon.oco_manager.step(tickers={"XRP": {"bid": 199.8, "ask": 199.9, "last": 199.8}}, now_dt=t_pre + timedelta(minutes=1))
+
+                # 2027-07-10 00:05 JST にいきなり起動
+                t_jump_p2 = datetime(2027, 7, 10, 0, 5, 0, tzinfo=JST)
+                res_jump = daemon.run_fast_cycle(tickers={"XRP": {"bid": 205.0, "ask": 205.1, "last": 205.0}}, now_dt=t_jump_p2)
+                self.assertEqual(res_jump["campaign_phase"], "PHASE2_ACTIVE")
+                self.assertTrue(any(e.get("type") == "PHASE1_DEADLINE_SETTLEMENT" for e in res_jump["events"]))
+                self.assertTrue(any(e.get("type") == "PHASE2_CAMPAIGN_STARTED" for e in res_jump["events"]))
+                self.assertTrue((tmp_dir / "PERFORMANCE_REPORT_PHASE1.md").exists())
+
+                # portfolio.json の phase1_settled が万一消えても SQLite WAL (account_meta) から自動復元され二重決済しないこと
+                pf_corrupt = daemon.oco_manager.load_portfolio()
+                pf_corrupt.pop("phase1_settled", None)
+                daemon.oco_manager.save_portfolio(pf_corrupt, now_dt=t_jump_p2 + timedelta(minutes=1))
+
+                res_next = daemon.run_fast_cycle(tickers={"XRP": {"bid": 205.0, "ask": 205.1, "last": 205.0}}, now_dt=t_jump_p2 + timedelta(minutes=2))
+                self.assertFalse(any(e.get("type") == "PHASE1_DEADLINE_SETTLEMENT" for e in res_next["events"]))
+                self.assertTrue(daemon.oco_manager.load_portfolio().get("phase1_settled"))
+            finally:
+                daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()
