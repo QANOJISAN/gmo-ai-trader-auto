@@ -284,11 +284,16 @@ class ThreeWayReconciler:
                                 timestamp_str=str(ex.get("timestamp", now_jst.isoformat(timespec="seconds"))),
                             )
                     recorded_sz = self.db_wal.get_executed_size_for_order(oid) if hasattr(self.db_wal, "get_executed_size_for_order") else (filled_size_dec if self.db_wal.has_execution_for_order(oid) else Decimal("0"))
-                    if recorded_sz + Decimal("1e-12") < filled_size_dec:
-                        residual_sz = filled_size_dec - recorded_sz
+                    residual_sz = filled_size_dec - recorded_sz
+                    residual_sat = (
+                        int((residual_sz * Decimal("100000000")).to_integral_value(rounding=ROUND_HALF_UP))
+                        if residual_sz > Decimal("0")
+                        else 0
+                    )
+                    if residual_sz > Decimal("0") and residual_sat > 0:
                         residual_fee = (entry_fee_d * residual_sz / filled_size_dec).quantize(Decimal("0.01")) if filled_size_dec > Decimal("0") else entry_fee_d
                         self.db_wal.record_execution_idempotent(
-                            execution_id=f"rec_{oid}_{format_decimal_plain(filled_size_dec)}",
+                            execution_id=f"rec_{oid}_{residual_sat}",
                             order_id=oid,
                             symbol=sym,
                             side="BUY",

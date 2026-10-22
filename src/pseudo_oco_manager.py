@@ -1563,10 +1563,14 @@ class PseudoOCOManager:
             Decimal("0"),
         )
         rem_sz_d = total_size_d - recorded_sz_d
-        if rem_sz_d > Decimal("0"):
+        rem_sat = (
+            int((rem_sz_d * Decimal("100000000")).to_integral_value(rounding=ROUND_HALF_UP))
+            if rem_sz_d > Decimal("0")
+            else 0
+        )
+        if rem_sz_d > Decimal("0") and rem_sat > 0:
             ratio = (rem_sz_d / total_size_d) if total_size_d > Decimal("0") else Decimal("1")
             rem_fee_d = (total_fee_d * ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            rem_sat = int((rem_sz_d * Decimal("100000000")).to_integral_value(rounding=ROUND_HALF_UP))
             exec_id = (
                 f"{fallback_prefix}_{primary_order_id}"
                 if recorded_sz_d == Decimal("0")

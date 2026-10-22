@@ -87,7 +87,11 @@ def from_satoshi_int(sat: int) -> Decimal:
 
 
 def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None:
-    """一時ファイル書き込み＋os.replace によるクラッシュ耐性アトミックファイル更新"""
+    """
+    一時ファイル書き込み＋os.replace によるクラッシュ耐性アトミックファイル更新。
+    Windows 環境で Windows Defender やインデクサが一時的にハンドルを掴むことによる
+    `PermissionError` (`[WinError 32]` / `[WinError 5]`) に対し、指数バックオフ付きリトライを行う。
+    """
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex[:8]}.tmp")
@@ -96,13 +100,29 @@ def atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> None
             f.write(content)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_path, target)
+        last_err: Optional[OSError] = None
+        for attempt in range(6):
+            try:
+                os.replace(tmp_path, target)
+                last_err = None
+                break
+            except OSError as exc:
+                last_err = exc
+                time.sleep(0.015 * (attempt + 1))
+        if last_err is not None:
+            # 最終フォールバック: target へ直接書き込み試行
+            with target.open("w", encoding=encoding, newline="\n") as f_direct:
+                f_direct.write(content)
+                f_direct.flush()
+                os.fsync(f_direct.fileno())
     finally:
         if tmp_path.exists():
-            try:
-                tmp_path.unlink()
-            except OSError:
-                pass
+            for _ in range(3):
+                try:
+                    tmp_path.unlink()
+                    break
+                except OSError:
+                    time.sleep(0.01)
 
 
 class OrderLatticeViolationError(RuntimeError):

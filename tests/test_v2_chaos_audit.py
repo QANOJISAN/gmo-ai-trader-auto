@@ -2249,6 +2249,169 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
 
             daemon.shutdown()
 
+    def test_round6_zero_defect_and_monte_carlo_fuzzing_audit(self) -> None:
+        """
+        Round 6 徹底総合監査:
+        1. [R6-01] `get_orders` / `cancel_orders` に空リスト `[]`、整数リスト `[1001, 1002]`、カンマ区切り文字列 `"1001,1002"` を渡した場合の正規化検証
+        2. [R6-02] `poll_and_execute_db_commands` において不正・期限切れ・未知の `PENDING` コマンドが `REJECTED` に更新され無限ループしないこと
+        3. [R6-03] 1 Satoshi 未満 (`1e-10`) の端数誤差で `0 Satoshi` レコードが挿入されないこと、および `L5_KILL_SWITCH` / `FLATTEN_ALL` 時の `quarantined_dust` 非干渉＆部分約定昇格建玉の確実な決済
+        """
+        from decimal import Decimal
+        from src.gmo_private_client import GMOPrivateClient
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            t0 = datetime(2026, 10, 22, 14, 0, 0, tzinfo=JST)
+
+            # ------------------------------------------------------------------
+            # 1. R6-01: _parse_order_ids_arg による get_orders / cancel_orders 入力形式網羅検証
+            # ------------------------------------------------------------------
+            self.assertEqual(daemon.broker.get_orders([]), [])
+            self.assertEqual(daemon.broker.get_orders(""), [])
+            self.assertEqual(daemon.broker.cancel_orders([]), {"success": [], "failed": []})
+            self.assertEqual(daemon.broker.cancel_orders(""), {"success": [], "failed": []})
+
+            o1 = daemon.broker.place_order(symbol="XRP", side="BUY", execution_type="LIMIT", size=10, price=75.0, time_in_force="SOK")
+            o2 = daemon.broker.place_order(symbol="XRP", side="BUY", execution_type="LIMIT", size=10, price=74.0, time_in_force="SOK")
+            id1_int = int(o1["order_id"])
+            id2_int = int(o2["order_id"])
+            comma_ids = f"{id1_int},{id2_int}"
+
+            # 整数リストでもカンマ区切り文字列でも 2件とも取得・キャンセルできること
+            fetched_int = daemon.broker.get_orders([id1_int, id2_int])
+            self.assertEqual(len(fetched_int), 2)
+            fetched_csv = daemon.broker.get_orders(comma_ids)
+            self.assertEqual(len(fetched_csv), 2)
+
+            cancel_csv_res = daemon.broker.cancel_orders(comma_ids)
+            self.assertEqual(len(cancel_csv_res["success"]), 2)
+            self.assertEqual(len(cancel_csv_res["failed"]), 0)
+
+            # GMOPrivateClient._parse_order_ids_arg 単体でも 12件カンマ区切り文字列が 12要素に分割されること
+            twelve_csv = ",".join(str(1000 + i) for i in range(12))
+            parsed_12 = GMOPrivateClient._parse_order_ids_arg(twelve_csv)
+            self.assertEqual(len(parsed_12), 12)
+
+            # ------------------------------------------------------------------
+            # 2. R6-02: poll_and_execute_db_commands の不正・期限切れコマンド REJECTED 遷移（無限再試行防止）
+            # ------------------------------------------------------------------
+            daemon.db_wal.enqueue_control_command(
+                command="FLATTEN_CONFIRM",
+                nonce="bad_cli_1",
+                requested_by="LOCAL_OWNER",
+                status="PENDING",
+                payload={"target_nonce": "flt_nonexistent_expired"},
+                now_ts_ms=int(t0.timestamp() * 1000),
+            )
+            daemon.db_wal.enqueue_control_command(
+                command="UNKNOWN_CMD_XYZ",
+                nonce="bad_cli_2",
+                requested_by="LOCAL_OWNER",
+                status="PENDING",
+                payload={},
+                now_ts_ms=int(t0.timestamp() * 1000),
+            )
+            self.assertEqual(len(daemon.db_wal.fetch_pending_control_commands()), 2)
+
+            # 1回のポーリングで両方 REJECTED に遷移し、次サイクルでは PENDING が 0件になること
+            daemon.remote_control.poll_and_execute_db_commands(now_dt=t0 + timedelta(seconds=5))
+            self.assertEqual(len(daemon.db_wal.fetch_pending_control_commands()), 0)
+            row1 = daemon.db_wal.get_control_command_by_nonce("bad_cli_1")
+            row2 = daemon.db_wal.get_control_command_by_nonce("bad_cli_2")
+            self.assertEqual(row1["status"], "REJECTED")
+            self.assertEqual(row2["status"], "REJECTED")
+
+            # ------------------------------------------------------------------
+            # 3. R6-03: 1 Satoshi 未満の端数誤差防止 ＆ DUST共存時の L5 キルスイッチ完全性
+            # ------------------------------------------------------------------
+            # 既に 10.0 XRP が記録されている注文に対し、total_size_d = 10.0000000001 (差 1e-10 < 1 Satoshi) を渡しても
+            # 0 Satoshi の補完レコードが挿入されないこと
+            daemon.db_wal.record_execution_idempotent(
+                execution_id="exec_subsat_test_1",
+                order_id="777001",
+                symbol="XRP",
+                side="BUY",
+                price_str="80",
+                size_str="10",
+                fee_jpy_str="0",
+                timestamp_str=t0.isoformat(timespec="seconds"),
+            )
+            daemon.oco_manager._record_executions_to_wal(
+                symbol="XRP",
+                side="BUY",
+                primary_order_id="777001",
+                all_order_ids=["777001"],
+                total_size_d=Decimal("10.0000000001"),
+                avg_price_d=Decimal("80"),
+                total_fee_d=Decimal("0"),
+                matched_execs=[],
+                fallback_prefix="exec_buy",
+                now_jst=t0,
+            )
+            with daemon.db_wal._lock:
+                cnt_777 = daemon.db_wal._conn.execute(
+                    "SELECT COUNT(*) FROM executions WHERE order_id = '777001'"
+                ).fetchone()[0]
+            self.assertEqual(int(cnt_777), 1)
+
+            # BCH に DUST_QUARANTINED (0.003 BCH) と有効建玉 (0.095 BCH) が共存する状態で
+            # L5 ハード・キルスイッチが発動した際、有効建玉のみが決済され、端数には成行売りが出ないこと
+            daemon.oco_manager.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000.0,
+                    "size": 0.095,
+                    "take_profit_price": 46500.0,
+                    "stop_loss_price": 42500.0,
+                    "expected_loss_jpy": 142,
+                },
+                tickers={"BCH": {"ask": 44100.0, "bid": 44050.0, "last": 44080.0}},
+                now_dt=t0 + timedelta(minutes=1, seconds=5),
+            )
+            # 約定させて SL_ACTIVE へ
+            daemon.oco_manager.step(
+                tickers={"BCH": {"ask": 43950.0, "bid": 43900.0, "last": 43950.0}},
+                now_dt=t0 + timedelta(minutes=1, seconds=10),
+            )
+
+            pf = daemon.oco_manager.load_portfolio()
+            pf["jpy_balance"] = 3000  # 総資産約 7,172円 (< 8,500円) にして L5 を誘発
+            pf["quarantined_dust"] = [
+                {
+                    "symbol": "BCH",
+                    "size": 0.003,
+                    "entry_price": 44000.0,
+                    "cost_jpy": 132,
+                    "state": "DUST_QUARANTINED",
+                }
+            ]
+            daemon.oco_manager.save_portfolio(pf, now_dt=t0 + timedelta(minutes=1, seconds=15))
+
+            # さらに 3回連続で純資産 < 8,500円 を検知させて L5 キルスイッチを発動
+            for step_i in range(3):
+                res_l5 = daemon.run_fast_cycle(
+                    tickers={"BCH": {"ask": 43950.0, "bid": 43900.0, "last": 43950.0}},
+                    now_dt=t0 + timedelta(minutes=1, seconds=20 + step_i * 5),
+                )
+            self.assertEqual(res_l5["status"], "OK")
+            self.assertTrue(res_l5["l5_kill_switch"]["latched"])
+            self.assertTrue(res_l5["l5_kill_switch"]["newly_triggered"])
+            pf_after_l5 = daemon.oco_manager.load_portfolio()
+            active_after_l5 = [
+                p for p in pf_after_l5["positions"]
+                if p.get("state") != "DUST_QUARANTINED"
+            ]
+            self.assertEqual(len(active_after_l5), 0)
+            self.assertEqual(len(pf_after_l5["quarantined_dust"]), 1)
+
+            daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

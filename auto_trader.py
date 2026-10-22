@@ -561,10 +561,14 @@ class AutoTraderDaemon:
             l5_res = self.circuit_breaker.evaluate_l5_hard_kill_switch(pf_now, current_tickers)
             if l5_res["newly_triggered"]:
                 self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                pf_now = self.oco_manager.load_portfolio()
                 for l5_pos in list(pf_now.get("positions", []) or []):
                     if str(l5_pos.get("state", "PROTECTED")).upper() == "DUST_QUARANTINED":
                         continue
                     l5_sym = str(l5_pos.get("symbol", "")).strip().upper()
+                    min_sz = float(DEFAULT_SYMBOL_RULES.get(l5_sym, {}).get("min_order_size", 0.0001) or 0.0001)
+                    if float(l5_pos.get("size", 0) or 0) < min_sz:
+                        continue
                     if l5_sym:
                         try:
                             closed_l5 = self.oco_manager.close_position_immediately(

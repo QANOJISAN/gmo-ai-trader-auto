@@ -616,12 +616,26 @@ class GMOPrivateClient:
                 results.append(self._normalize_order_dict(item))
         return results
 
+    @staticmethod
+    def _parse_order_ids_arg(order_ids: Union[str, int, List[Union[str, int]], None]) -> List[str]:
+        """文字列（カンマ区切り含む）・整数・リストのいずれの形式でも注文ID文字列リストへ正規化する"""
+        if order_ids is None:
+            return []
+        if isinstance(order_ids, (str, int)):
+            return [part.strip() for part in str(order_ids).split(",") if part.strip()]
+        out: List[str] = []
+        for item in order_ids:
+            if item is None:
+                continue
+            for part in str(item).split(","):
+                clean = part.strip()
+                if clean:
+                    out.append(clean)
+        return out
+
     def get_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> List[Dict[str, Any]]:
         """注文ID指定で注文情報を取得する (`GET /private/v1/orders`, Priority 3, 10件ずつチャンク処理)"""
-        if isinstance(order_ids, (str, int)):
-            id_list = [str(order_ids)] if str(order_ids).strip() else []
-        else:
-            id_list = [str(x) for x in order_ids if str(x).strip()]
+        id_list = self._parse_order_ids_arg(order_ids)
         if not id_list:
             return []
         results: List[Dict[str, Any]] = []
@@ -670,9 +684,10 @@ class GMOPrivateClient:
         oid_str = str(order_id)
         return {"order_id": oid_str, "orderId": oid_str, "status": "CANCELED", "orderStatus": "CANCELED"}
 
-    def cancel_orders(self, order_ids: List[Union[str, int]]) -> Dict[str, Any]:
+    def cancel_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> Dict[str, Any]:
         """複数注文（最大10件ずつ）を一括キャンセルする (`POST /private/v1/cancelOrders`, Priority 2)"""
-        normalized_ids = [int(x) if str(x).isdigit() else x for x in order_ids if str(x).strip()]
+        parsed_ids = self._parse_order_ids_arg(order_ids)
+        normalized_ids = [int(x) if x.isdigit() else x for x in parsed_ids]
         if not normalized_ids:
             return {"success": [], "failed": []}
         all_success: List[Any] = []
@@ -1682,10 +1697,7 @@ class PaperBroker:
         return out[:count]
 
     def get_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> List[Dict[str, Any]]:
-        if isinstance(order_ids, (str, int)):
-            id_set = {str(order_ids)} if str(order_ids).strip() else set()
-        else:
-            id_set = {str(x) for x in order_ids if str(x).strip()}
+        id_set = set(GMOPrivateClient._parse_order_ids_arg(order_ids))
         if not id_set:
             return []
         state = self._ensure_state_file()
@@ -1709,10 +1721,11 @@ class PaperBroker:
                 return GMOPrivateClient._normalize_order_dict(o)
         raise GMOPrivateAPIError(f"[PaperBroker] 指定された注文IDが見つかりません: {oid}")
 
-    def cancel_orders(self, order_ids: List[Union[str, int]]) -> Dict[str, Any]:
+    def cancel_orders(self, order_ids: Union[str, int, List[Union[str, int]]]) -> Dict[str, Any]:
+        parsed_ids = GMOPrivateClient._parse_order_ids_arg(order_ids)
         success = []
         failed = []
-        for oid in order_ids:
+        for oid in parsed_ids:
             try:
                 self.cancel_order(oid)
                 success.append(str(oid))

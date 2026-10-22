@@ -533,15 +533,17 @@ class RemoteControlManager:
         # 1. 未約定の買い指値を全キャンセル
         cancel_res = self.cancel_pending_entries_only(actor_id=verified_actor, now_dt=now_jst)
 
-        # 2. 保有中の全ポジション（DUST_QUARANTINED 除く）を緊急成行決済
+        # 2. 保有中の全ポジション（DUST_QUARANTINED 除く・最小注文数量以上）を緊急成行決済
         pf = self.oco_manager.load_portfolio()
         pf["is_paused"] = True
         self.oco_manager.save_portfolio(pf, now_dt=now_jst)
+        rules_map = getattr(self.oco_manager, "symbol_rules", None) or {}
         symbols_to_close = [
             str(p.get("symbol", "")).upper()
             for p in (pf.get("positions", []) or [])
             if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
-            and float(p.get("size", 0) or 0) > 0
+            and float(p.get("size", 0) or 0)
+            >= float(rules_map.get(str(p.get("symbol", "")).upper(), {}).get("min_order_size", 0.0001) or 0.0001)
         ]
         closed_trades: List[Dict[str, Any]] = []
         for sym in symbols_to_close:
@@ -668,10 +670,27 @@ class RemoteControlManager:
                     target_nonce = str(payload_dict.get("target_nonce", "") or (parts[1] if len(parts) > 1 else "")).strip()
                     res = self.confirm_flatten_all(nonce=target_nonce, actor_id=actor, now_dt=now_jst)
                 else:
+                    if nonce and hasattr(self.db_wal, "mark_control_command"):
+                        self.db_wal.mark_control_command(
+                            nonce=nonce,
+                            status="REJECTED",
+                            now_ts_ms=int(now_jst.timestamp() * 1000),
+                        )
+                    self._record_consumed_nonce(nonce)
                     continue
                 self.db_wal.confirm_and_execute_command(nonce=nonce, actor_id=actor, now_dt=now_jst)
                 self._record_consumed_nonce(nonce)
                 executed_results.append(res)
             except Exception as exc:
+                if nonce and hasattr(self.db_wal, "mark_control_command"):
+                    try:
+                        self.db_wal.mark_control_command(
+                            nonce=nonce,
+                            status="REJECTED",
+                            now_ts_ms=int(now_jst.timestamp() * 1000),
+                        )
+                    except Exception:
+                        pass
+                self._record_consumed_nonce(nonce)
                 logger.warning("control_commands ポーリング実行スキップ (nonce=%s, cmd=%s): %s", nonce, cmd, exc)
         return executed_results
