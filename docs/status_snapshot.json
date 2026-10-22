@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-23T00:57:42+09:00",
+  "timestamp": "2026-10-23T01:12:48+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -107,10 +107,10 @@
     "phase2_freeze_start_jst": "2027-12-09T22:00:00+09:00",
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 258,
-    "remaining_hours": 23,
-    "remaining_minutes": 2,
-    "remaining_total_seconds": 22374137,
-    "countdown_text": "第1回締め(2027/7/9) 残り 258日 23時間 02分",
+    "remaining_hours": 22,
+    "remaining_minutes": 47,
+    "remaining_total_seconds": 22373231,
+    "countdown_text": "第1回締め(2027/7/9) 残り 258日 22時間 47分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -121,8 +121,8 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 376764.0,
-        "estimated_value_jpy": 288.8,
+        "current_bid": 376002.0,
+        "estimated_value_jpy": 288.2,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
     ]
@@ -163,7 +163,6 @@
     "status": "RADAR_SKIPPED_AI"
   },
   "logs": [
-    "2026-10-22 18:40:28,580 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 18:55:33,984 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-22 19:04:54,722 [INFO] auto_trader: === GMO AI Trader v2 デーモン起動 (mode=LIVE, fast=15s, radar=900s, expiry=4.0h) ===",
     "2026-10-22 19:04:57,554 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
@@ -192,99 +191,100 @@
     "2026-10-23 00:12:24,647 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 00:27:30,325 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 00:42:36,595 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
-    "2026-10-23 00:57:42,537 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
+    "2026-10-23 00:57:42,537 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-23 01:12:48,369 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12828480.0,
-      "bid": 12828479.0,
+      "ask": 12812171.0,
+      "bid": 12811112.0,
       "high": 13397513.0,
       "low": 12789400.0,
-      "last": 12828480.0,
-      "volume": 179.27205,
-      "trading_value_24h": 2299787907.98,
-      "spread": 1.0,
-      "spread_pct": 0.0,
-      "timestamp": "2026-10-22T15:57:41.180Z"
+      "last": 12819520.0,
+      "volume": 177.7405,
+      "trading_value_24h": 2278547894.56,
+      "spread": 1059.0,
+      "spread_pct": 0.0083,
+      "timestamp": "2026-10-22T16:12:46.692Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 376775.0,
-      "bid": 376764.0,
+      "ask": 376067.0,
+      "bid": 376002.0,
       "high": 395299.0,
       "low": 375156.0,
-      "last": 376763.0,
-      "volume": 3449.7187,
-      "trading_value_24h": 1299726366.57,
-      "spread": 11.0,
-      "spread_pct": 0.0029,
-      "timestamp": "2026-10-22T15:57:41.128Z"
+      "last": 376584.0,
+      "volume": 3441.3815,
+      "trading_value_24h": 1295969210.8,
+      "spread": 65.0,
+      "spread_pct": 0.0173,
+      "timestamp": "2026-10-22T16:12:47.615Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 43173.0,
-      "bid": 43099.0,
+      "ask": 43098.0,
+      "bid": 43044.0,
       "high": 45589.0,
       "low": 42947.0,
       "last": 43098.0,
-      "volume": 245.296,
-      "trading_value_24h": 10571767.01,
-      "spread": 74.0,
-      "spread_pct": 0.1717,
-      "timestamp": "2026-10-22T15:57:40.967Z"
+      "volume": 243.796,
+      "trading_value_24h": 10507120.01,
+      "spread": 54.0,
+      "spread_pct": 0.1255,
+      "timestamp": "2026-10-22T16:12:47.615Z"
     },
     "LTC": {
       "symbol": "LTC",
-      "ask": 9249.0,
-      "bid": 9246.0,
+      "ask": 9253.0,
+      "bid": 9224.0,
       "high": 9810.0,
       "low": 9200.0,
-      "last": 9246.0,
-      "volume": 907.22,
-      "trading_value_24h": 8388156.12,
-      "spread": 3.0,
-      "spread_pct": 0.0324,
-      "timestamp": "2026-10-22T15:57:41.132Z"
+      "last": 9263.0,
+      "volume": 912.03,
+      "trading_value_24h": 8448133.89,
+      "spread": 29.0,
+      "spread_pct": 0.3144,
+      "timestamp": "2026-10-22T16:12:47.607Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 207.625,
-      "bid": 207.57,
+      "ask": 207.605,
+      "bid": 207.47,
       "high": 219.149,
       "low": 206.704,
-      "last": 207.625,
-      "volume": 2873419.0,
-      "trading_value_24h": 596593619.88,
-      "spread": 0.05500000000000682,
-      "spread_pct": 0.0265,
-      "timestamp": "2026-10-22T15:57:41.343Z"
+      "last": 208.125,
+      "volume": 2830732.0,
+      "trading_value_24h": 589146097.5,
+      "spread": 0.1349999999999909,
+      "spread_pct": 0.0651,
+      "timestamp": "2026-10-22T16:12:47.648Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.433,
-      "bid": 12.429,
+      "ask": 12.426,
+      "bid": 12.408,
       "high": 13.137,
       "low": 12.384,
-      "last": 12.42,
-      "volume": 2984573.0,
-      "trading_value_24h": 37068396.66,
-      "spread": 0.0039999999999995595,
-      "spread_pct": 0.0322,
-      "timestamp": "2026-10-22T15:57:41.151Z"
+      "last": 12.459,
+      "volume": 2927571.0,
+      "trading_value_24h": 36474607.09,
+      "spread": 0.018000000000000682,
+      "spread_pct": 0.1451,
+      "timestamp": "2026-10-22T16:12:47.584Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16441.0,
-      "bid": 16440.0,
+      "ask": 16406.0,
+      "bid": 16400.0,
       "high": 17130.0,
       "low": 16263.0,
-      "last": 16432.0,
-      "volume": 14532.58,
-      "trading_value_24h": 238799354.56,
-      "spread": 1.0,
-      "spread_pct": 0.0061,
-      "timestamp": "2026-10-22T15:57:41.116Z"
+      "last": 16434.0,
+      "volume": 14536.48,
+      "trading_value_24h": 238892512.32,
+      "spread": 6.0,
+      "spread_pct": 0.0366,
+      "timestamp": "2026-10-22T16:12:47.273Z"
     }
   },
   "static_snapshot": true
