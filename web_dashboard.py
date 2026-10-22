@@ -28,6 +28,7 @@ import logging
 import os
 import socket
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -72,7 +73,85 @@ DEFAULT_PHASE1_END_JST = "2027-07-09T00:00:00+09:00"
 DEFAULT_PHASE2_START_JST = "2027-07-10T00:00:00+09:00"
 DEFAULT_PHASE2_END_JST = "2027-12-10T00:00:00+09:00"
 DEFAULT_PRE_DEADLINE_FREEZE_HOURS = 2.0
-DEFAULT_GITHUB_PAGES_URL = "https://qanojisan.github.io/gmo-ai-trader/"
+DEFAULT_GITHUB_PAGES_URL = "https://qanojisan.github.io/gmo-ai-trader-auto/"
+
+_GIT_PUSH_LOCK = threading.Lock()
+
+
+def push_docs_snapshot_async(base_dir: Path) -> None:
+    """
+    本番ワークスペース (`BASE_DIR`) で `docs/` が更新された際、
+    バックグラウンドスレッドで `docs/` の変更のみを GitHub (`origin main`) へ自動コミット＆プッシュする。
+    （※単体テストの一時ディレクトリやリモート未設定環境では何もしない）
+    """
+    try:
+        resolved = Path(base_dir).resolve()
+        if resolved != BASE_DIR.resolve() or not (resolved / ".git").exists():
+            return
+    except Exception:
+        return
+
+    def _worker() -> None:
+        if not _GIT_PUSH_LOCK.acquire(blocking=False):
+            return
+        try:
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            r_remote = subprocess.run(
+                ["git", "-C", str(resolved), "remote", "get-url", "origin"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=creation_flags,
+            )
+            if r_remote.returncode != 0 or not r_remote.stdout.strip():
+                return
+
+            subprocess.run(
+                ["git", "-C", str(resolved), "add", "docs/"],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=creation_flags,
+            )
+            r_diff = subprocess.run(
+                ["git", "-C", str(resolved), "diff", "--cached", "--quiet", "--", "docs/"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                creationflags=creation_flags,
+            )
+            if r_diff.returncode == 0:
+                return
+
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(resolved),
+                    "commit",
+                    "-m",
+                    "chore(pwa-snapshot): auto-update v2 status_snapshot.json [skip ci]",
+                    "--",
+                    "docs/",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                creationflags=creation_flags,
+            )
+            subprocess.run(
+                ["git", "-C", str(resolved), "push", "origin", "main"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                creationflags=creation_flags,
+            )
+        except Exception as exc:
+            logger.debug("Auto push docs skipped: %s", exc)
+        finally:
+            _GIT_PUSH_LOCK.release()
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
@@ -444,9 +523,9 @@ def generate_qr_svg(text: str, box_size: int = 6, border: int = 3) -> str:
 # ============================================================================
 # 3. PWA Manifest & Service Worker 定義
 # ============================================================================
-def build_pwa_manifest(start_url: str = "./") -> Dict[str, Any]:
+def build_pwa_manifest(start_url: str = "./index.html") -> Dict[str, Any]:
     return {
-        "name": "GMO AI Trader v2",
+        "name": "GMO AI Trader v2 (Full-Auto)",
         "short_name": "AI Trader v2",
         "description": "GMOコイン 24時間現物全自動売買システム (v2) モバイル＆PC管理アプリ",
         "start_url": start_url,
@@ -457,19 +536,19 @@ def build_pwa_manifest(start_url: str = "./") -> Dict[str, Any]:
         "theme_color": "#0b0f19",
         "icons": [
             {
-                "src": "icon-192.png",
+                "src": "./icon-192.png",
                 "sizes": "192x192",
                 "type": "image/png",
                 "purpose": "any maskable",
             },
             {
-                "src": "icon-512.png",
+                "src": "./icon-512.png",
                 "sizes": "512x512",
                 "type": "image/png",
                 "purpose": "any maskable",
             },
             {
-                "src": "icon.svg",
+                "src": "./icon.svg",
                 "sizes": "any",
                 "type": "image/svg+xml",
                 "purpose": "any maskable",
@@ -479,9 +558,10 @@ def build_pwa_manifest(start_url: str = "./") -> Dict[str, Any]:
 
 
 SERVICE_WORKER_JS = r"""// GMO AI Trader v2 - Service Worker (sw.js)
-const CACHE_NAME = 'gmo-ai-trader-v2-pwa-v1';
+const CACHE_NAME = 'gmo-ai-trader-v2-pwa-v2';
 const APP_SHELL = [
   './',
+  './index.html',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',
@@ -1152,9 +1232,9 @@ class WebDashboardService:
         pf_after = self.oco_manager.load_portfolio()
         is_paused_after = bool(pf_after.get("is_paused", False))
 
-        # 状態変更後に docs/status_snapshot.json も非同期更新
+        # 状態変更後に docs/status_snapshot.json も非同期更新＆GitHub Pagesへ自動Push
         try:
-            self.export_static_pwa_bundle(include_charts=False, now_dt=now_jst)
+            self.export_static_pwa_bundle(include_charts=False, now_dt=now_jst, auto_push=True)
         except Exception:
             pass
 
@@ -1188,6 +1268,7 @@ class WebDashboardService:
         output_dir: Optional[Path] = None,
         include_charts: bool = True,
         now_dt: Optional[datetime] = None,
+        auto_push: bool = False,
     ) -> Dict[str, Any]:
         """
         外出先 (GitHub Pages 等) からスマートフォン PWA として閲覧するための静的アセット一式と
@@ -1197,11 +1278,16 @@ class WebDashboardService:
         target_dir = Path(output_dir) if output_dir is not None else self.docs_dir
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. PWA 静的シェル (index.html, manifest.json, sw.js, icons)
+        lan_url = f"http://{self.lan_ip}:{self.port}"
+        gh_url = self.github_pages_url
+
+        # 1. PWA 静的シェル (index.html, manifest.json, sw.js, icons, static QR codes)
         atomic_write_text(target_dir / "index.html", DASHBOARD_HTML)
-        atomic_write_text(target_dir / "manifest.json", dumps_json(build_pwa_manifest(start_url="./"), indent=2))
+        atomic_write_text(target_dir / "manifest.json", dumps_json(build_pwa_manifest(start_url="./index.html"), indent=2))
         atomic_write_text(target_dir / "sw.js", SERVICE_WORKER_JS)
         atomic_write_text(target_dir / "icon.svg", generate_app_icon_svg())
+        atomic_write_text(target_dir / "qr-lan.svg", generate_qr_svg(lan_url))
+        atomic_write_text(target_dir / "qr-gh.svg", generate_qr_svg(gh_url))
         (target_dir / "icon-192.png").write_bytes(generate_app_icon_png(192))
         (target_dir / "icon-512.png").write_bytes(generate_app_icon_png(512))
 
@@ -1221,6 +1307,9 @@ class WebDashboardService:
                     pass
             atomic_write_text(chart_snap_path, dumps_json(charts_map, indent=None))
 
+        if auto_push and target_dir.resolve() == self.docs_dir.resolve():
+            push_docs_snapshot_async(self.base_dir)
+
         return {
             "ok": True,
             "output_dir": str(target_dir),
@@ -1231,6 +1320,8 @@ class WebDashboardService:
                 "icon-192.png",
                 "icon-512.png",
                 "icon.svg",
+                "qr-lan.svg",
+                "qr-gh.svg",
                 "status_snapshot.json",
                 "chart_snapshots.json",
             ],
@@ -1247,10 +1338,10 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="AI Trader v2">
 <meta name="theme-color" content="#0b0f19">
-<link rel="manifest" href="manifest.json">
-<link rel="apple-touch-icon" href="icon-192.png">
-<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
-<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="manifest" href="./manifest.json">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png">
+<link rel="icon" type="image/svg+xml" href="./icon.svg">
 <title>GMO AI Trader v2 — 24/7 自動売買アプリ</title>
 <style>
   :root {
@@ -1862,9 +1953,9 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
         <div style="font-size:0.72rem; color:var(--text-secondary);">PAUSE / RESUME 等の全ボタン操作が可能</div>
       </div>
       <div class="qr-card">
-        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（GitHub Pages 閲覧）</div>
+        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（v2専用 GitHub Pages）</div>
         <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
-        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader/</a>
+        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
         <div style="font-size:0.72rem; color:var(--text-secondary);">外出先から最新スナップショット＆チャートを確認</div>
       </div>
     </div>
@@ -1913,9 +2004,11 @@ let currentFlattenNonce = "";
 let lastChartData = null;
 let lastEquityCurve = [];
 let isStaticSnapshotMode = false;
+let activeApiBase = ".";
+let latestStatusData = null;
 let latestNetworkInfo = {
   lan_url: "http://192.168.11.3:8080",
-  github_pages_url: "https://qanojisan.github.io/gmo-ai-trader/"
+  github_pages_url: "https://qanojisan.github.io/gmo-ai-trader-auto/"
 };
 
 function fmtJpy(val, showSign=false) {
@@ -1970,33 +2063,76 @@ function renderToolbarChips(tickers={}) {
   });
 }
 
-async function fetchStatus() {
+async function fetchWithTimeout(url, options={}, timeoutMs=2000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`./api/status?_t=${Date.now()}`, { cache: "no-store" });
-    if (!res.ok) throw new Error("API status not available");
-    const data = await res.json();
-    isStaticSnapshotMode = false;
-    updateDashboardUI(data);
-    return;
-  } catch (_) {
-    // 外出先 (GitHub Pages 静的配信環境) の場合は status_snapshot.json へ自動フォールバック
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+async function fetchStatus() {
+  // 1. 同一オリジン (/api/status) への通信を試行 (PC local / 自宅Wi-Fi LAN 直接アクセス時)
+  if (!location.hostname.endsWith("github.io")) {
     try {
-      const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
-      if (snapRes.ok) {
-        const snapData = await snapRes.json();
-        isStaticSnapshotMode = true;
-        updateDashboardUI(snapData);
+      const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (res.ok && ct.includes("json")) {
+        const data = await res.json();
+        activeApiBase = ".";
+        isStaticSnapshotMode = false;
+        latestStatusData = data;
+        updateDashboardUI(data);
+        return;
       }
-    } catch (err) {
-      console.error("Snapshot fallback error:", err);
+    } catch (_) {}
+  }
+
+  // 2. GitHub Pages 等から開いている場合、まず status_snapshot.json を読み込みつつ、自宅Wi-Fi LAN API への直接接続も試行
+  let snapData = null;
+  try {
+    const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+    if (snapRes.ok) {
+      snapData = await snapRes.json();
+      if (snapData && snapData.network_info) {
+        latestNetworkInfo = snapData.network_info;
+      }
     }
+  } catch (_) {}
+
+  const lanCandidate = (latestNetworkInfo && latestNetworkInfo.lan_url) || "http://192.168.11.3:8080";
+  try {
+    const lanRes = await fetchWithTimeout(`${lanCandidate}/api/status?_t=${Date.now()}`, { cache: "no-store", mode: "cors" }, 1800);
+    if (lanRes.ok) {
+      const liveData = await lanRes.json();
+      activeApiBase = lanCandidate;
+      isStaticSnapshotMode = false;
+      latestStatusData = liveData;
+      updateDashboardUI(liveData);
+      return;
+    }
+  } catch (_) {}
+
+  // 3. 外出先 (4G/5G) または HTTPS 混在制限時は status_snapshot.json で表示
+  if (snapData) {
+    activeApiBase = ".";
+    isStaticSnapshotMode = true;
+    latestStatusData = snapData;
+    updateDashboardUI(snapData);
   }
 }
 
 async function fetchChart() {
   try {
+    // 1. ローカル/LAN バックエンド接続時
     if (!isStaticSnapshotMode) {
-      const res = await fetch(`./api/chart?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&_t=${Date.now()}`, { cache: "no-store" });
+      const res = await fetchWithTimeout(
+        `${activeApiBase}/api/chart?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&_t=${Date.now()}`,
+        { cache: "no-store" },
+        3500
+      );
       if (res.ok) {
         const data = await res.json();
         lastChartData = data;
@@ -2004,7 +2140,55 @@ async function fetchChart() {
         return;
       }
     }
-    // 静的スナップショットフォールバック
+
+    // 2. 外出先 (GitHub Pages) の場合: GMO Public API からの直接取得を試み、CORS制限時は chart_snapshots.json へ自動フォールバック
+    try {
+      const jstNow = new Date(Date.now() + 9 * 3600 * 1000);
+      const yStr = String(jstNow.getUTCFullYear());
+      const mStr = String(jstNow.getUTCMonth() + 1).padStart(2, "0");
+      const dStr = String(jstNow.getUTCDate()).padStart(2, "0");
+      const dateParam = selectedInterval === "1day" ? yStr : `${yStr}${mStr}${dStr}`;
+      const gmoRes = await fetchWithTimeout(
+        `https://api.coin.z.com/public/v1/klines?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&date=${dateParam}`,
+        { cache: "no-store" },
+        2200
+      );
+      if (gmoRes.ok) {
+        const gmoJson = await gmoRes.json();
+        const rawList = (gmoJson && gmoJson.data) || [];
+        if (rawList.length > 0) {
+          const candles = rawList.slice(-72).map(r => {
+            const ms = Number(r.openTime || 0);
+            const dt = new Date(ms + 9 * 3600 * 1000);
+            const lbl = `${String(dt.getUTCMonth()+1).padStart(2,"0")}/${String(dt.getUTCDate()).padStart(2,"0")} ${String(dt.getUTCHours()).padStart(2,"0")}:${String(dt.getUTCMinutes()).padStart(2,"0")}`;
+            return {
+              open_time: ms,
+              time_label: lbl,
+              open: Number(r.open),
+              high: Number(r.high),
+              low: Number(r.low),
+              close: Number(r.close),
+              volume: Number(r.volume || 0)
+            };
+          });
+          const tMap = (latestStatusData && latestStatusData.tickers) || {};
+          const tk = tMap[selectedSymbol] || { last: candles[candles.length - 1].close, bid: candles[candles.length - 1].close, ask: candles[candles.length - 1].close };
+          const liveChart = {
+            symbol: selectedSymbol,
+            interval: selectedInterval,
+            timestamp: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 19) + "+09:00",
+            ticker: tk,
+            candles: candles,
+            overlays: {}
+          };
+          lastChartData = liveChart;
+          drawPriceChart(liveChart);
+          return;
+        }
+      }
+    } catch (_) {}
+
+    // 3. 静的スナップショット (chart_snapshots.json) フォールバック
     const snapRes = await fetch(`./chart_snapshots.json?_t=${Date.now()}`, { cache: "no-store" });
     if (snapRes.ok) {
       const map = await snapRes.json();
@@ -2362,7 +2546,7 @@ async function sendControl(command, nonce="") {
     return null;
   }
   try {
-    const res = await fetch("./api/control", {
+    const res = await fetch(`${activeApiBase}/api/control`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ command, nonce })
@@ -2426,7 +2610,7 @@ async function confirmFlattenAll() {
 async function openQrModal() {
   document.getElementById("qrModal").style.display = "flex";
   const lanUrl = latestNetworkInfo.lan_url || "http://192.168.11.3:8080";
-  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader/";
+  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader-auto/";
   const lanLink = document.getElementById("qrLanLink");
   const ghLink = document.getElementById("qrGhLink");
   lanLink.href = lanUrl;
@@ -2436,11 +2620,23 @@ async function openQrModal() {
 
   try {
     const [r1, r2] = await Promise.all([
-      fetch(`./api/qr?text=${encodeURIComponent(lanUrl)}`),
-      fetch(`./api/qr?text=${encodeURIComponent(ghUrl)}`)
+      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(lanUrl)}`, {}, 2000).catch(() => fetch("./qr-lan.svg")),
+      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(ghUrl)}`, {}, 2000).catch(() => fetch("./qr-gh.svg"))
     ]);
-    if (r1.ok) document.getElementById("qrLanHolder").innerHTML = await r1.text();
-    if (r2.ok) document.getElementById("qrGhHolder").innerHTML = await r2.text();
+    if (r1 && r1.ok) {
+      const t1 = await r1.text();
+      if (t1.includes("<svg")) document.getElementById("qrLanHolder").innerHTML = t1;
+    } else {
+      const f1 = await fetch("./qr-lan.svg");
+      if (f1.ok) document.getElementById("qrLanHolder").innerHTML = await f1.text();
+    }
+    if (r2 && r2.ok) {
+      const t2 = await r2.text();
+      if (t2.includes("<svg")) document.getElementById("qrGhHolder").innerHTML = t2;
+    } else {
+      const f2 = await fetch("./qr-gh.svg");
+      if (f2.ok) document.getElementById("qrGhHolder").innerHTML = await f2.text();
+    }
   } catch (_) {}
 }
 
@@ -2486,8 +2682,15 @@ def make_dashboard_handler(service: WebDashboardService):
         def log_message(self, format: str, *args: Any) -> None:
             logger.debug("HTTP %s - %s", self.address_string(), format % args)
 
+        def _send_cors_headers(self) -> None:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.send_header("Access-Control-Allow-Private-Network", "true")
+
         def _send_bytes(self, status_code: int, content_type: str, data: bytes, cache_control: str = "no-store") -> None:
             self.send_response(status_code)
+            self._send_cors_headers()
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", cache_control)
@@ -2497,6 +2700,12 @@ def make_dashboard_handler(service: WebDashboardService):
         def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
             raw = dumps_json(payload, indent=None).encode("utf-8")
             self._send_bytes(status_code, "application/json; charset=utf-8", raw)
+
+        def do_OPTIONS(self) -> None:
+            self.send_response(HTTPStatus.NO_CONTENT)
+            self._send_cors_headers()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)
@@ -2508,7 +2717,7 @@ def make_dashboard_handler(service: WebDashboardService):
                 return
 
             if path == "/manifest.json":
-                manifest = build_pwa_manifest(start_url="/")
+                manifest = build_pwa_manifest(start_url="./index.html")
                 self._send_bytes(
                     HTTPStatus.OK,
                     "application/manifest+json; charset=utf-8",
@@ -2539,6 +2748,16 @@ def make_dashboard_handler(service: WebDashboardService):
                     generate_app_icon_svg().encode("utf-8"),
                     cache_control="public, max-age=3600",
                 )
+                return
+
+            if path == "/qr-lan.svg":
+                svg = generate_qr_svg(f"http://{service.lan_ip}:{service.port}")
+                self._send_bytes(HTTPStatus.OK, "image/svg+xml; charset=utf-8", svg.encode("utf-8"))
+                return
+
+            if path == "/qr-gh.svg":
+                svg = generate_qr_svg(service.github_pages_url)
+                self._send_bytes(HTTPStatus.OK, "image/svg+xml; charset=utf-8", svg.encode("utf-8"))
                 return
 
             if path == "/api/qr":

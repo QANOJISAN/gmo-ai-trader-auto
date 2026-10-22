@@ -1,7 +1,8 @@
 // GMO AI Trader v2 - Service Worker (sw.js)
-const CACHE_NAME = 'gmo-ai-trader-v2-pwa-v1';
+const CACHE_NAME = 'gmo-ai-trader-v2-pwa-v2';
 const APP_SHELL = [
   './',
+  './index.html',
   './manifest.json',
   './icon-192.png',
   './icon-512.png',

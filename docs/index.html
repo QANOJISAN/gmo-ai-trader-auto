@@ -8,10 +8,10 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="AI Trader v2">
 <meta name="theme-color" content="#0b0f19">
-<link rel="manifest" href="manifest.json">
-<link rel="apple-touch-icon" href="icon-192.png">
-<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
-<link rel="icon" type="image/svg+xml" href="icon.svg">
+<link rel="manifest" href="./manifest.json">
+<link rel="apple-touch-icon" href="./icon-192.png">
+<link rel="icon" type="image/png" sizes="192x192" href="./icon-192.png">
+<link rel="icon" type="image/svg+xml" href="./icon.svg">
 <title>GMO AI Trader v2 — 24/7 自動売買アプリ</title>
 <style>
   :root {
@@ -623,9 +623,9 @@
         <div style="font-size:0.72rem; color:var(--text-secondary);">PAUSE / RESUME 等の全ボタン操作が可能</div>
       </div>
       <div class="qr-card">
-        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（GitHub Pages 閲覧）</div>
+        <div style="font-size:0.82rem; font-weight:700; color:#d8b4fe;">🌐 外出先 4G/5G（v2専用 GitHub Pages）</div>
         <div id="qrGhHolder" class="qr-svg-holder">読み込み中...</div>
-        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader/</a>
+        <a id="qrGhLink" href="#" target="_blank" style="font-family:monospace; font-size:0.8rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
         <div style="font-size:0.72rem; color:var(--text-secondary);">外出先から最新スナップショット＆チャートを確認</div>
       </div>
     </div>
@@ -674,9 +674,11 @@ let currentFlattenNonce = "";
 let lastChartData = null;
 let lastEquityCurve = [];
 let isStaticSnapshotMode = false;
+let activeApiBase = ".";
+let latestStatusData = null;
 let latestNetworkInfo = {
   lan_url: "http://192.168.11.3:8080",
-  github_pages_url: "https://qanojisan.github.io/gmo-ai-trader/"
+  github_pages_url: "https://qanojisan.github.io/gmo-ai-trader-auto/"
 };
 
 function fmtJpy(val, showSign=false) {
@@ -731,33 +733,76 @@ function renderToolbarChips(tickers={}) {
   });
 }
 
-async function fetchStatus() {
+async function fetchWithTimeout(url, options={}, timeoutMs=2000) {
+  const ctrl = new AbortController();
+  const id = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(`./api/status?_t=${Date.now()}`, { cache: "no-store" });
-    if (!res.ok) throw new Error("API status not available");
-    const data = await res.json();
-    isStaticSnapshotMode = false;
-    updateDashboardUI(data);
-    return;
-  } catch (_) {
-    // 外出先 (GitHub Pages 静的配信環境) の場合は status_snapshot.json へ自動フォールバック
+    return await fetch(url, { ...options, signal: ctrl.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+async function fetchStatus() {
+  // 1. 同一オリジン (/api/status) への通信を試行 (PC local / 自宅Wi-Fi LAN 直接アクセス時)
+  if (!location.hostname.endsWith("github.io")) {
     try {
-      const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
-      if (snapRes.ok) {
-        const snapData = await snapRes.json();
-        isStaticSnapshotMode = true;
-        updateDashboardUI(snapData);
+      const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
+      const ct = (res.headers.get("content-type") || "").toLowerCase();
+      if (res.ok && ct.includes("json")) {
+        const data = await res.json();
+        activeApiBase = ".";
+        isStaticSnapshotMode = false;
+        latestStatusData = data;
+        updateDashboardUI(data);
+        return;
       }
-    } catch (err) {
-      console.error("Snapshot fallback error:", err);
+    } catch (_) {}
+  }
+
+  // 2. GitHub Pages 等から開いている場合、まず status_snapshot.json を読み込みつつ、自宅Wi-Fi LAN API への直接接続も試行
+  let snapData = null;
+  try {
+    const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+    if (snapRes.ok) {
+      snapData = await snapRes.json();
+      if (snapData && snapData.network_info) {
+        latestNetworkInfo = snapData.network_info;
+      }
     }
+  } catch (_) {}
+
+  const lanCandidate = (latestNetworkInfo && latestNetworkInfo.lan_url) || "http://192.168.11.3:8080";
+  try {
+    const lanRes = await fetchWithTimeout(`${lanCandidate}/api/status?_t=${Date.now()}`, { cache: "no-store", mode: "cors" }, 1800);
+    if (lanRes.ok) {
+      const liveData = await lanRes.json();
+      activeApiBase = lanCandidate;
+      isStaticSnapshotMode = false;
+      latestStatusData = liveData;
+      updateDashboardUI(liveData);
+      return;
+    }
+  } catch (_) {}
+
+  // 3. 外出先 (4G/5G) または HTTPS 混在制限時は status_snapshot.json で表示
+  if (snapData) {
+    activeApiBase = ".";
+    isStaticSnapshotMode = true;
+    latestStatusData = snapData;
+    updateDashboardUI(snapData);
   }
 }
 
 async function fetchChart() {
   try {
+    // 1. ローカル/LAN バックエンド接続時
     if (!isStaticSnapshotMode) {
-      const res = await fetch(`./api/chart?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&_t=${Date.now()}`, { cache: "no-store" });
+      const res = await fetchWithTimeout(
+        `${activeApiBase}/api/chart?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&_t=${Date.now()}`,
+        { cache: "no-store" },
+        3500
+      );
       if (res.ok) {
         const data = await res.json();
         lastChartData = data;
@@ -765,7 +810,55 @@ async function fetchChart() {
         return;
       }
     }
-    // 静的スナップショットフォールバック
+
+    // 2. 外出先 (GitHub Pages) の場合: GMO Public API からの直接取得を試み、CORS制限時は chart_snapshots.json へ自動フォールバック
+    try {
+      const jstNow = new Date(Date.now() + 9 * 3600 * 1000);
+      const yStr = String(jstNow.getUTCFullYear());
+      const mStr = String(jstNow.getUTCMonth() + 1).padStart(2, "0");
+      const dStr = String(jstNow.getUTCDate()).padStart(2, "0");
+      const dateParam = selectedInterval === "1day" ? yStr : `${yStr}${mStr}${dStr}`;
+      const gmoRes = await fetchWithTimeout(
+        `https://api.coin.z.com/public/v1/klines?symbol=${encodeURIComponent(selectedSymbol)}&interval=${encodeURIComponent(selectedInterval)}&date=${dateParam}`,
+        { cache: "no-store" },
+        2200
+      );
+      if (gmoRes.ok) {
+        const gmoJson = await gmoRes.json();
+        const rawList = (gmoJson && gmoJson.data) || [];
+        if (rawList.length > 0) {
+          const candles = rawList.slice(-72).map(r => {
+            const ms = Number(r.openTime || 0);
+            const dt = new Date(ms + 9 * 3600 * 1000);
+            const lbl = `${String(dt.getUTCMonth()+1).padStart(2,"0")}/${String(dt.getUTCDate()).padStart(2,"0")} ${String(dt.getUTCHours()).padStart(2,"0")}:${String(dt.getUTCMinutes()).padStart(2,"0")}`;
+            return {
+              open_time: ms,
+              time_label: lbl,
+              open: Number(r.open),
+              high: Number(r.high),
+              low: Number(r.low),
+              close: Number(r.close),
+              volume: Number(r.volume || 0)
+            };
+          });
+          const tMap = (latestStatusData && latestStatusData.tickers) || {};
+          const tk = tMap[selectedSymbol] || { last: candles[candles.length - 1].close, bid: candles[candles.length - 1].close, ask: candles[candles.length - 1].close };
+          const liveChart = {
+            symbol: selectedSymbol,
+            interval: selectedInterval,
+            timestamp: new Date(Date.now() + 9 * 3600 * 1000).toISOString().slice(0, 19) + "+09:00",
+            ticker: tk,
+            candles: candles,
+            overlays: {}
+          };
+          lastChartData = liveChart;
+          drawPriceChart(liveChart);
+          return;
+        }
+      }
+    } catch (_) {}
+
+    // 3. 静的スナップショット (chart_snapshots.json) フォールバック
     const snapRes = await fetch(`./chart_snapshots.json?_t=${Date.now()}`, { cache: "no-store" });
     if (snapRes.ok) {
       const map = await snapRes.json();
@@ -1123,7 +1216,7 @@ async function sendControl(command, nonce="") {
     return null;
   }
   try {
-    const res = await fetch("./api/control", {
+    const res = await fetch(`${activeApiBase}/api/control`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ command, nonce })
@@ -1187,7 +1280,7 @@ async function confirmFlattenAll() {
 async function openQrModal() {
   document.getElementById("qrModal").style.display = "flex";
   const lanUrl = latestNetworkInfo.lan_url || "http://192.168.11.3:8080";
-  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader/";
+  const ghUrl = latestNetworkInfo.github_pages_url || "https://qanojisan.github.io/gmo-ai-trader-auto/";
   const lanLink = document.getElementById("qrLanLink");
   const ghLink = document.getElementById("qrGhLink");
   lanLink.href = lanUrl;
@@ -1197,11 +1290,23 @@ async function openQrModal() {
 
   try {
     const [r1, r2] = await Promise.all([
-      fetch(`./api/qr?text=${encodeURIComponent(lanUrl)}`),
-      fetch(`./api/qr?text=${encodeURIComponent(ghUrl)}`)
+      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(lanUrl)}`, {}, 2000).catch(() => fetch("./qr-lan.svg")),
+      fetchWithTimeout(`${activeApiBase}/api/qr?text=${encodeURIComponent(ghUrl)}`, {}, 2000).catch(() => fetch("./qr-gh.svg"))
     ]);
-    if (r1.ok) document.getElementById("qrLanHolder").innerHTML = await r1.text();
-    if (r2.ok) document.getElementById("qrGhHolder").innerHTML = await r2.text();
+    if (r1 && r1.ok) {
+      const t1 = await r1.text();
+      if (t1.includes("<svg")) document.getElementById("qrLanHolder").innerHTML = t1;
+    } else {
+      const f1 = await fetch("./qr-lan.svg");
+      if (f1.ok) document.getElementById("qrLanHolder").innerHTML = await f1.text();
+    }
+    if (r2 && r2.ok) {
+      const t2 = await r2.text();
+      if (t2.includes("<svg")) document.getElementById("qrGhHolder").innerHTML = t2;
+    } else {
+      const f2 = await fetch("./qr-gh.svg");
+      if (f2.ok) document.getElementById("qrGhHolder").innerHTML = await f2.text();
+    }
   } catch (_) {}
 }
 

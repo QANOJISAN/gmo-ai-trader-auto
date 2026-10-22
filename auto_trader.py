@@ -944,6 +944,9 @@ class AutoTraderDaemon:
                     now_dt=now_jst,
                 )
 
+            if events:
+                self._sync_pwa_snapshot(include_charts=False)
+
             self.record_api_success()
             return {
                 "status": "OK",
@@ -1297,8 +1300,8 @@ class AutoTraderDaemon:
                 "circuit_breaker": cb_info,
             }
 
-    def _sync_pwa_snapshot(self) -> None:
-        """本番ワークスペース稼働時に docs/ 以下の静的PWAスナップショットを最新状態へ同期する（秘密情報は一切含めない）"""
+    def _sync_pwa_snapshot(self, include_charts: bool = True) -> None:
+        """本番ワークスペース稼働時に docs/ 以下の静的PWAスナップショットを最新状態へ同期し、GitHub Pagesへ非同期Pushする"""
         if self.base_dir != BASE_DIR:
             return
         try:
@@ -1306,7 +1309,11 @@ class AutoTraderDaemon:
 
             svc = WebDashboardService(base_dir=self.base_dir, public_client=self.public_client)
             try:
-                svc.export_static_pwa_bundle(output_dir=self.base_dir / "docs")
+                svc.export_static_pwa_bundle(
+                    output_dir=self.base_dir / "docs",
+                    include_charts=include_charts,
+                    auto_push=True,
+                )
             finally:
                 svc.close()
         except Exception as exc:

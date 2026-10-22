@@ -2781,17 +2781,26 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 flt_conf = _post_ctrl({"command": "FLATTEN_CONFIRM", "nonce": flt_req["result"]["nonce"]})
                 self.assertTrue(flt_conf["ok"])
 
-                # (6) PWA 必須エンドポイント検証 (/manifest.json, /sw.js, /icon-192.png, /icon-512.png, /icon.svg, /api/qr)
+                # (6) PWA 必須エンドポイント検証 (/manifest.json, /sw.js, /icon-192.png, /icon-512.png, /icon.svg, /api/qr, CORS OPTIONS)
                 with urllib.request.urlopen(f"{base_url}/manifest.json", timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
+                    self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
                     manifest = json.loads(resp.read().decode("utf-8"))
-                    self.assertEqual(manifest["name"], "GMO AI Trader v2")
+                    self.assertEqual(manifest["name"], "GMO AI Trader v2 (Full-Auto)")
                     self.assertEqual(manifest["short_name"], "AI Trader v2")
+                    self.assertEqual(manifest["start_url"], "./index.html")
+                    self.assertEqual(manifest["scope"], "./")
                     self.assertEqual(manifest["display"], "standalone")
                     self.assertEqual(manifest["orientation"], "portrait")
                     self.assertEqual(manifest["background_color"], "#0b0f19")
                     self.assertEqual(manifest["theme_color"], "#0b0f19")
                     self.assertGreaterEqual(len(manifest["icons"]), 2)
+                    self.assertEqual(manifest["icons"][0]["src"], "./icon-192.png")
+
+                opt_req = urllib.request.Request(f"{base_url}/api/control", method="OPTIONS")
+                with urllib.request.urlopen(opt_req, timeout=5) as resp:
+                    self.assertEqual(resp.status, 204)
+                    self.assertEqual(resp.headers.get("Access-Control-Allow-Origin"), "*")
 
                 with urllib.request.urlopen(f"{base_url}/sw.js", timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
@@ -2826,6 +2835,7 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 self.assertIn("network_info", st)
                 self.assertIn("lan_ip", st["network_info"])
                 self.assertIn("lan_url", st["network_info"])
+                self.assertEqual(st["network_info"]["github_pages_url"], "https://qanojisan.github.io/gmo-ai-trader-auto/")
 
                 export_res = svc.export_static_pwa_bundle(output_dir=tmp_dir / "docs")
                 self.assertTrue(export_res["ok"])
@@ -2836,6 +2846,8 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                     "icon-192.png",
                     "icon-512.png",
                     "icon.svg",
+                    "qr-lan.svg",
+                    "qr-gh.svg",
                     "status_snapshot.json",
                     "chart_snapshots.json",
                 ):
