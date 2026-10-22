@@ -1,0 +1,62 @@
+{
+  "probed_at": "2026-10-22T17:27:48+09:00",
+  "execution_mode": "LIVE",
+  "probe_symbol": "XRP",
+  "probe_size": "1",
+  "probe_limit_price": "177.65",
+  "probe_modified_price": "177.649",
+  "clock_offset_ms": -1414,
+  "schema_compatibility": {
+    "assets_schema_valid": true,
+    "active_orders_schema_valid": true,
+    "trading_volume_schema_valid": true
+  },
+  "limit_change_order_supported": true,
+  "limit_change_order_preserves_order_id": true,
+  "stop_change_order_supported": true,
+  "cancel_before_supported": true,
+  "ws_auth_put_delete_supported": true,
+  "trading_volume_supported": true,
+  "fee_schedule": {
+    "tier_level": 1,
+    "jpy_volume_30d": "0",
+    "spot_fees": {
+      "BTC": {
+        "maker_fee": "-0.0001",
+        "taker_fee": "0.0005"
+      },
+      "ETH": {
+        "maker_fee": "-0.0001",
+        "taker_fee": "0.0005"
+      },
+      "BCH": {
+        "maker_fee": "-0.0003",
+        "taker_fee": "0.0009"
+      },
+      "LTC": {
+        "maker_fee": "-0.0003",
+        "taker_fee": "0.0009"
+      },
+      "XRP": {
+        "maker_fee": "-0.0001",
+        "taker_fee": "0.0005"
+      },
+      "DOGE": {
+        "maker_fee": "-0.0003",
+        "taker_fee": "0.0009"
+      },
+      "SOL": {
+        "maker_fee": "-0.0003",
+        "taker_fee": "0.0009"
+      }
+    }
+  },
+  "cleanup_verified_zero_residual_orders": true,
+  "residual_probe_orders_count": 0,
+  "cleaned_order_ids": [
+    "9068603366",
+    "9068603367",
+    "9068603368"
+  ],
+  "cancel_before_market_fak_sell_only_enforced": true
+}

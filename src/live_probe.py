@@ -17,12 +17,15 @@ Live Capability Probe：GMOコイン実環境・Paper環境 API 挙動実測＆ 
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.database_wal import atomic_write_text
 from src.json_utils import dumps_json
+from src.validator import DEFAULT_SYMBOL_RULES, _to_decimal, format_decimal_plain, round_to_step
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +62,62 @@ class GMOCoinLiveProbe:
         self.deep_limit_price = str(deep_limit_price)
         self.deep_modified_price = str(deep_modified_price)
 
+    def _resolve_probe_params(self) -> Dict[str, str]:
+        """
+        実機 LIVE 環境（または public_client 接続時）に対象銘柄の現在値と最小ロットから
+        価格制限エラー (ERR-5121) を起こさず、かつ決して約定しない安全なプローブ価格・数量を算出する。
+        """
+        sym = self.probe_symbol.strip().upper()
+        rule = DEFAULT_SYMBOL_RULES.get(sym, {})
+        min_size_dec = _to_decimal(rule.get("min_order_size", self.probe_size), default=Decimal("1"))
+        tick_dec = _to_decimal(rule.get("tick_size", "0.001"), default=Decimal("0.001"))
+
+        is_live = str(getattr(self.broker, "MODE", "")).upper() == "LIVE"
+        pub = getattr(self.broker, "public_client", None)
+        if is_live and pub is not None and hasattr(pub, "get_tickers"):
+            try:
+                tickers = pub.get_tickers([sym])
+                t_info = tickers.get(sym, {}) if isinstance(tickers, dict) else {}
+                bid_dec = _to_decimal(t_info.get("bid", 0) or t_info.get("last", 0))
+                ask_dec = _to_decimal(t_info.get("ask", 0) or bid_dec)
+                if bid_dec > Decimal("0"):
+                    limit_dec = round_to_step(bid_dec * Decimal("0.85"), tick_dec, rounding=ROUND_DOWN)
+                    mod_dec = max(tick_dec, round_to_step(limit_dec - tick_dec, tick_dec, rounding=ROUND_DOWN))
+                    stop_dec = round_to_step(ask_dec * Decimal("1.15"), tick_dec, rounding=ROUND_DOWN)
+                    stop_mod_dec = round_to_step(stop_dec + tick_dec, tick_dec, rounding=ROUND_DOWN)
+                    return {
+                        "size": format_decimal_plain(min_size_dec),
+                        "limit_price": format_decimal_plain(limit_dec),
+                        "modified_price": format_decimal_plain(mod_dec),
+                        "stop_price": format_decimal_plain(stop_dec),
+                        "stop_modified_price": format_decimal_plain(stop_mod_dec),
+                    }
+            except Exception as exc:
+                logger.debug("LiveProbe ティッカー取得フォールバック (%s): %s", sym, exc)
+
+        return {
+            "size": self.probe_size,
+            "limit_price": self.deep_limit_price,
+            "modified_price": self.deep_modified_price,
+            "stop_price": "999",
+            "stop_modified_price": "998",
+        }
+
+    def _wait_until_order_active_if_live(self, order_id: str) -> None:
+        """LIVE環境にて新規注文が WAITING から ORDERED に遷移するまで最大1.2秒待機する"""
+        if str(getattr(self.broker, "MODE", "")).upper() != "LIVE" or not order_id:
+            return
+        if not hasattr(self.broker, "get_orders"):
+            return
+        for _ in range(6):
+            try:
+                ords = self.broker.get_orders([order_id])
+                if ords and str(ords[0].get("status", "")).upper() == "ORDERED":
+                    return
+            except Exception:
+                pass
+            time.sleep(0.2)
+
     def run_probe(
         self,
         test_stop_change_order: bool = True,
@@ -72,33 +131,71 @@ class GMOCoinLiveProbe:
         now_jst = _now_jst(now_dt)
         created_order_ids: List[str] = []
         ws_token: Optional[str] = None
+        params = self._resolve_probe_params()
+        probe_size = params["size"]
+        limit_price = params["limit_price"]
+        modified_price = params["modified_price"]
+        stop_price = params["stop_price"]
+        stop_modified_price = params["stop_modified_price"]
+
+        # プローブ用の診断注文で本番 WAL 台帳を汚さないよう一時的に切り離す
+        orig_wal_db = getattr(self.broker, "wal_db", None)
 
         capabilities: Dict[str, Any] = {
             "probed_at": now_jst.isoformat(timespec="seconds"),
+            "execution_mode": str(getattr(self.broker, "MODE", "DRY_RUN")),
             "probe_symbol": self.probe_symbol,
+            "probe_size": probe_size,
+            "probe_limit_price": limit_price,
+            "probe_modified_price": modified_price,
+            "clock_offset_ms": int(getattr(self.broker, "clock_offset_ms", 0) or 0),
+            "schema_compatibility": {
+                "assets_schema_valid": False,
+                "active_orders_schema_valid": False,
+                "trading_volume_schema_valid": False,
+            },
             "limit_change_order_supported": False,
             "limit_change_order_preserves_order_id": False,
             "stop_change_order_supported": False,
             "cancel_before_supported": False,
             "ws_auth_put_delete_supported": False,
             "trading_volume_supported": False,
+            "fee_schedule": {},
             "cleanup_verified_zero_residual_orders": False,
+            "residual_probe_orders_count": 0,
             "cleaned_order_ids": [],
         }
 
         try:
+            if hasattr(self.broker, "wal_db"):
+                self.broker.wal_db = None
+
+            # 0. Assets スキーマ整合性＆時計オフセット確認
+            if hasattr(self.broker, "get_assets"):
+                try:
+                    assets_list = self.broker.get_assets()
+                    capabilities["schema_compatibility"]["assets_schema_valid"] = (
+                        isinstance(assets_list, list)
+                        and len(assets_list) > 0
+                        and all(isinstance(a, dict) and "symbol" in a and "available" in a for a in assets_list)
+                    )
+                    capabilities["clock_offset_ms"] = int(getattr(self.broker, "clock_offset_ms", 0) or 0)
+                except Exception as exc:
+                    logger.debug("Probe get_assets 確認スキップ: %s", exc)
+
             # 1. LIMIT 指値発注 & changeOrder 検証
             ord_res = self.broker.place_order(
                 symbol=self.probe_symbol,
                 side="BUY",
                 execution_type="LIMIT",
-                size=self.probe_size,
-                price=self.deep_limit_price,
+                size=probe_size,
+                price=limit_price,
                 time_in_force="SOK",
             )
             oid_limit = str(ord_res.get("order_id", ""))
             if oid_limit:
                 created_order_ids.append(oid_limit)
+                self._wait_until_order_active_if_live(oid_limit)
 
             if inject_mid_probe_exception is not None:
                 raise inject_mid_probe_exception
@@ -107,20 +204,32 @@ class GMOCoinLiveProbe:
                 try:
                     chg_res = self.broker.change_order(
                         order_id=oid_limit,
-                        price=self.deep_modified_price,
+                        price=modified_price,
                     )
                     capabilities["limit_change_order_supported"] = str(chg_res.get("status", "")).upper() in (
                         "CHANGED",
                         "ORDERED",
                         "WAITING",
                     )
+                    self._wait_until_order_active_if_live(oid_limit)
                     # changeOrder 後も同じ orderId が activeOrders に存在するか確認
                     active_after = self.broker.get_active_orders(symbol=self.probe_symbol)
+                    capabilities["schema_compatibility"]["active_orders_schema_valid"] = isinstance(active_after, list)
                     active_ids = {str(o.get("order_id", "")) for o in active_after}
                     capabilities["limit_change_order_preserves_order_id"] = oid_limit in active_ids
                 except Exception as exc:
                     logger.info("Probe: LIMIT changeOrder 非対応または失敗: %s", exc)
                     capabilities["limit_change_order_supported"] = False
+
+            # 先に1本目のプローブ指値をキャンセルして余力を解放
+            if oid_limit and oid_limit in created_order_ids:
+                try:
+                    self.broker.cancel_order(oid_limit)
+                    created_order_ids.remove(oid_limit)
+                    if oid_limit not in capabilities["cleaned_order_ids"]:
+                        capabilities["cleaned_order_ids"].append(oid_limit)
+                except Exception:
+                    pass
 
             # 2. STOP 注文への changeOrder 可否検証 (オプション)
             if test_stop_change_order and hasattr(self.broker, "change_order"):
@@ -129,15 +238,16 @@ class GMOCoinLiveProbe:
                         symbol=self.probe_symbol,
                         side="BUY",
                         execution_type="STOP",
-                        size=self.probe_size,
-                        price="999",
+                        size=probe_size,
+                        price=stop_price,
                         time_in_force="FAK",
                     )
                     oid_stop = str(stop_res.get("order_id", ""))
                     if oid_stop:
                         created_order_ids.append(oid_stop)
+                        self._wait_until_order_active_if_live(oid_stop)
                         try:
-                            s_chg = self.broker.change_order(order_id=oid_stop, price="998")
+                            s_chg = self.broker.change_order(order_id=oid_stop, price=stop_modified_price)
                             capabilities["stop_change_order_supported"] = str(s_chg.get("status", "")).upper() in (
                                 "CHANGED",
                                 "ORDERED",
@@ -145,6 +255,13 @@ class GMOCoinLiveProbe:
                             )
                         except Exception:
                             capabilities["stop_change_order_supported"] = False
+                        try:
+                            self.broker.cancel_order(oid_stop)
+                            created_order_ids.remove(oid_stop)
+                            if oid_stop not in capabilities["cleaned_order_ids"]:
+                                capabilities["cleaned_order_ids"].append(oid_stop)
+                        except Exception:
+                            pass
                 except Exception:
                     capabilities["stop_change_order_supported"] = False
 
@@ -154,13 +271,14 @@ class GMOCoinLiveProbe:
                     symbol=self.probe_symbol,
                     side="BUY",
                     execution_type="LIMIT",
-                    size=self.probe_size,
-                    price=self.deep_limit_price,
+                    size=probe_size,
+                    price=limit_price,
                     time_in_force="SOK",
                 )
                 oid_lock = str(lock_ord.get("order_id", ""))
                 if oid_lock:
                     created_order_ids.append(oid_lock)
+                    self._wait_until_order_active_if_live(oid_lock)
                     self.broker.cancel_order(oid_lock)
                     created_order_ids.remove(oid_lock)
                     if oid_lock not in capabilities["cleaned_order_ids"]:
@@ -172,8 +290,8 @@ class GMOCoinLiveProbe:
                         symbol=self.probe_symbol,
                         side="BUY",
                         execution_type="LIMIT",
-                        size=self.probe_size,
-                        price=self.deep_limit_price,
+                        size=probe_size,
+                        price=limit_price,
                         time_in_force="SOK",
                         cancel_before=True,
                     )
@@ -201,42 +319,71 @@ class GMOCoinLiveProbe:
                 except Exception:
                     capabilities["ws_auth_put_delete_supported"] = False
 
-            # 5. tradingVolume 検証
+            # 5. tradingVolume 検証 & 手数料率記録
             if hasattr(self.broker, "get_trading_volume"):
                 try:
                     tv_res = self.broker.get_trading_volume()
-                    capabilities["trading_volume_supported"] = isinstance(tv_res, dict)
+                    is_tv_dict = isinstance(tv_res, dict)
+                    capabilities["trading_volume_supported"] = is_tv_dict
+                    if is_tv_dict:
+                        lim_list = tv_res.get("limit", [])
+                        capabilities["schema_compatibility"]["trading_volume_schema_valid"] = isinstance(lim_list, list)
+                        spot_fees: Dict[str, Dict[str, str]] = {}
+                        if isinstance(lim_list, list):
+                            for item in lim_list:
+                                if not isinstance(item, dict):
+                                    continue
+                                s_name = str(item.get("symbol", "")).strip().upper()
+                                if s_name in ("BTC", "ETH", "XRP", "SOL", "DOGE", "BCH", "LTC", self.probe_symbol):
+                                    spot_fees[s_name] = {
+                                        "maker_fee": str(item.get("makerFee", item.get("maker_fee", ""))),
+                                        "taker_fee": str(item.get("takerFee", item.get("taker_fee", ""))),
+                                    }
+                        capabilities["fee_schedule"] = {
+                            "tier_level": tv_res.get("tierLevel", tv_res.get("tier_level", 1)),
+                            "jpy_volume_30d": str(tv_res.get("jpyVolume", tv_res.get("jpy_volume", "0"))),
+                            "spot_fees": spot_fees,
+                        }
                 except Exception:
                     capabilities["trading_volume_supported"] = False
 
         finally:
+            if hasattr(self.broker, "wal_db"):
+                self.broker.wal_db = orig_wal_db
+
             # 100% クリーンアップ保証: 作成した全プローブ注文をキャンセルし、残存確認
-            cleaned_ids: List[str] = []
+            cleaned_ids: List[str] = list(capabilities.get("cleaned_order_ids", []))
             for oid in list(created_order_ids):
                 try:
+                    self._wait_until_order_active_if_live(oid)
                     self.broker.cancel_order(oid)
-                    cleaned_ids.append(oid)
+                    if oid not in cleaned_ids:
+                        cleaned_ids.append(oid)
                 except Exception as exc:
                     logger.debug("Probe cleanup cancel_order (%s): %s", oid, exc)
 
             # 万一まだ activeOrders に残っているプローブ注文があれば掃討
             try:
+                all_probe_ids = set(created_order_ids) | set(cleaned_ids)
                 remaining_active = self.broker.get_active_orders(symbol=self.probe_symbol)
                 for rem in remaining_active:
                     r_oid = str(rem.get("order_id", ""))
-                    if r_oid in created_order_ids:
+                    if r_oid in all_probe_ids:
                         try:
                             self.broker.cancel_order(r_oid)
                             if r_oid not in cleaned_ids:
                                 cleaned_ids.append(r_oid)
                         except Exception:
                             pass
+                if str(getattr(self.broker, "MODE", "")).upper() == "LIVE":
+                    time.sleep(0.3)
                 final_active = self.broker.get_active_orders(symbol=self.probe_symbol)
                 residual_probe_orders = [
                     str(o.get("order_id", ""))
                     for o in final_active
-                    if str(o.get("order_id", "")) in created_order_ids
+                    if str(o.get("order_id", "")) in all_probe_ids
                 ]
+                capabilities["residual_probe_orders_count"] = len(residual_probe_orders)
                 capabilities["cleanup_verified_zero_residual_orders"] = len(residual_probe_orders) == 0
             except Exception:
                 capabilities["cleanup_verified_zero_residual_orders"] = False
@@ -247,6 +394,7 @@ class GMOCoinLiveProbe:
                 except Exception:
                     pass
 
+            capabilities["clock_offset_ms"] = int(getattr(self.broker, "clock_offset_ms", 0) or 0)
             capabilities["cleaned_order_ids"] = cleaned_ids
             try:
                 atomic_write_text(self.capabilities_path, dumps_json(capabilities, indent=2) + "\n")

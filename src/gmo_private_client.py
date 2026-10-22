@@ -595,6 +595,42 @@ class GMOPrivateClient:
     # ------------------------------------------------------------------
     # 注文照会・変更・取消・一括取消エンドポイント
     # ------------------------------------------------------------------
+    LIVE_SPOT_EXCHANGE_SYMBOLS = (
+        "BTC",
+        "ETH",
+        "BCH",
+        "LTC",
+        "XRP",
+        "XLM",
+        "DOT",
+        "ATOM",
+        "FCR",
+        "ADA",
+        "LINK",
+        "DOGE",
+        "SOL",
+        "ASTR",
+        "NAC",
+        "WILD",
+        "SUI",
+    )
+
+    def _resolve_active_order_scan_symbols(self) -> List[str]:
+        unsupported = getattr(self, "_unsupported_active_order_symbols", set())
+        if self.public_client is not None and hasattr(self.public_client, "get_symbols"):
+            cached = getattr(self, "_cached_live_spot_symbols", None)
+            if cached is None:
+                try:
+                    live_map = self.public_client.get_symbols()
+                    if isinstance(live_map, dict) and live_map:
+                        cached = [str(k).strip().upper() for k in live_map.keys() if str(k).strip()]
+                        self._cached_live_spot_symbols = cached
+                except Exception:
+                    cached = None
+            if cached:
+                return [s for s in cached if s not in unsupported]
+        return [s for s in self.LIVE_SPOT_EXCHANGE_SYMBOLS if s not in unsupported]
+
     def get_active_orders(
         self,
         symbol: Optional[str] = None,
@@ -602,15 +638,24 @@ class GMOPrivateClient:
         count: int = 100,
     ) -> List[Dict[str, Any]]:
         """有効注文一覧を取得する (`GET /private/v1/activeOrders`, Priority 3)"""
-        symbols_to_query = [symbol.upper()] if symbol else list(DEFAULT_SYMBOL_RULES.keys())
+        if not hasattr(self, "_unsupported_active_order_symbols"):
+            self._unsupported_active_order_symbols = set()
+        symbols_to_query = [symbol.strip().upper()] if symbol else self._resolve_active_order_scan_symbols()
         results: List[Dict[str, Any]] = []
         for sym in symbols_to_query:
-            data = self._request(
-                "GET",
-                "/private/v1/activeOrders",
-                params={"symbol": sym, "page": page, "count": count},
-                priority=3,
-            )
+            try:
+                data = self._request(
+                    "GET",
+                    "/private/v1/activeOrders",
+                    params={"symbol": sym, "page": page, "count": count},
+                    priority=3,
+                )
+            except GMOPrivateAPIError as exc:
+                if symbol is None and "ERR-5106" in (exc.error_codes or []):
+                    self._unsupported_active_order_symbols.add(sym)
+                    logger.debug("get_active_orders: 非対応銘柄をスキップ (%s): %s", sym, exc)
+                    continue
+                raise
             raw_list = data.get("list", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
             for item in raw_list:
                 results.append(self._normalize_order_dict(item))
@@ -666,7 +711,15 @@ class GMOPrivateClient:
         }
         if losscut_price is not None and _to_decimal(losscut_price) > 0:
             body["losscutPrice"] = format_decimal_plain(losscut_price)
-        self._request("POST", "/private/v1/changeOrder", body=body, priority=2)
+        for attempt in range(4):
+            try:
+                self._request("POST", "/private/v1/changeOrder", body=body, priority=2)
+                break
+            except GMOPrivateAPIError as exc:
+                if "ERR-5122" in (exc.error_codes or []) and attempt < 3:
+                    self._sleep(0.25 * (attempt + 1))
+                    continue
+                raise
         oid_str = str(order_id)
         return {
             "order_id": oid_str,
@@ -680,7 +733,15 @@ class GMOPrivateClient:
     def cancel_order(self, order_id: Union[str, int], now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """単一注文をキャンセルする (`POST /private/v1/cancelOrder`, Priority 2)"""
         oid = int(order_id) if str(order_id).isdigit() else order_id
-        self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid}, priority=2)
+        for attempt in range(4):
+            try:
+                self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid}, priority=2)
+                break
+            except GMOPrivateAPIError as exc:
+                if "ERR-5122" in (exc.error_codes or []) and attempt < 3:
+                    self._sleep(0.25 * (attempt + 1))
+                    continue
+                raise
         oid_str = str(order_id)
         return {"order_id": oid_str, "orderId": oid_str, "status": "CANCELED", "orderStatus": "CANCELED"}
 

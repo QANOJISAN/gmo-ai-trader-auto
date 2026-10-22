@@ -26,7 +26,7 @@ $Action = New-ScheduledTaskAction `
     -Argument ("-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File `"" + $RunnerScript + "`"") `
     -WorkingDirectory $ProjectDir
 
-$TriggerLogon = New-ScheduledTaskTrigger -AtLogOn
+$TriggerLogon = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 $TriggerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).Date.AddMinutes(5) `
     -RepetitionInterval (New-TimeSpan -Minutes 15) `
     -RepetitionDuration (New-TimeSpan -Days 3650)
@@ -38,13 +38,23 @@ $Settings = New-ScheduledTaskSettingsSet `
     -MultipleInstances IgnoreNew `
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 
-Register-ScheduledTask `
-    -TaskName $TaskName `
-    -Action $Action `
-    -Trigger @($TriggerLogon, $TriggerRepeat) `
-    -Settings $Settings `
-    -Description "GMO Coin Spot 24/7 Full-Automated AI Trading Daemon (v2)" `
-    -Force | Out-Null
+try {
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $Action `
+        -Trigger @($TriggerLogon, $TriggerRepeat) `
+        -Settings $Settings `
+        -Description "GMO Coin Spot 24/7 Full-Automated AI Trading Daemon (v2)" `
+        -Force | Out-Null
+} catch {
+    Register-ScheduledTask `
+        -TaskName $TaskName `
+        -Action $Action `
+        -Trigger @($TriggerRepeat) `
+        -Settings $Settings `
+        -Description "GMO Coin Spot 24/7 Full-Automated AI Trading Daemon (v2)" `
+        -Force | Out-Null
+}
 
 Write-Host ("[OK] Registered scheduled task: " + $TaskName)
 Write-Host ("Note: Before switching v2 to LIVE mode, disable v1 task (GMO-AI-Trader-Daily) and run migrate_from_v1.py --execute.")
