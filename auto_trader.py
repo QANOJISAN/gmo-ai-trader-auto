@@ -98,6 +98,22 @@ def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     return now_dt.astimezone(JST)
 
 
+DEFAULT_PHASE1_END_JST = "2027-07-09T00:00:00+09:00"
+DEFAULT_PHASE2_START_JST = "2027-07-10T00:00:00+09:00"
+DEFAULT_PHASE2_END_JST = "2027-12-10T00:00:00+09:00"
+DEFAULT_PRE_DEADLINE_FREEZE_HOURS = 2.0
+
+
+def _parse_jst_iso(ts_str: Optional[Union[str, datetime]], default_iso: str) -> datetime:
+    if isinstance(ts_str, datetime):
+        return _now_jst(ts_str)
+    raw = str(ts_str or "").strip() or default_iso
+    try:
+        return _now_jst(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+    except Exception:
+        return _now_jst(datetime.fromisoformat(default_iso))
+
+
 def is_in_saturday_maintenance_window(now_dt: Optional[datetime] = None) -> bool:
     """
     毎週土曜日 08:55 〜 11:05 JST（GMOコイン定期メンテナンス枠）かどうかを判定する。
@@ -147,7 +163,13 @@ def append_history_csv(
                 "confidence": decision.get("confidence", 0.0),
                 "provider": decision.get("provider", "unknown"),
                 "jpy_balance": int(portfolio.get("jpy_balance", 0) or 0),
-                "open_positions_count": len(portfolio.get("positions", []) or []),
+                "open_positions_count": len(
+                    [
+                        p
+                        for p in (portfolio.get("positions", []) or [])
+                        if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+                    ]
+                ),
                 "reasoning": str(decision.get("reasoning", "")).replace("\r", " ").replace("\n", " "),
             }
         )
@@ -172,6 +194,10 @@ class AutoTraderDaemon:
         max_daily_trades: Optional[int] = None,
         max_consecutive_api_errors: Optional[int] = None,
         dry_run_notify: bool = False,
+        phase1_end_jst: Optional[Union[str, datetime]] = None,
+        phase2_start_jst: Optional[Union[str, datetime]] = None,
+        phase2_end_jst: Optional[Union[str, datetime]] = None,
+        pre_deadline_freeze_hours: Optional[float] = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else BASE_DIR
         self.portfolio_path = self.base_dir / "portfolio.json"
@@ -211,6 +237,23 @@ class AutoTraderDaemon:
             max_consecutive_api_errors
             if max_consecutive_api_errors is not None
             else os.getenv("MAX_CONSECUTIVE_API_ERRORS", "5")
+        )
+        self.phase1_end_jst = _parse_jst_iso(
+            phase1_end_jst if phase1_end_jst is not None else os.getenv("PHASE1_END_JST", DEFAULT_PHASE1_END_JST),
+            DEFAULT_PHASE1_END_JST,
+        )
+        self.phase2_start_jst = _parse_jst_iso(
+            phase2_start_jst if phase2_start_jst is not None else os.getenv("PHASE2_START_JST", DEFAULT_PHASE2_START_JST),
+            DEFAULT_PHASE2_START_JST,
+        )
+        self.phase2_end_jst = _parse_jst_iso(
+            phase2_end_jst if phase2_end_jst is not None else os.getenv("PHASE2_END_JST", DEFAULT_PHASE2_END_JST),
+            DEFAULT_PHASE2_END_JST,
+        )
+        self.pre_deadline_freeze_hours = float(
+            pre_deadline_freeze_hours
+            if pre_deadline_freeze_hours is not None
+            else os.getenv("CAMPAIGN_PRE_DEADLINE_FREEZE_HOURS", str(DEFAULT_PRE_DEADLINE_FREEZE_HOURS))
         )
 
         self.oco_manager = PseudoOCOManager(
@@ -268,6 +311,9 @@ class AutoTraderDaemon:
         self._daily_trade_date: str = ""
         self._daily_trade_count: int = 0
         self._last_digest_date: str = ""
+        self._phase1_pre_freeze_cleared: bool = False
+        self._phase2_pre_freeze_cleared: bool = False
+        self.campaign_phase: str = "PHASE1_ACTIVE"
 
     def _get_daily_trade_count(self, now_jst: datetime) -> int:
         # GMO取引日基準 (06:00 JST) で日次カウントをリセット
@@ -388,6 +434,293 @@ class AutoTraderDaemon:
         )
         return summary
 
+    def _execute_deadline_settlement(
+        self,
+        phase_label: str,
+        settlement_reason: str,
+        report_filename: str,
+        settled_flag_key: str,
+        now_dt: datetime,
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        運用期限（第1回: 2027-07-09 00:00 JST / 第2回: 2027-12-10 00:00 JST）到達時に
+        未約定注文の全件キャンセル・保有ポジションの即時成行全決済・総合レポート確定とDiscord通知を1回限り実行する。
+        """
+        now_jst = _now_jst(now_dt)
+        settle_events: List[Dict[str, Any]] = []
+
+        if tickers is None:
+            try:
+                tickers = self.public_client.get_tickers()
+            except Exception:
+                tickers = {}
+        if tickers and hasattr(self.broker, "update_market_tickers"):
+            try:
+                self.broker.update_market_tickers(tickers)
+            except Exception:
+                pass
+
+        # 1. 未約定の買い指値注文を全件キャンセル（部分約定分は安全にポジションへ昇格）
+        try:
+            cancel_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+            if cancel_res.get("canceled_order_ids"):
+                settle_events.append(
+                    {
+                        "type": f"{phase_label}_DEADLINE_PENDING_CANCELED",
+                        "canceled_order_ids": cancel_res.get("canceled_order_ids", []),
+                        "timestamp": now_jst.isoformat(timespec="seconds"),
+                    }
+                )
+        except Exception as exc:
+            logger.error("%s 期限締め時の待機注文キャンセルエラー: %s", phase_label, exc)
+
+        # 2. 保有中の全有効ポジション（DUST_QUARANTINED 除く）を即時成行全決済して日本円に確定
+        pf_now = self.oco_manager.load_portfolio()
+        for pos in list(pf_now.get("positions", []) or []):
+            if str(pos.get("state", "PROTECTED")).strip().upper() == "DUST_QUARANTINED":
+                continue
+            sym = str(pos.get("symbol", "")).strip().upper()
+            min_sz = float(DEFAULT_SYMBOL_RULES.get(sym, {}).get("min_order_size", 0.0001) or 0.0001)
+            if float(pos.get("size", 0) or 0) < min_sz or not sym:
+                continue
+            try:
+                closed_tr = self.oco_manager.close_position_immediately(
+                    symbol=sym,
+                    reason=settlement_reason,
+                    now_dt=now_jst,
+                )
+                if closed_tr:
+                    settle_events.append(
+                        {
+                            "type": settlement_reason,
+                            "symbol": sym,
+                            "size": closed_tr.get("size", 0),
+                            "exit_price": closed_tr.get("exit_price", 0),
+                            "pnl_jpy": closed_tr.get("pnl_jpy", 0),
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+            except Exception as exc:
+                logger.error("%s 期限締め時のポジション全決済エラー (%s): %s", phase_label, sym, exc)
+
+        # 3. 決済完了フラグの永続化（重複実行防止）
+        pf_settled = self.oco_manager.load_portfolio()
+        pf_settled[settled_flag_key] = True
+        pf_settled[f"{settled_flag_key}_at"] = now_jst.isoformat(timespec="seconds")
+        self.oco_manager.save_portfolio(pf_settled, now_dt=now_jst)
+        if self.db_wal is not None:
+            try:
+                self.db_wal.set_meta(settled_flag_key, True)
+            except Exception:
+                pass
+
+        # 4. PERFORMANCE_REPORT.md および フェーズ別アーカイブレポートの確定出力
+        report_archive_path = self.base_dir / report_filename
+        for out_p in (self.base_dir / "PERFORMANCE_REPORT.md", report_archive_path):
+            try:
+                generate_report(
+                    output_path=out_p,
+                    notify=False,
+                    dry_run=True,
+                    print_console=False,
+                    portfolio_path=self.portfolio_path,
+                    history_csv_path=self.history_csv_path,
+                )
+            except Exception as rep_exc:
+                logger.error("%s レポート出力エラー (%s): %s", phase_label, out_p, rep_exc)
+
+        # 5. 初期資金からの最終総合結果サマリーを Discord へ通知
+        init_cap_val = int(pf_settled.get("initial_capital_jpy", 10000) or 10000)
+        final_jpy_val = int(pf_settled.get("jpy_balance", init_cap_val) or init_cap_val)
+        total_pnl_val = final_jpy_val - init_cap_val
+        total_pnl_pct = (total_pnl_val / init_cap_val * 100.0) if init_cap_val > 0 else 0.0
+        closed_count = len(pf_settled.get("closed_trades", []) or [])
+        settle_events.append(
+            {
+                "type": f"{phase_label}_SETTLEMENT_COMPLETED",
+                "final_jpy_balance": final_jpy_val,
+                "total_pnl_jpy": total_pnl_val,
+                "report_archive": str(report_archive_path.name),
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+            }
+        )
+        self.notification_dispatcher.dispatch(
+            tier="CRITICAL",
+            title=f"🏁 {phase_label} 運用期間満了・全ポジション決済＆最終総合レポート確定",
+            message=(
+                f"・満了時刻: `{now_jst.isoformat(timespec='seconds')}`\n"
+                f"・初期運用資金: {init_cap_val:,} 円（実口座開始: 10,025 円）\n"
+                f"・最終確定日本円残高: **{final_jpy_val:,} 円**（通算損益: **{total_pnl_val:+,} 円 / {total_pnl_pct:+.2f}%**）\n"
+                f"・累計決済トレード数: {closed_count} 回\n"
+                f"・確定アーカイブレポート: `{report_archive_path.name}`"
+            ),
+            now_dt=now_jst,
+        )
+        logger.info(
+            "🏁 %s 運用期間満了決済＆レポート確定完了: 最終残高=%d円 (%+d円), report=%s",
+            phase_label,
+            final_jpy_val,
+            total_pnl_val,
+            report_archive_path.name,
+        )
+        return settle_events
+
+    def evaluate_and_enforce_campaign_schedule(
+        self,
+        now_dt: Optional[datetime] = None,
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        第1回（〜2027-07-09 00:00 JST）・検証休止期間（2027-07-09 00:00〜2027-07-10 00:00 JST）・
+        第2回（2027-07-10 00:00〜2027-12-10 00:00 JST）の運用スケジュールを判定・自動執行する。
+        """
+        now_jst = _now_jst(now_dt)
+        p1_end = self.phase1_end_jst
+        p1_freeze_start = p1_end - timedelta(hours=self.pre_deadline_freeze_hours)
+        p2_start = self.phase2_start_jst
+        p2_end = self.phase2_end_jst
+        p2_freeze_start = p2_end - timedelta(hours=self.pre_deadline_freeze_hours)
+
+        events: List[Dict[str, Any]] = []
+
+        # 0. portfolio.json に campaign_schedule メタデータが未登録の場合は自動初期化
+        pf_init = self.oco_manager.load_portfolio()
+        camp_meta = pf_init.get("campaign_schedule")
+        if not isinstance(camp_meta, dict) or not camp_meta.get("phase1_end_jst"):
+            pf_init["campaign_schedule"] = {
+                "phase1_end_jst": p1_end.isoformat(timespec="seconds"),
+                "phase2_start_jst": p2_start.isoformat(timespec="seconds"),
+                "phase2_end_jst": p2_end.isoformat(timespec="seconds"),
+                "pre_deadline_freeze_hours": self.pre_deadline_freeze_hours,
+                "current_phase": self.campaign_phase,
+            }
+            self.oco_manager.save_portfolio(pf_init, now_dt=now_jst)
+
+        # 1. 第1回 通常稼働期間 (< 2027-07-08 22:00:00 JST)
+        if now_jst < p1_freeze_start:
+            self.campaign_phase = "PHASE1_ACTIVE"
+            return {
+                "phase": "PHASE1_ACTIVE",
+                "allow_new_buy": True,
+                "halt_cycle": False,
+                "events": events,
+            }
+
+        # 2. 第1回 終了2時間前エントリー凍結 (2027-07-08 22:00:00 <= now < 2027-07-09 00:00:00 JST)
+        if p1_freeze_start <= now_jst < p1_end:
+            self.campaign_phase = "PHASE1_PRE_DEADLINE_FREEZE"
+            pf = self.oco_manager.load_portfolio()
+            if (pf.get("pending_orders") or []) or not self._phase1_pre_freeze_cleared:
+                c_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                self._phase1_pre_freeze_cleared = True
+                if c_res.get("canceled_order_ids"):
+                    events.append(
+                        {
+                            "type": "PHASE1_PRE_DEADLINE_PENDING_CANCELED",
+                            "canceled_order_ids": c_res.get("canceled_order_ids", []),
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+            return {
+                "phase": "PHASE1_PRE_DEADLINE_FREEZE",
+                "allow_new_buy": False,
+                "halt_cycle": False,
+                "events": events,
+            }
+
+        # 3. 第1回 運用期限到達＆24時間検証・改良休止ウィンドウ (2027-07-09 00:00:00 <= now < 2027-07-10 00:00:00 JST)
+        if p1_end <= now_jst < p2_start:
+            self.campaign_phase = "PHASE1_COMPLETED_INTERMISSION"
+            pf = self.oco_manager.load_portfolio()
+            if not pf.get("phase1_settled", False):
+                events.extend(
+                    self._execute_deadline_settlement(
+                        phase_label="PHASE1",
+                        settlement_reason="PHASE1_DEADLINE_SETTLEMENT",
+                        report_filename="PERFORMANCE_REPORT_PHASE1.md",
+                        settled_flag_key="phase1_settled",
+                        now_dt=now_jst,
+                        tickers=tickers,
+                    )
+                )
+            return {
+                "phase": "PHASE1_COMPLETED_INTERMISSION",
+                "allow_new_buy": False,
+                "halt_cycle": True,
+                "events": events,
+            }
+
+        # 4. 第2回 通常稼働期間 (2027-07-10 00:00:00 <= now < 2027-12-09 22:00:00 JST)
+        if p2_start <= now_jst < p2_freeze_start:
+            self.campaign_phase = "PHASE2_ACTIVE"
+            pf = self.oco_manager.load_portfolio()
+            if not pf.get("phase2_started", False):
+                pf["phase2_started"] = True
+                pf["phase2_started_at"] = now_jst.isoformat(timespec="seconds")
+                self.oco_manager.save_portfolio(pf, now_dt=now_jst)
+                if self.db_wal is not None:
+                    try:
+                        self.db_wal.set_meta("phase2_started", True)
+                    except Exception:
+                        pass
+                events.append(
+                    {
+                        "type": "PHASE2_CAMPAIGN_STARTED",
+                        "timestamp": now_jst.isoformat(timespec="seconds"),
+                    }
+                )
+                logger.info("🚀 第2回（Phase 2）運用期間を開始しました (%s)", now_jst.isoformat(timespec="seconds"))
+            return {
+                "phase": "PHASE2_ACTIVE",
+                "allow_new_buy": True,
+                "halt_cycle": False,
+                "events": events,
+            }
+
+        # 5. 第2回 終了2時間前エントリー凍結 (2027-12-09 22:00:00 <= now < 2027-12-10 00:00:00 JST)
+        if p2_freeze_start <= now_jst < p2_end:
+            self.campaign_phase = "PHASE2_PRE_DEADLINE_FREEZE"
+            pf = self.oco_manager.load_portfolio()
+            if (pf.get("pending_orders") or []) or not self._phase2_pre_freeze_cleared:
+                c_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                self._phase2_pre_freeze_cleared = True
+                if c_res.get("canceled_order_ids"):
+                    events.append(
+                        {
+                            "type": "PHASE2_PRE_DEADLINE_PENDING_CANCELED",
+                            "canceled_order_ids": c_res.get("canceled_order_ids", []),
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+            return {
+                "phase": "PHASE2_PRE_DEADLINE_FREEZE",
+                "allow_new_buy": False,
+                "halt_cycle": False,
+                "events": events,
+            }
+
+        # 6. 第2回 運用期限満了＆安全待機 (now >= 2027-12-10 00:00:00 JST)
+        self.campaign_phase = "PHASE2_COMPLETED_HALT"
+        pf = self.oco_manager.load_portfolio()
+        if not pf.get("phase2_settled", False):
+            events.extend(
+                self._execute_deadline_settlement(
+                    phase_label="PHASE2",
+                    settlement_reason="PHASE2_DEADLINE_SETTLEMENT",
+                    report_filename="PERFORMANCE_REPORT_PHASE2.md",
+                    settled_flag_key="phase2_settled",
+                    now_dt=now_jst,
+                    tickers=tickers,
+                )
+            )
+        return {
+            "phase": "PHASE2_COMPLETED_HALT",
+            "allow_new_buy": False,
+            "halt_cycle": True,
+            "events": events,
+        }
+
     def run_fast_cycle(
         self,
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
@@ -422,6 +755,16 @@ class AutoTraderDaemon:
                     self.db_wal.checkpoint_wal("PASSIVE")
                 except Exception as wal_exc:
                     logger.warning("日次 WAL チェックポイント警告: %s", wal_exc)
+
+        # 0a. 第1回・第2回 運用期限スケジュール判定・自動全決済チェック
+        campaign_res = self.evaluate_and_enforce_campaign_schedule(now_dt=now_jst, tickers=tickers)
+        if campaign_res.get("halt_cycle"):
+            return {
+                "status": campaign_res["phase"],
+                "campaign_phase": campaign_res["phase"],
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+                "events": campaign_res.get("events", []),
+            }
 
         # 0b. 土曜 08:50〜08:55 JST 未約定 BUY 事前クリア
         if is_in_saturday_pre_maintenance_clear_window(now_jst) and not self.pre_maintenance_cleared:
@@ -542,7 +885,7 @@ class AutoTraderDaemon:
                 self.oco_manager.save_portfolio(pf_pre, now_dt=now_jst)
 
             step_events = self.oco_manager.step(tickers=current_tickers, now_dt=now_jst)
-            events = guardian_events + adverse_cancel_events + step_events
+            events = list(campaign_res.get("events", [])) + guardian_events + adverse_cancel_events + step_events
 
             # SL 約定イベント発生時は該当銘柄に180分クールダウンを記録
             for ev in events:
@@ -556,9 +899,11 @@ class AutoTraderDaemon:
                     if ev_sym:
                         self.ai_judge.record_sl_hit_cooldown(ev_sym, now_dt=now_jst)
 
-            # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < 8,500円) チェック
+            # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < max(8500, peak_equity * 0.85)) チェック
             pf_now = self.oco_manager.load_portfolio()
             l5_res = self.circuit_breaker.evaluate_l5_hard_kill_switch(pf_now, current_tickers)
+            if l5_res.get("peak_updated"):
+                self.oco_manager.save_portfolio(pf_now, now_dt=now_jst)
             if l5_res["newly_triggered"]:
                 self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
                 pf_now = self.oco_manager.load_portfolio()
@@ -602,6 +947,7 @@ class AutoTraderDaemon:
             self.record_api_success()
             return {
                 "status": "OK",
+                "campaign_phase": campaign_res["phase"],
                 "timestamp": now_jst.isoformat(timespec="seconds"),
                 "events": events,
                 "reconciled": reconcile_result,
@@ -637,6 +983,16 @@ class AutoTraderDaemon:
                 "ai_called": False,
             }
 
+        campaign_res = self.evaluate_and_enforce_campaign_schedule(now_dt=now_jst, tickers=tickers)
+        if campaign_res.get("halt_cycle"):
+            return {
+                "status": campaign_res["phase"],
+                "campaign_phase": campaign_res["phase"],
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+                "ai_called": False,
+                "events": campaign_res.get("events", []),
+            }
+
         if is_in_saturday_maintenance_window(now_jst):
             self.in_maintenance_sleep = True
             return {
@@ -665,7 +1021,11 @@ class AutoTraderDaemon:
 
         try:
             pf = self.oco_manager.load_portfolio()
-            held_symbols = [str(p.get("symbol", "")).upper() for p in pf.get("positions", [])]
+            held_symbols = [
+                str(p.get("symbol", "")).upper()
+                for p in (pf.get("positions", []) or [])
+                if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+            ]
 
             if market_summaries is None:
                 market_summaries, symbol_rules, tickers = self.radar.collect_market_summaries(
@@ -707,6 +1067,16 @@ class AutoTraderDaemon:
                 now_dt=now_jst,
             )
             self.last_radar_run_at = now_jst
+
+            if not campaign_res.get("allow_new_buy", True):
+                filtered_trigs = [t for t in radar_eval.get("triggers", []) if t != "NEW_ENTRY_OPPORTUNITY"]
+                radar_eval["triggers"] = filtered_trigs
+                radar_eval["candidate_symbols"] = []
+                if not filtered_trigs:
+                    radar_eval["should_call_ai"] = False
+                    radar_eval["reason_summary"] = (
+                        f"{campaign_res['phase']}: 運用期限2時間前エントリー凍結中（新規買い停止・AI呼び出しスキップ）"
+                    )
 
             # RISK_OFF_CRASH 検知時は未約定の PENDING_BUY を即時キャンセル
             regime_info = radar_eval.get("regime_info", {})
@@ -750,12 +1120,14 @@ class AutoTraderDaemon:
                 self.remote_control.is_paused = is_paused_now
 
                 block_reason = ""
-                if is_paused_now:
+                if not campaign_res.get("allow_new_buy", True):
+                    block_reason = f"[{campaign_res['phase']}: 運用期限2時間前エントリー凍結中によりHOLDへ自動補正] "
+                elif is_paused_now:
                     block_reason = "[リモートPAUSE中によりHOLDへ自動補正] "
                 elif self.circuit_breaker.l5_kill_switch_latched:
                     block_reason = "[L5ハード・キルスイッチ発動中によりHOLDへ自動補正] "
                 elif l3_res["blocked"]:
-                    block_reason = f"[L3日次損失制限 ({l3_res['daily_total_pnl_jpy']:+.0f}円 <= -300円) により翌06:00までHOLD] "
+                    block_reason = f"[L3日次損失制限 ({l3_res['daily_total_pnl_jpy']:+.0f}円 <= {l3_res.get('daily_loss_limit_jpy', -300.0):.0f}円) により翌06:00までHOLD] "
                 elif l4_res["blocked"]:
                     block_reason = f"[L4連敗/週間損失クールダウンによりHOLD] "
                 elif current_daily_trades >= self.max_daily_trades:
@@ -965,7 +1337,12 @@ class AutoTraderDaemon:
 
                 # RSS メモリ監視（ポジション・待機注文がゼロの安全なタイミングでのみ計画再起動）
                 pf_chk = self.oco_manager.load_portfolio()
-                has_active = bool((pf_chk.get("positions") or []) or (pf_chk.get("pending_orders") or []))
+                active_pos_list = [
+                    p
+                    for p in (pf_chk.get("positions") or [])
+                    if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+                ]
+                has_active = bool(active_pos_list or (pf_chk.get("pending_orders") or []))
                 mem_status = check_memory_rss_and_should_restart(has_open_positions_or_orders=has_active)
                 if mem_status["should_graceful_restart"]:
                     logger.info("メモリ閾値到達かつポジションフラットのため計画再起動を実行します: %s", mem_status)
@@ -1051,8 +1428,45 @@ def main() -> int:
             logger.info("Remote Control 実行完了: %s", res)
             return 0
         if args.once:
+            rec_res = daemon.reconciler.reconcile()
+            logger.info("初回 3-Way Reconciliation 完了: %s", rec_res)
             daemon.run_fast_cycle()
-            daemon.run_radar_and_ai_cycle(force_ai=args.force_ai)
+            cycle_res = daemon.run_radar_and_ai_cycle(force_ai=args.force_ai)
+            if not cycle_res.get("ai_called"):
+                pf_now = daemon.oco_manager.load_portfolio()
+                if not daemon.latest_decision_path.exists():
+                    radar_info = cycle_res.get("radar", {})
+                    write_json_file(
+                        daemon.latest_decision_path,
+                        {
+                            "timestamp": cycle_res.get("timestamp", _now_jst().isoformat(timespec="seconds")),
+                            "action": "HOLD",
+                            "symbol": "NONE",
+                            "order_type": "NONE",
+                            "limit_price": 0,
+                            "size": 0,
+                            "take_profit_price": 0,
+                            "stop_loss_price": 0,
+                            "expected_cost_jpy": 0,
+                            "expected_loss_jpy": 0,
+                            "risk_reward_ratio": 0.0,
+                            "confidence": 0.5,
+                            "provider": "radar_gate_hold",
+                            "execution_mode": getattr(daemon.broker, "MODE", daemon.execution_mode),
+                            "radar_triggers": radar_info.get("triggers", []),
+                            "regime_info": radar_info.get("regime_info", {}),
+                            "reasoning": str(radar_info.get("reason_summary", "レーダー条件未達のためAI呼び出しスキップ（HOLD待機）")),
+                            "status": "RADAR_SKIPPED_AI",
+                        },
+                    )
+                generate_report(
+                    output_path=daemon.base_dir / "PERFORMANCE_REPORT.md",
+                    notify=False,
+                    dry_run=True,
+                    print_console=False,
+                    portfolio_path=daemon.portfolio_path,
+                    history_csv_path=daemon.history_csv_path,
+                )
             return 0
 
         daemon.run_forever()

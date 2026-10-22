@@ -267,9 +267,10 @@ class PseudoOCOManager:
                 default_pf = {
                     "initial_capital_jpy": 10000,
                     "jpy_balance": 10000,
+                    "peak_equity_jpy": 10000,
                     "realized_pnl_total_jpy": 0,
                     "total_realized_pnl_jpy": 0,
-                    "max_allocation_per_trade_pct": 0.50,
+                    "max_allocation_per_trade_pct": 0.45,
                     "max_concurrent_positions": 2,
                     "target_risk_per_trade_jpy": 150,
                     "max_risk_per_trade_jpy": 200,
@@ -298,6 +299,23 @@ class PseudoOCOManager:
             ts_ms = int(now_jst.timestamp() * 1000)
             portfolio["last_updated"] = now_jst.isoformat(timespec="seconds")
             portfolio["execution_mode"] = getattr(self.broker, "MODE", "DRY_RUN")
+            init_cap_val = float(portfolio.get("initial_capital_jpy", 10000) or 10000)
+            prev_peak_val = max(float(portfolio.get("peak_equity_jpy", 0) or 0), init_cap_val, 10000.0)
+            active_pos_list = [
+                p
+                for p in (portfolio.get("positions", []) or [])
+                if str(p.get("state", "PROTECTED")).strip().upper() != "DUST_QUARANTINED"
+            ]
+            pending_list = portfolio.get("pending_orders", []) or []
+            if not active_pos_list and not pending_list:
+                jpy_now = float(portfolio.get("jpy_balance", init_cap_val) or init_cap_val)
+                if jpy_now > prev_peak_val:
+                    prev_peak_val = jpy_now
+            portfolio["peak_equity_jpy"] = int(prev_peak_val) if prev_peak_val.is_integer() else round(prev_peak_val, 2)
+            hwm_ks = max(8500.0, round(prev_peak_val * 0.85, 2))
+            curr_ks = float(portfolio.get("drawdown_kill_switch_jpy", 8500) or 8500)
+            new_ks = max(8500.0, curr_ks, hwm_ks)
+            portfolio["drawdown_kill_switch_jpy"] = int(new_ks) if new_ks.is_integer() else round(new_ks, 2)
             if self.wal_db is not None:
                 for p in portfolio.get("positions", []) or []:
                     p_sym = str(p.get("symbol", "")).strip().upper()

@@ -46,6 +46,11 @@ JST = timezone(timedelta(hours=9))
 # Gate 0 固定除外リスト（廃止予定・超低流動性・特殊・ステーブルコイン DAI）
 GATE0_EXCLUDED_SYMBOLS = set(EXCLUDED_SPOT_SYMBOLS) | {"DAI"}
 
+# パターンA（自動複利スケール型）パラメータ
+MAX_POSITION_ALLOCATION_PCT = Decimal("0.45")
+DYNAMIC_MIN_RISK_PCT = Decimal("0.012")
+DYNAMIC_TARGET_RISK_PCT = Decimal("0.015")
+
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     if now_dt is None:
@@ -129,11 +134,25 @@ class TechnicalRadar:
         ticker: Dict[str, Any],
         symbol_rule: Dict[str, Any],
         atr_1h: Optional[Any] = None,
+        equity_jpy: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
         単一銘柄について Gate 0 〜 Gate 3 の合否を厳密判定する。
+        `equity_jpy` が指定された場合はパターンA（動的複利スケール）に基づき
+        最小注文額上限（`max(2500, equity * 0.25)`）と許容SLリスク予算（`max(150, equity * 0.015)`）を自動スケールする。
         """
         sym_up = str(symbol or "").strip().upper()
+        eq_dec = _to_decimal(equity_jpy) if equity_jpy is not None else Decimal("0")
+        effective_max_min_notional = (
+            max(self.max_min_notional_jpy, eq_dec * Decimal("0.25"))
+            if eq_dec > Decimal("0")
+            else self.max_min_notional_jpy
+        )
+        effective_target_risk = (
+            max(self.target_risk_jpy, eq_dec * DYNAMIC_TARGET_RISK_PCT)
+            if eq_dec > Decimal("0")
+            else self.target_risk_jpy
+        )
 
         # Gate 0: 固定除外リスト & レバレッジ銘柄 (`*_JPY`)
         if not sym_up or sym_up.endswith("_JPY") or sym_up in GATE0_EXCLUDED_SYMBOLS:
@@ -189,21 +208,21 @@ class TechnicalRadar:
                 "spread_pct": float(spread_pct_dec),
             }
 
-        # Gate 3: 最小注文額 minOrderSize * last <= 2,500円 かつ 150円 / minOrderSize >= 1.5 * ATR_1h
+        # Gate 3: 最小注文額 minOrderSize * last <= effective_max_min_notional かつ effective_target_risk / minOrderSize >= 1.5 * ATR_1h
         min_notional_jpy = min_size_dec * last_dec
-        if min_notional_jpy > self.max_min_notional_jpy:
+        if min_notional_jpy > effective_max_min_notional:
             return {
                 "symbol": sym_up,
                 "passed": False,
                 "failed_gate": "GATE_3_MIN_NOTIONAL_TOO_LARGE",
-                "reason": f"Gate 3 最小注文額超過 ({float(min_notional_jpy):,.0f}円 > {float(self.max_min_notional_jpy):,.0f}円)",
+                "reason": f"Gate 3 最小注文額超過 ({float(min_notional_jpy):,.0f}円 > {float(effective_max_min_notional):,.0f}円)",
                 "min_notional_jpy": float(min_notional_jpy),
             }
 
         if atr_1h is not None:
             atr_1h_dec = _to_decimal(atr_1h)
             if atr_1h_dec > Decimal("0"):
-                max_allowable_sl_dist_at_min_lot = self.target_risk_jpy / min_size_dec
+                max_allowable_sl_dist_at_min_lot = effective_target_risk / min_size_dec
                 required_min_sl_dist = atr_1h_dec * self.min_sl_atr1h_mult
                 if max_allowable_sl_dist_at_min_lot < required_min_sl_dist:
                     return {
@@ -212,7 +231,7 @@ class TechnicalRadar:
                         "failed_gate": "GATE_3_SL_TOO_TIGHT_FOR_MIN_LOT",
                         "reason": (
                             f"Gate 3 最小ロットでの許容SL距離不足 "
-                            f"(150円/minLot={float(max_allowable_sl_dist_at_min_lot):.2f}円 < 1.5*ATR_1h={float(required_min_sl_dist):.2f}円)"
+                            f"({float(effective_target_risk):.0f}円/minLot={float(max_allowable_sl_dist_at_min_lot):.2f}円 < 1.5*ATR_1h={float(required_min_sl_dist):.2f}円)"
                         ),
                         "max_sl_dist_at_min_lot": float(max_allowable_sl_dist_at_min_lot),
                         "required_min_sl_dist": float(required_min_sl_dist),
@@ -380,11 +399,20 @@ class TechnicalRadar:
         # トリガー1: 新規エントリー好機 (空き枠あり & キルスイッチ未発動 & レジーム許可 & 上位足トレンド + 1h押し目合致)
         # ------------------------------------------------------------------
         total_equity = calculate_total_equity_jpy(enriched_pf, market_summaries)
-        kill_switch_jpy = _to_decimal(enriched_pf.get("drawdown_kill_switch_jpy", 8500))
-        if kill_switch_jpy <= Decimal("0"):
-            kill_switch_jpy = Decimal("8500")
+        peak_equity = max(
+            _to_decimal(enriched_pf.get("peak_equity_jpy", 0)),
+            _to_decimal(enriched_pf.get("initial_capital_jpy", 10000)),
+            total_equity,
+        )
+        base_ks_jpy = _to_decimal(enriched_pf.get("drawdown_kill_switch_jpy", 8500))
+        if base_ks_jpy <= Decimal("0"):
+            base_ks_jpy = Decimal("8500")
+        kill_switch_jpy = max(Decimal("8500"), base_ks_jpy, (peak_equity * Decimal("0.85")).quantize(Decimal("0.01")))
         kill_switch_active = total_equity < kill_switch_jpy
         cb_triggered, _ = check_btc_circuit_breaker(market_summaries)
+
+        effective_max_min_notional = max(self.max_min_notional_jpy, total_equity * Decimal("0.25"))
+        effective_target_risk = max(self.target_risk_jpy, total_equity * DYNAMIC_TARGET_RISK_PCT)
 
         has_open_slot = (len(positions) + len(active_pending_buys)) < max_concurrent
         if has_open_slot and not kill_switch_active and not cb_triggered and regime_info["allow_new_buy"]:
@@ -399,15 +427,15 @@ class TechnicalRadar:
                 price_info = summary.get("price", {}) or {}
                 rule = rules.get(sym_up, {})
 
-                # Gate 3 チェック: 最小注文額 <= 2,500円 & 150円 / minOrderSize >= 1.5 * ATR_1h
+                # Gate 3 チェック (パターンA複利対応): 最小注文額 <= max(2500円, 総資産*25%) & 許容SLリスク / minOrderSize >= 1.5 * ATR_1h
                 last_p = _to_decimal(price_info.get("last", 0))
                 min_lot = _to_decimal(rule.get("min_order_size", "0.0001"))
                 atr_1h_val = _to_decimal(h1.get("atr_14", 0))
                 if last_p > 0 and min_lot > 0:
-                    if (min_lot * last_p) > self.max_min_notional_jpy:
+                    if (min_lot * last_p) > effective_max_min_notional:
                         gate3_skipped_symbols.append(sym_up)
                         continue
-                    if atr_1h_val > 0 and (self.target_risk_jpy / min_lot) < (atr_1h_val * self.min_sl_atr1h_mult):
+                    if atr_1h_val > 0 and (effective_target_risk / min_lot) < (atr_1h_val * self.min_sl_atr1h_mult):
                         gate3_skipped_symbols.append(sym_up)
                         continue
 

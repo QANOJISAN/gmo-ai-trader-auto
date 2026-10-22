@@ -1,0 +1,33 @@
+{
+  "timestamp": "2026-10-22T17:30:21+09:00",
+  "action": "HOLD",
+  "symbol": "NONE",
+  "order_type": "NONE",
+  "limit_price": 0,
+  "size": 0,
+  "take_profit_price": 0,
+  "stop_loss_price": 0,
+  "expected_cost_jpy": 0,
+  "expected_loss_jpy": 0,
+  "risk_reward_ratio": 0.0,
+  "confidence": 0.5,
+  "provider": "radar_gate_hold",
+  "execution_mode": "LIVE",
+  "radar_triggers": [],
+  "regime_info": {
+    "regime": "RISK_OFF_CRASH",
+    "allow_new_buy": false,
+    "should_cancel_pending_buys": true,
+    "in_hysteresis_cooldown": false,
+    "cooldown_until": "2026-10-22T19:30:21+09:00",
+    "btc_change_1h_pct": -0.32,
+    "btc_change_4h_pct": -1.4,
+    "btc_rsi_4h": 41.96,
+    "breadth_ratio": 0.0,
+    "reasons": [
+      "市場Breadth悪化 (0/10 = 0.0% < 25%)"
+    ]
+  },
+  "reasoning": "トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+  "status": "RADAR_SKIPPED_AI"
+}

@@ -51,14 +51,14 @@ MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP"}
 SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買クオンツアナリスト兼リスク審査AI（Veto Gate）です。
 確証バイアス（Confirmation Bias）を排除するため、必ず最初に「エントリーを見送るべき弱気要因・反対仮説 (`bearish_counter_thesis` 最低2項目)」を検証した上で、それを上回る強気根拠 (`bullish_conviction_factors`) と確信度スコア (`conviction_score`: 0〜100) が 75点以上ある場合のみ `BUY` を承認してください。
 
-【1. 運用・資金管理・リスク計算ルール】
+【1. 運用・資金管理・リスク計算ルール（パターンA：自動複利スケール型）】
 1. 対象はGMOコイン「取引所（現物）」のみ（レバレッジ取引・空売りは不可、新規エントリーは現物買い `BUY` のみ）。
-2. 資金配分上限: 1銘柄あたりの最大投入比率 `max_allocation_per_trade_pct` は `0.50`（初期資金10,000円のうち1ポジション最大5,000円）、同時保有は最大2銘柄（`max_concurrent_positions = 2`）までとすること。
-3. 損失許容上限（厳格化）:
-   - 逆指値（SL）発動時のTaker手数料（0.05%〜0.09%）とスリッページ予備を見込み、1トレードの名目許容損失額のターゲット上限を **「150円（または総資産の1.5%の小さい方）」** で数量逆算し、スリッページ込みの実損失でも絶対に **200円** を超えないよう注文数量 (`size`) を決定すること。
+2. 資金配分上限（動的複利）: 1銘柄あたりの最大投入比率 `max_allocation_per_trade_pct` は **`0.45`（現在の総資産 Equity の 45% 上限：資産1万円時は4,500円、資産10万円時は45,000円）**、同時保有は最大2銘柄（`max_concurrent_positions = 2`）までとすること。
+3. 損失許容上限（動的複利・厳格化）:
+   - 逆指値（SL）発動時のTaker手数料（0.05%〜0.09%）とスリッページ予備を見込み、1トレードの名目許容損失額（SLリスク予算）を **「現在の総資産の 1.2%〜1.5%」** で動的算出して数量逆算し、スリッページ込みの実損失でも絶対に **「現在の総資産の 2.0%」** を超えないよう注文数量 (`size`) を決定すること。
    - 「`(スプレッド + Taker手数料) ÷ SL距離`」が **10%** を超える場合は期待値マイナスとして `HOLD` とすること。
-   - 2枠目を新規 `BUY` する際、1枠目の想定リスクと合わせた **「ポートフォリオ合計リスク」が総資産の3.0%（初期300円）** を超えないこと。
-   - 総資産が **8,500円（初期資金から-15%）** を下回った場合は、ドローダウン・キルスイッチとして新規 `BUY` を停止（`HOLD` 強制）すること。
+   - 2枠目を新規 `BUY` する際、1枠目の想定リスクと合わせた **「ポートフォリオ合計リスク」が現在の総資産の3.0%** を超えないこと。
+   - 総資産が **「max(8,500円, 過去最高総資産 peak_equity_jpy × 0.85)（ピークから-15%）」** を下回った場合は、トレーリング・キルスイッチとして新規 `BUY` を停止（`HOLD` 強制）すること。
 4. リスクリワード比 (`(take_profit_price - limit_price) / (limit_price - stop_loss_price)`) は原則 **1.5以上** を確保すること。
 
 【2. 反対仮説優先出力JSONスキーマ】
@@ -492,10 +492,16 @@ class AIJudge:
             symbol_rules=symbol_rules,
             now_dt=now_jst,
         )
+        llm_portfolio_view = dict(enriched_portfolio)
+        llm_portfolio_view["positions"] = [
+            p
+            for p in (enriched_portfolio.get("positions", []) or [])
+            if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
+        ]
 
         user_payload = {
             "timestamp_jst": now_str,
-            "portfolio": enriched_portfolio,
+            "portfolio": llm_portfolio_view,
             "symbol_rules": symbol_rules,
             "market_summaries": market_summaries,
         }
@@ -833,16 +839,17 @@ class AIJudge:
             for o in pending_orders
         )
         available_jpy = max(0.0, jpy_balance - locked_pending_jpy)
-        max_alloc_pct = float(portfolio.get("max_allocation_per_trade_pct", 0.50))
         invested_jpy = sum(
             float(p.get("current_price") or p.get("entry_price", 0)) * float(p.get("size", 0))
             for p in positions
         )
         total_equity = jpy_balance + invested_jpy
+        raw_alloc_pct = float(portfolio.get("max_allocation_per_trade_pct", 0.45))
+        max_alloc_pct = 0.45 if (raw_alloc_pct <= 0.0 or raw_alloc_pct > 0.50 or total_equity > 15000.0) else raw_alloc_pct
         budget_jpy = min(available_jpy, total_equity * max_alloc_pct)
 
-        target_risk_cfg = float(portfolio.get("target_risk_per_trade_jpy", 150))
-        aim_risk_jpy = min(target_risk_cfg, total_equity * 0.015)
+        # パターンA: 1トレードあたりのSLリスク予算を現在の総資産の 1.2%〜1.5% で動的算出
+        aim_risk_jpy = max(total_equity * 0.012, total_equity * 0.015)
 
         best_symbol = "NONE"
         best_score = -999.0

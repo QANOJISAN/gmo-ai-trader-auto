@@ -575,11 +575,17 @@ def validate_and_adjust_decision(
     positions: List[Dict[str, Any]] = portfolio.get("positions", []) or []
     jpy_balance = _to_decimal(portfolio.get("jpy_balance", 10000))
     total_equity = calculate_total_equity_jpy(portfolio, market_summaries)
-    kill_switch_jpy = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", 8500))
-    if kill_switch_jpy <= 0:
+    peak_equity_val = max(
+        _to_decimal(portfolio.get("peak_equity_jpy", 0)),
+        _to_decimal(portfolio.get("initial_capital_jpy", 10000)),
+        Decimal("10000"),
+    )
+    base_ks_jpy = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", 8500))
+    if base_ks_jpy <= 0:
         # M-4: null・0・不正値でキルスイッチが無効化（0円）されないよう、初期資金の85%（既定8,500円）へフォールバック
         init_cap_for_ks = _to_decimal(portfolio.get("initial_capital_jpy", 10000))
-        kill_switch_jpy = (init_cap_for_ks * Decimal("0.85")) if init_cap_for_ks > 0 else Decimal("8500")
+        base_ks_jpy = (init_cap_for_ks * Decimal("0.85")) if init_cap_for_ks > 0 else Decimal("8500")
+    kill_switch_jpy = max(Decimal("8500"), base_ks_jpy, (peak_equity_val * Decimal("0.85")).quantize(Decimal("0.01")))
 
     # M-2: 確信度を [0.0, 1.0] に正規化（85 等の百分率表記による「8500%」表示を防止）
     adjusted["confidence"] = normalize_confidence(adjusted.get("confidence", 0))
@@ -594,11 +600,11 @@ def validate_and_adjust_decision(
             reason_prefix=f"[未知のアクション '{unknown_action}' のためHOLDへ正規化]",
         )
 
-    # 0a. ドローダウン・キルスイッチ（総資産 < 8,500円 で新規BUYを停止）
+    # 0a. ドローダウン・キルスイッチ（総資産 < max(8500, peak_equity * 0.85) で新規BUYを停止）
     if action == "BUY" and total_equity < kill_switch_jpy:
         msg = (
             f"[ドローダウン・キルスイッチ発動によりHOLDへ強制変更] "
-            f"現在の総資産 ({int(total_equity):,} 円) がキルスイッチ基準値 ({int(kill_switch_jpy):,} 円 / 初期資金比 -15%) "
+            f"現在の総資産 ({int(total_equity):,} 円) がキルスイッチ基準値 ({int(kill_switch_jpy):,} 円 / ピーク資産 {int(peak_equity_val):,} 円比 -15%) "
             "を下回っているため、新規BUYを停止します。"
         )
         logger.warning("🛑 キルスイッチ発動: %s", msg)
@@ -752,7 +758,7 @@ def validate_and_adjust_decision(
         limit_dec = Decimal("0")
         existing_tp = Decimal("0")
         existing_sl = Decimal("0")
-        for pos in positions:
+        for pos in active_positions:
             if str(pos.get("symbol", "")).strip().upper() == symbol:
                 existing_tp = _to_decimal(pos.get("take_profit_price") or pos.get("tp_price") or 0)
                 existing_sl = _to_decimal(pos.get("stop_loss_price") or pos.get("sl_price") or 0)
@@ -866,9 +872,33 @@ def validate_and_adjust_decision(
         tp_dec = Decimal("0")
         sl_dec = Decimal("0")
 
-    max_alloc_pct = _to_decimal(portfolio.get("max_allocation_per_trade_pct", 0.50))
-    target_risk_cfg = _to_decimal(portfolio.get("target_risk_per_trade_jpy", 150))
-    max_risk_cfg = _to_decimal(portfolio.get("max_risk_per_trade_jpy", 200))
+    # パターンA（自動複利スケール型）: 1銘柄あたり最大投入比率 45% (MAX_POSITION_ALLOCATION_PCT = 0.45)
+    MAX_POSITION_ALLOCATION_PCT = Decimal("0.45")
+    raw_alloc_pct = _to_decimal(portfolio.get("max_allocation_per_trade_pct", MAX_POSITION_ALLOCATION_PCT))
+    if raw_alloc_pct <= Decimal("0") or raw_alloc_pct > Decimal("0.50") or total_equity > Decimal("15000"):
+        max_alloc_pct = MAX_POSITION_ALLOCATION_PCT
+    else:
+        max_alloc_pct = raw_alloc_pct
+
+    # パターンA: 1トレードあたりの許容損失額（SLリスク予算）を現在の総資産の 1.2%〜1.5%（実損失上限 2.0%）で動的算出
+    conf_val = _to_decimal(adjusted.get("confidence", 0.80))
+    # 確信度に応じて [1.2%, 1.5%] の範囲でスケーリング（通常の BUY 承認時 >=0.75 は 1.5% を上限として適用）
+    dynamic_risk_pct = Decimal("0.015") if conf_val >= Decimal("0.75") else Decimal("0.012")
+    dynamic_min_risk_jpy = total_equity * Decimal("0.012")
+    dynamic_target_risk_jpy = max(dynamic_min_risk_jpy, total_equity * dynamic_risk_pct)
+    dynamic_hard_max_risk_jpy = total_equity * Decimal("0.020")
+
+    target_risk_cfg = _to_decimal(portfolio.get("target_risk_per_trade_jpy", 0))
+    max_risk_cfg = _to_decimal(portfolio.get("max_risk_per_trade_jpy", 0))
+    if target_risk_cfg <= Decimal("0") or total_equity > Decimal("10000") or target_risk_cfg == Decimal("150"):
+        effective_target_risk_jpy = dynamic_target_risk_jpy
+    else:
+        effective_target_risk_jpy = min(target_risk_cfg, dynamic_target_risk_jpy)
+
+    if max_risk_cfg <= Decimal("0") or total_equity > Decimal("10000") or max_risk_cfg == Decimal("200"):
+        effective_max_risk_jpy = dynamic_hard_max_risk_jpy
+    else:
+        effective_max_risk_jpy = min(max_risk_cfg, dynamic_hard_max_risk_jpy)
 
     fee_buffer = Decimal("1") + taker_fee
     per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct)
@@ -943,14 +973,13 @@ def validate_and_adjust_decision(
                     ),
                 )
 
-        # 5. 名目許容損失上限「min(150円, 総資産の1.5%, 残余ポートフォリオリスク枠)」から注文数量を逆算し、
-        #    さらに Taker手数料 + スリッページ予備を見込んだ実損失でも絶対に 200円（および残余リスク枠）を超えないよう制御
+        # 5. パターンA 動的複利リスク予算「総資産の1.2%〜1.5%（および残余ポートフォリオリスク枠）」から注文数量を逆算し、
+        #    さらに Taker手数料 + スリッページ予備を見込んだ実損失でも絶対に 総資産の2.0%（および残余リスク枠）を超えないよう制御
         nominal_target_risk_jpy = min(
-            target_risk_cfg,
-            total_equity * Decimal("0.015"),
+            effective_target_risk_jpy,
             remaining_portfolio_risk_jpy,
         )
-        hard_max_risk_jpy = min(max_risk_cfg, remaining_portfolio_risk_jpy)
+        hard_max_risk_jpy = min(effective_max_risk_jpy, remaining_portfolio_risk_jpy)
 
         # 1単位あたりの名目損失（SL幅＋SL発動時Taker手数料）およびスリッページ予備込み実損失
         sl_taker_fee_per_unit = sl_dec * taker_fee
@@ -1037,7 +1066,7 @@ def validate_and_adjust_decision(
         held_size = Decimal("0")
         held_entry = last_price if last_price > 0 else limit_dec
         held_initial_risk_jpy = Decimal("0")
-        for pos in positions:
+        for pos in active_positions:
             if str(pos.get("symbol", "")).upper() == symbol:
                 held_size += _to_decimal(pos.get("size", 0) or 0)
                 if _to_decimal(pos.get("entry_price", 0) or 0) > 0:

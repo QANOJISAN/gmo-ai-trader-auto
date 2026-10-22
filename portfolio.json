@@ -1,16 +1,38 @@
 {
   "initial_capital_jpy": 10000,
-  "jpy_balance": 10000,
+  "jpy_balance": 10025,
+  "peak_equity_jpy": 10025,
   "realized_pnl_total_jpy": 0,
   "total_realized_pnl_jpy": 0,
-  "max_allocation_per_trade_pct": 0.5,
+  "max_allocation_per_trade_pct": 0.45,
   "max_concurrent_positions": 2,
   "target_risk_per_trade_jpy": 150,
   "max_risk_per_trade_jpy": 200,
-  "drawdown_kill_switch_jpy": 8500,
-  "positions": [],
+  "drawdown_kill_switch_jpy": 8521.25,
+  "positions": [
+    {
+      "symbol": "ETH",
+      "side": "BUY",
+      "size": 0.00076653866858138,
+      "entry_price": 0.0,
+      "current_price": 0.0,
+      "take_profit_price": 0.0,
+      "stop_loss_price": 0.0,
+      "sl_order_id": "",
+      "state": "DUST_QUARANTINED",
+      "opened_at": "2026-10-22T17:30:20+09:00"
+    }
+  ],
   "closed_trades": [],
   "pending_orders": [],
-  "execution_mode": "DRY_RUN",
-  "last_updated": "2026-10-21T19:10:00+09:00"
+  "execution_mode": "LIVE",
+  "last_updated": "2026-10-22T18:00:34+09:00",
+  "quarantined_dust": [],
+  "campaign_schedule": {
+    "phase1_end_jst": "2027-07-09T00:00:00+09:00",
+    "phase2_start_jst": "2027-07-10T00:00:00+09:00",
+    "phase2_end_jst": "2027-12-10T00:00:00+09:00",
+    "pre_deadline_freeze_hours": 2.0,
+    "current_phase": "PHASE1_ACTIVE"
+  }
 }

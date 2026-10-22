@@ -2412,6 +2412,213 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
 
             daemon.shutdown()
 
+    def test_pattern_a_compounding_and_campaign_phase1_phase2_lifecycle(self) -> None:
+        """
+        パターンA（資産10万円時の複利スケーリング＆L3/L4/L5 High-Water Mark保護）および
+        第1回運用期限満了 (2027-07-09 00:00) -> 7月9日休止 -> 第2回開始 (2027-07-10 00:00) ->
+        第2回運用期限満了 (2027-12-10 00:00) の完全自動締め・全決済・レポート生成ライフサイクル検証
+        """
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                dry_run_notify=True,
+            )
+            try:
+                # ==============================================================
+                # Part 1: パターンA 資産10万円時の動的複利スケーリング (45%配分・1.5%リスク・L3/L4/L5 HWM)
+                # ==============================================================
+                t_comp = datetime(2027, 3, 15, 12, 0, 0, tzinfo=JST)
+                pf_100k = daemon.oco_manager.load_portfolio()
+                pf_100k["initial_capital_jpy"] = 10000
+                pf_100k["jpy_balance"] = 100000
+                pf_100k["max_allocation_per_trade_pct"] = 0.45
+                daemon.oco_manager.save_portfolio(pf_100k, now_dt=t_comp)
+
+                # save_portfolio と SQLite WAL に peak_equity_jpy=100,000 / drawdown_kill_switch_jpy=85,000 が永続化されていること
+                pf_loaded = daemon.oco_manager.load_portfolio()
+                self.assertEqual(pf_loaded["peak_equity_jpy"], 100000)
+                self.assertEqual(pf_loaded["drawdown_kill_switch_jpy"], 85000)
+                self.assertEqual(daemon.db_wal.get_meta("peak_equity_jpy"), 100000)
+
+                # 資産10万円時: 1銘柄最大45,000円 (45%)・許容損失1,500円 (1.5%) までスケールすること
+                # SOL @ 40,000円, SL @ 38,600円 (1枚あたり名目損失約1,434円 <= 1,500円, 投入額 40,000円 <= 45,000円)
+                summaries_100k = {
+                    "BTC": {
+                        "price": {"last": 14000000, "best_bid": 13995000, "best_ask": 14000000, "spread_pct": 0.03},
+                        "daily_indicators": {"trend": "STRONG_UPTREND", "rsi_14": 55.0, "atr_14": 300000.0},
+                        "h4_indicators": {"change_4h_pct": 1.2, "rsi_14": 54.0, "close": 14000000, "sma_25": 13800000},
+                        "h1_indicators": {"change_1h_pct": 0.5, "rsi_14": 45.0, "atr_14": 80000.0, "rsi_rebound": True},
+                    },
+                    "SOL": {
+                        "price": {"last": 40000, "best_bid": 40000, "best_ask": 40010, "spread_pct": 0.025},
+                        "daily_indicators": {"trend": "STRONG_UPTREND", "rsi_14": 52.0, "atr_14": 1200.0},
+                        "h4_indicators": {"change_4h_pct": 1.5, "rsi_14": 50.0, "close": 40000, "sma_25": 39000},
+                        "h1_indicators": {"change_1h_pct": 0.6, "rsi_14": 42.0, "atr_14": 450.0, "rsi_rebound": True},
+                    },
+                }
+                val_100k = validate_and_adjust_decision(
+                    decision={
+                        "action": "BUY",
+                        "symbol": "SOL",
+                        "limit_price": 40000,
+                        "size": 1.0,
+                        "take_profit_price": 43000,
+                        "stop_loss_price": 38600,
+                        "confidence": 0.85,
+                    },
+                    portfolio=pf_loaded,
+                    symbol_rules=DEFAULT_SYMBOL_RULES,
+                    market_summaries=summaries_100k,
+                )
+                self.assertEqual(val_100k["action"], "BUY")
+                self.assertAlmostEqual(float(val_100k["size"]), 1.0, places=4)
+                self.assertEqual(val_100k["expected_cost_jpy"], 40000)
+                self.assertTrue(1200 <= val_100k["expected_loss_jpy"] <= 1500)
+
+                # L3 (日次 -3% = -3,000円) & L4 (週次 -6% = -6,000円) の動的スケーリング確認
+                l3_chk = daemon.circuit_breaker.check_l3_daily_loss(pf_loaded, now_dt=t_comp)
+                self.assertEqual(l3_chk["daily_loss_limit_jpy"], -3000.0)
+                l4_chk = daemon.circuit_breaker.check_l4_weekly_and_streak(pf_loaded, now_dt=t_comp)
+                self.assertEqual(l4_chk["weekly_loss_limit_jpy"], -6000.0)
+
+                # ==============================================================
+                # Part 2: 第1回終了2時間前凍結 (2027-07-08 22:05) -> 満了全決済 (2027-07-09 00:00)
+                # ==============================================================
+                t_before_p1_freeze = datetime(2027, 7, 8, 21, 30, 0, tzinfo=JST)
+                tickers_p1 = {
+                    "XRP": {"bid": 200.0, "ask": 200.1, "last": 200.0},
+                    "DOGE": {"bid": 20.0, "ask": 20.01, "last": 20.0},
+                }
+                daemon.broker.update_market_tickers(tickers_p1)
+
+                # (1) XRP は約定済み保有建玉 (SL_ACTIVE)、DOGE は未約定の買い指値 (PENDING_BUY) を作成
+                buy_xrp = daemon.oco_manager.place_new_buy_order(
+                    {
+                        "action": "BUY",
+                        "symbol": "XRP",
+                        "limit_price": 200.0,
+                        "size": 50.0,
+                        "take_profit_price": 220.0,
+                        "stop_loss_price": 193.0,
+                        "expected_loss_jpy": 350,
+                    },
+                    tickers=tickers_p1,
+                    now_dt=t_before_p1_freeze,
+                )
+                self.assertEqual(buy_xrp["status"], "PENDING_BUY")
+                # XRP を約定させて SL_ACTIVE へ
+                daemon.oco_manager.step(
+                    tickers={"XRP": {"bid": 199.8, "ask": 199.9, "last": 199.8}},
+                    now_dt=t_before_p1_freeze + timedelta(minutes=1),
+                )
+                # DOGE を未約定の PENDING_BUY として発注
+                buy_doge = daemon.oco_manager.place_new_buy_order(
+                    {
+                        "action": "BUY",
+                        "symbol": "DOGE",
+                        "limit_price": 19.5,
+                        "size": 100.0,
+                        "take_profit_price": 22.0,
+                        "stop_loss_price": 18.8,
+                        "expected_loss_jpy": 70,
+                    },
+                    tickers=tickers_p1,
+                    now_dt=t_before_p1_freeze + timedelta(minutes=2),
+                )
+                self.assertEqual(buy_doge["status"], "PENDING_BUY")
+
+                # (2) 2027-07-08 22:05 JST (第1回終了2時間前ウィンドウ):
+                # 未約定の DOGE 買い指値が自動キャンセルされ、保有中の XRP ポジションは維持されること
+                t_p1_freeze = datetime(2027, 7, 8, 22, 5, 0, tzinfo=JST)
+                fast_freeze1 = daemon.run_fast_cycle(
+                    tickers={"XRP": {"bid": 202.0, "ask": 202.1, "last": 202.0}, "DOGE": {"bid": 20.0, "ask": 20.01, "last": 20.0}},
+                    now_dt=t_p1_freeze,
+                )
+                self.assertEqual(fast_freeze1["campaign_phase"], "PHASE1_PRE_DEADLINE_FREEZE")
+                pf_freeze1 = daemon.oco_manager.load_portfolio()
+                self.assertEqual(len(pf_freeze1["pending_orders"]), 0)
+                active_pos_f1 = [p for p in pf_freeze1["positions"] if p.get("state") != "DUST_QUARANTINED"]
+                self.assertEqual(len(active_pos_f1), 1)
+                self.assertEqual(active_pos_f1[0]["symbol"], "XRP")
+
+                # (3) 2027-07-09 00:00:05 JST (第1回運用期限到達):
+                # XRP ポジションが PHASE1_DEADLINE_SETTLEMENT で即時成行全決済され、PERFORMANCE_REPORT_PHASE1.md が生成されること
+                t_p1_end = datetime(2027, 7, 9, 0, 0, 5, tzinfo=JST)
+                fast_p1_end = daemon.run_fast_cycle(
+                    tickers={"XRP": {"bid": 205.0, "ask": 205.1, "last": 205.0}},
+                    now_dt=t_p1_end,
+                )
+                self.assertEqual(fast_p1_end["status"], "PHASE1_COMPLETED_INTERMISSION")
+                self.assertTrue(any(e.get("type") == "PHASE1_DEADLINE_SETTLEMENT" for e in fast_p1_end["events"]))
+                self.assertTrue((tmp_dir / "PERFORMANCE_REPORT_PHASE1.md").exists())
+
+                pf_after_p1 = daemon.oco_manager.load_portfolio()
+                self.assertTrue(pf_after_p1.get("phase1_settled"))
+                self.assertEqual(
+                    len([p for p in pf_after_p1["positions"] if p.get("state") != "DUST_QUARANTINED"]),
+                    0,
+                )
+
+                # (4) 2027-07-09 12:00:00 JST (検証・改良休止ウィンドウ中):
+                # 重複決済は走らず、PHASE1_COMPLETED_INTERMISSION で安全にスキップされること
+                t_intermission = datetime(2027, 7, 9, 12, 0, 0, tzinfo=JST)
+                fast_inter = daemon.run_fast_cycle(now_dt=t_intermission)
+                self.assertEqual(fast_inter["status"], "PHASE1_COMPLETED_INTERMISSION")
+                self.assertEqual(fast_inter["events"], [])
+
+                # ==============================================================
+                # Part 3: 第2回自動開始 (2027-07-10 00:00) -> 第2回満了全決済 (2027-12-10 00:00)
+                # ==============================================================
+                t_p2_start = datetime(2027, 7, 10, 0, 0, 5, tzinfo=JST)
+                fast_p2_start = daemon.run_fast_cycle(
+                    tickers={"XRP": {"bid": 210.0, "ask": 210.1, "last": 210.0}},
+                    now_dt=t_p2_start,
+                )
+                self.assertEqual(fast_p2_start["status"], "OK")
+                self.assertEqual(fast_p2_start["campaign_phase"], "PHASE2_ACTIVE")
+                self.assertTrue(any(e.get("type") == "PHASE2_CAMPAIGN_STARTED" for e in fast_p2_start["events"]))
+
+                # 第2回期間中に新規ポジション (XRP 50枚 @ 200円) を構築して約定させる
+                daemon.oco_manager.place_new_buy_order(
+                    {
+                        "action": "BUY",
+                        "symbol": "XRP",
+                        "limit_price": 200.0,
+                        "size": 50.0,
+                        "take_profit_price": 230.0,
+                        "stop_loss_price": 192.0,
+                        "expected_loss_jpy": 400,
+                    },
+                    tickers={"XRP": {"bid": 200.5, "ask": 200.6, "last": 200.5}},
+                    now_dt=t_p2_start + timedelta(hours=2),
+                )
+                daemon.oco_manager.step(
+                    tickers={"XRP": {"bid": 199.5, "ask": 199.6, "last": 199.5}},
+                    now_dt=t_p2_start + timedelta(hours=2, minutes=5),
+                )
+
+                # 2027-12-10 00:00:05 JST (第2回運用期限満了):
+                # 全ポジションが PHASE2_DEADLINE_SETTLEMENT で成行全決済され、PERFORMANCE_REPORT_PHASE2.md が生成され HALT へ移行すること
+                t_p2_end = datetime(2027, 12, 10, 0, 0, 5, tzinfo=JST)
+                fast_p2_end = daemon.run_fast_cycle(
+                    tickers={"XRP": {"bid": 215.0, "ask": 215.1, "last": 215.0}},
+                    now_dt=t_p2_end,
+                )
+                self.assertEqual(fast_p2_end["status"], "PHASE2_COMPLETED_HALT")
+                self.assertTrue(any(e.get("type") == "PHASE2_DEADLINE_SETTLEMENT" for e in fast_p2_end["events"]))
+                self.assertTrue((tmp_dir / "PERFORMANCE_REPORT_PHASE2.md").exists())
+
+                pf_after_p2 = daemon.oco_manager.load_portfolio()
+                self.assertTrue(pf_after_p2.get("phase2_settled"))
+                self.assertEqual(
+                    len([p for p in pf_after_p2["positions"] if p.get("state") != "DUST_QUARANTINED"]),
+                    0,
+                )
+            finally:
+                daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

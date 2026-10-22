@@ -1317,6 +1317,17 @@ class DatabaseWAL:
                     """,
                     (dumps_json(portfolio, indent=None), ts),
                 )
+                peak_eq_val = portfolio.get("peak_equity_jpy", portfolio.get("initial_capital_jpy", 10000))
+                self._conn.execute(
+                    """
+                    INSERT INTO account_meta (key, value_json, updated_ts_ms)
+                    VALUES ('peak_equity_jpy', ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_ts_ms = excluded.updated_ts_ms
+                    """,
+                    (dumps_json(peak_eq_val, indent=None), ts),
+                )
                 self._conn.execute("COMMIT;")
                 self._write_count += 1
                 if self._write_count % 100 == 0:
@@ -1330,6 +1341,40 @@ class DatabaseWAL:
 
             if self.auto_sync_files and self.portfolio_json_path is not None:
                 atomic_write_text(self.portfolio_json_path, dumps_json(portfolio, indent=2))
+
+    def get_meta(self, key: str, default: Any = None) -> Any:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value_json FROM account_meta WHERE key = ?",
+                (str(key),),
+            ).fetchone()
+            if row:
+                try:
+                    return json.loads(row["value_json"])
+                except Exception:
+                    return row["value_json"]
+            return default
+
+    def set_meta(self, key: str, value: Any, now_ts_ms: Optional[int] = None) -> None:
+        ts = int(now_ts_ms if now_ts_ms is not None else time.time() * 1000)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE;")
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO account_meta (key, value_json, updated_ts_ms)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value_json = excluded.value_json,
+                        updated_ts_ms = excluded.updated_ts_ms
+                    """,
+                    (str(key), dumps_json(value, indent=None), ts),
+                )
+                self._conn.execute("COMMIT;")
+                self._write_count += 1
+            except Exception:
+                self._conn.execute("ROLLBACK;")
+                raise
 
     def load_portfolio_snapshot(self) -> Optional[Dict[str, Any]]:
         with self._lock:

@@ -372,13 +372,29 @@ class MultiTierCircuitBreaker:
             unrealized += (bid_dec - entry_dec) * size_dec
 
         daily_total_pnl = realized_today + unrealized
-        if daily_total_pnl <= self.l3_daily_loss_limit_jpy:
+        current_eq, _ = self.calculate_conservative_equity_jpy(portfolio, tickers)
+        explicit_daily_start = _to_decimal(portfolio.get("daily_starting_equity_jpy", 0))
+        daily_starting_eq = (
+            explicit_daily_start
+            if explicit_daily_start > Decimal("0")
+            else max(
+                _to_decimal(portfolio.get("initial_capital_jpy", 10000)),
+                current_eq - daily_total_pnl,
+            )
+        )
+        base_l3_abs = abs(self.l3_daily_loss_limit_jpy)
+        dynamic_l3_abs = max(base_l3_abs, (daily_starting_eq * Decimal("0.03")).quantize(Decimal("0.01")))
+        effective_l3_limit = -dynamic_l3_abs
+
+        if daily_total_pnl <= effective_l3_limit:
             self.l3_paused_until = next_day_start
 
         blocked = bool(self.l3_paused_until and now_jst < self.l3_paused_until)
         return {
             "level": "L3",
             "blocked": blocked,
+            "daily_starting_equity_jpy": float(daily_starting_eq),
+            "daily_loss_limit_jpy": float(effective_l3_limit),
             "daily_realized_pnl_jpy": float(realized_today),
             "daily_unrealized_pnl_jpy": float(unrealized),
             "daily_total_pnl_jpy": float(daily_total_pnl),
@@ -424,12 +440,26 @@ class MultiTierCircuitBreaker:
             else:
                 weekly_pnl += pnl
 
+        current_eq, _ = self.calculate_conservative_equity_jpy(portfolio)
+        explicit_weekly_start = _to_decimal(portfolio.get("weekly_starting_equity_jpy", 0))
+        weekly_starting_eq = (
+            explicit_weekly_start
+            if explicit_weekly_start > Decimal("0")
+            else max(
+                _to_decimal(portfolio.get("initial_capital_jpy", 10000)),
+                current_eq - weekly_pnl,
+            )
+        )
+        base_l4_abs = abs(self.l4_weekly_loss_limit_jpy)
+        dynamic_l4_abs = max(base_l4_abs, (weekly_starting_eq * Decimal("0.06")).quantize(Decimal("0.01")))
+        effective_l4_limit = -dynamic_l4_abs
+
         reasons: List[str] = []
-        if weekly_pnl <= self.l4_weekly_loss_limit_jpy:
+        if weekly_pnl <= effective_l4_limit:
             target_until = now_jst + timedelta(hours=self.l4_weekly_cooldown_hours)
             if self.l4_paused_until is None or target_until > self.l4_paused_until:
                 self.l4_paused_until = target_until
-            reasons.append(f"L4: 直近7日間損失上限到達 ({float(weekly_pnl):+.0f}円 <= {float(self.l4_weekly_loss_limit_jpy):.0f}円 -> 24h停止)")
+            reasons.append(f"L4: 直近7日間損失上限到達 ({float(weekly_pnl):+.0f}円 <= {float(effective_l4_limit):.0f}円 -> 24h停止)")
 
         if streak >= self.l4_max_consecutive_losses:
             target_until = now_jst + timedelta(hours=self.l4_streak_cooldown_hours)
@@ -441,6 +471,8 @@ class MultiTierCircuitBreaker:
         return {
             "level": "L4",
             "blocked": blocked,
+            "weekly_starting_equity_jpy": float(weekly_starting_eq),
+            "weekly_loss_limit_jpy": float(effective_l4_limit),
             "consecutive_losses": streak,
             "weekly_pnl_jpy": float(weekly_pnl),
             "paused_until": self.l4_paused_until.isoformat(timespec="seconds") if self.l4_paused_until else None,
@@ -512,17 +544,38 @@ class MultiTierCircuitBreaker:
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        L5 ハード・キルスイッチ判定:
-        - `Best Bid * (1 - Taker Fee)` による保守的総資産が `< 8,500円` となった回数をカウントし、
+        L5 ハード・キルスイッチ判定 (パターンA High-Water Mark 連動):
+        - 過去最高総資産 `peak_equity_jpy` を追跡し、`threshold = max(8500.0, peak_equity_jpy * 0.85)` を動的算出する。
+        - `Best Bid * (1 - Taker Fee)` による保守的総資産が `< threshold` となった回数をカウントし、
           有効な Best Bid のもとで **3回連続** 下回ったときに `l5_kill_switch_latched = True` を発動する。
         - 単発のヒゲ（1〜2回で回復）や Best Bid 欠損時はカウンタをリセットまたはスキップし、誤爆を防ぐ。
         """
         conservative_eq, bids_valid = self.calculate_conservative_equity_jpy(portfolio, tickers)
         self.l5_last_conservative_equity_jpy = conservative_eq
 
-        threshold = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", self.l5_kill_switch_equity_jpy))
-        if threshold <= Decimal("0"):
-            threshold = self.l5_kill_switch_equity_jpy
+        init_cap = _to_decimal(portfolio.get("initial_capital_jpy", 10000))
+        prev_peak = max(_to_decimal(portfolio.get("peak_equity_jpy", 0)), init_cap, Decimal("10000"))
+        peak_updated = False
+        if bids_valid and conservative_eq > prev_peak:
+            peak_equity = conservative_eq
+            peak_updated = True
+        else:
+            peak_equity = prev_peak
+
+        peak_val_num = int(peak_equity) if peak_equity == peak_equity.to_integral() else float(round(peak_equity, 2))
+        if portfolio.get("peak_equity_jpy") != peak_val_num:
+            portfolio["peak_equity_jpy"] = peak_val_num
+            peak_updated = True
+
+        base_threshold = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", self.l5_kill_switch_equity_jpy))
+        if base_threshold <= Decimal("0"):
+            base_threshold = self.l5_kill_switch_equity_jpy
+        hwm_threshold = (peak_equity * Decimal("0.85")).quantize(Decimal("0.01"))
+        threshold = max(self.l5_kill_switch_equity_jpy, base_threshold, hwm_threshold)
+        thresh_val_num = int(threshold) if threshold == threshold.to_integral() else float(round(threshold, 2))
+        if portfolio.get("drawdown_kill_switch_jpy") != thresh_val_num:
+            portfolio["drawdown_kill_switch_jpy"] = thresh_val_num
+            peak_updated = True
 
         if not bids_valid:
             # API欠損（Best Bid <= 0）時はカウントを進めない
@@ -531,6 +584,8 @@ class MultiTierCircuitBreaker:
                 "latched": self.l5_kill_switch_latched,
                 "newly_triggered": False,
                 "conservative_equity_jpy": float(conservative_eq),
+                "peak_equity_jpy": float(peak_equity),
+                "peak_updated": peak_updated,
                 "threshold_jpy": float(threshold),
                 "consecutive_breaches": self.l5_consecutive_breach_count,
                 "bids_valid": False,
@@ -553,6 +608,8 @@ class MultiTierCircuitBreaker:
             "latched": self.l5_kill_switch_latched,
             "newly_triggered": newly_triggered,
             "conservative_equity_jpy": float(conservative_eq),
+            "peak_equity_jpy": float(peak_equity),
+            "peak_updated": peak_updated,
             "threshold_jpy": float(threshold),
             "consecutive_breaches": self.l5_consecutive_breach_count,
             "bids_valid": True,
