@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-24T05:06:05+09:00",
+  "timestamp": "2026-10-24T05:20:55+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -95,9 +95,9 @@
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 257,
     "remaining_hours": 18,
-    "remaining_minutes": 53,
-    "remaining_total_seconds": 22272834,
-    "countdown_text": "第1回締め(2027/7/9) 残り 257日 18時間 53分",
+    "remaining_minutes": 39,
+    "remaining_total_seconds": 22271944,
+    "countdown_text": "第1回締め(2027/7/9) 残り 257日 18時間 39分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -108,7 +108,7 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 375425.0,
+        "current_bid": 375502.0,
         "estimated_value_jpy": 287.8,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
@@ -153,7 +153,6 @@
     }
   },
   "logs": [
-    "2026-10-24 04:05:34,083 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent \"HTTP/1.1 503 Service Unavailable\"",
     "2026-10-24 04:05:34,084 [WARNING] src.ai_judge: Gemini モデル 'gemini-3.6-flash' 呼び出し失敗 (次候補へフォールバック): 503 UNAVAILABLE. {'error': {'code': 503, 'message': 'This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.', 'status': 'UNAVAILABLE'}}",
     "2026-10-24 04:05:34,084 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.5-flash (thinking_level=HIGH)",
     "2026-10-24 04:05:34,085 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
@@ -182,99 +181,100 @@
     "2026-10-24 05:05:52,897 [WARNING] src.ai_judge: Gemini モデル 'gemini-3.7-flash' 呼び出し失敗 (次候補へフォールバック): 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.",
     "2026-10-24 05:05:52,897 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.6-flash (thinking_level=HIGH)",
     "2026-10-24 05:05:52,897 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
-    "2026-10-24 05:06:05,046 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent \"HTTP/1.1 200 OK\""
+    "2026-10-24 05:06:05,046 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent \"HTTP/1.1 200 OK\"",
+    "2026-10-24 05:20:55,176 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12753553.0,
-      "bid": 12753552.0,
+      "ask": 12760265.0,
+      "bid": 12760264.0,
       "high": 12874000.0,
       "low": 12662387.0,
-      "last": 12753552.0,
-      "volume": 119.99746,
-      "trading_value_24h": 1530393845.98,
+      "last": 12760263.0,
+      "volume": 119.55898,
+      "trading_value_24h": 1525604028.81,
       "spread": 1.0,
       "spread_pct": 0.0,
-      "timestamp": "2026-10-23T20:06:04.092Z"
+      "timestamp": "2026-10-23T20:20:52.920Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 375627.0,
-      "bid": 375425.0,
+      "ask": 375736.0,
+      "bid": 375502.0,
       "high": 379321.0,
       "low": 371807.0,
       "last": 375500.0,
-      "volume": 2142.1224,
-      "trading_value_24h": 804366961.2,
-      "spread": 202.0,
-      "spread_pct": 0.0538,
-      "timestamp": "2026-10-23T20:06:04.608Z"
+      "volume": 2138.8556,
+      "trading_value_24h": 803140277.8,
+      "spread": 234.0,
+      "spread_pct": 0.0623,
+      "timestamp": "2026-10-23T20:20:52.939Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 44387.0,
-      "bid": 44290.0,
+      "ask": 44342.0,
+      "bid": 44260.0,
       "high": 45201.0,
       "low": 42858.0,
       "last": 44460.0,
       "volume": 436.703,
       "trading_value_24h": 19415815.38,
-      "spread": 97.0,
-      "spread_pct": 0.219,
-      "timestamp": "2026-10-23T20:06:04.117Z"
+      "spread": 82.0,
+      "spread_pct": 0.1853,
+      "timestamp": "2026-10-23T20:20:52.593Z"
     },
     "LTC": {
       "symbol": "LTC",
-      "ask": 9140.0,
-      "bid": 9118.0,
+      "ask": 9118.0,
+      "bid": 9102.0,
       "high": 9388.0,
       "low": 9100.0,
-      "last": 9180.0,
-      "volume": 1871.87,
-      "trading_value_24h": 17183766.6,
-      "spread": 22.0,
-      "spread_pct": 0.2413,
-      "timestamp": "2026-10-23T20:06:04.219Z"
+      "last": 9118.0,
+      "volume": 1243.5,
+      "trading_value_24h": 11338233.0,
+      "spread": 16.0,
+      "spread_pct": 0.1758,
+      "timestamp": "2026-10-23T20:20:53.156Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 204.583,
-      "bid": 204.33,
+      "ask": 204.561,
+      "bid": 204.4,
       "high": 208.966,
       "low": 203.696,
-      "last": 204.128,
-      "volume": 1692334.0,
-      "trading_value_24h": 345452754.75,
-      "spread": 0.2529999999999859,
-      "spread_pct": 0.1238,
-      "timestamp": "2026-10-23T20:06:04.335Z"
+      "last": 204.53,
+      "volume": 1629647.0,
+      "trading_value_24h": 333311700.91,
+      "spread": 0.16100000000000136,
+      "spread_pct": 0.0788,
+      "timestamp": "2026-10-23T20:20:53.297Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.414,
-      "bid": 12.412,
+      "ask": 12.396,
+      "bid": 12.381,
       "high": 12.637,
       "low": 12.3,
-      "last": 12.424,
-      "volume": 3398175.0,
-      "trading_value_24h": 42218926.2,
-      "spread": 0.0019999999999988916,
-      "spread_pct": 0.0161,
-      "timestamp": "2026-10-23T20:06:04.290Z"
+      "last": 12.408,
+      "volume": 3398727.0,
+      "trading_value_24h": 42171404.62,
+      "spread": 0.015000000000000568,
+      "spread_pct": 0.1212,
+      "timestamp": "2026-10-23T20:20:53.541Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16243.0,
-      "bid": 16242.0,
+      "ask": 16238.0,
+      "bid": 16237.0,
       "high": 16486.0,
       "low": 16150.0,
-      "last": 16246.0,
-      "volume": 15118.6,
-      "trading_value_24h": 245616775.6,
+      "last": 16251.0,
+      "volume": 15188.3,
+      "trading_value_24h": 246825063.3,
       "spread": 1.0,
       "spread_pct": 0.0062,
-      "timestamp": "2026-10-23T20:06:03.722Z"
+      "timestamp": "2026-10-23T20:20:52.979Z"
     }
   },
   "static_snapshot": true
