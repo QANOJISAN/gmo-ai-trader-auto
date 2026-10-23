@@ -47,12 +47,18 @@ from dotenv import load_dotenv
 
 from src.circuit_breaker import MultiTierCircuitBreaker, SingleInstanceLock
 from src.database_wal import DatabaseWAL, atomic_write_text
-from src.dpapi_vault import build_github_basic_auth_header, load_and_unprotect_dotenv
+from src.dpapi_vault import (
+    build_github_basic_auth_header,
+    encrypt_dotenv_secrets_inplace,
+    get_secret_env,
+    load_and_unprotect_dotenv,
+)
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import create_broker_client
 from src.json_utils import dumps_json, load_json_file
 from src.notifier import mask_secrets
 from src.pseudo_oco_manager import PseudoOCOManager
+from src.pwa_crypto import encrypt_json_envelope, generate_default_pwa_password
 from src.remote_control import (
     RemoteControlManager,
     ReplayOrExpiredNonceError,
@@ -612,7 +618,7 @@ def build_pwa_manifest(start_url: str = "./index.html") -> Dict[str, Any]:
 
 
 SERVICE_WORKER_JS = r"""// GMO AI Trader v2 - Service Worker (sw.js)
-const CACHE_NAME = 'gmo-ai-trader-v2-pwa-v2';
+const CACHE_NAME = 'gmo-ai-trader-v2-pwa-v3';
 const APP_SHELL = [
   './',
   './index.html',
@@ -712,8 +718,10 @@ class WebDashboardService:
         self._cached_tickers: Dict[str, Dict[str, Any]] = {}
         self._cached_tickers_at: float = 0.0
         self._cached_klines: Dict[Tuple[str, str], Tuple[float, List[Dict[str, Any]]]] = {}
+        self._last_charts_map: Dict[str, Any] = {}
         self.lan_ip: str = detect_lan_ipv4()
         self.github_pages_url: str = os.getenv("GITHUB_PAGES_URL", DEFAULT_GITHUB_PAGES_URL).strip()
+        self.pwa_unlock_password: str = self._ensure_pwa_unlock_password()
 
         self.db_wal = DatabaseWAL(
             self.wal_db_path,
@@ -744,6 +752,30 @@ class WebDashboardService:
             symbol_rules=DEFAULT_SYMBOL_RULES,
             l5_kill_switch_equity_jpy=float(os.getenv("DRAWDOWN_KILL_SWITCH_JPY", str(DEFAULT_DRAWDOWN_KILL_SWITCH_JPY))),
         )
+
+    def _ensure_pwa_unlock_password(self) -> str:
+        """
+        スマホPWAゼロ知識復号用パスワード (`PWA_UNLOCK_PASSWORD`) を取得する。
+        未設定の場合は強固な初期パスフレーズを生成し、`.env` が存在すれば DPAPI 暗号化して保存する。
+        """
+        env_file = self.base_dir / ".env"
+        if env_file.exists():
+            load_and_unprotect_dotenv(env_file)
+        pw = get_secret_env("PWA_UNLOCK_PASSWORD", "").strip()
+        if not pw:
+            pw = generate_default_pwa_password()
+            os.environ["PWA_UNLOCK_PASSWORD"] = pw
+            if env_file.exists():
+                try:
+                    encrypt_dotenv_secrets_inplace(env_file, extra_secrets={"PWA_UNLOCK_PASSWORD": pw})
+                except Exception as exc:
+                    logger.warning("PWA_UNLOCK_PASSWORD の DPAPI 保存スキップ: %s", mask_secrets(str(exc)))
+        return pw
+
+    def get_pwa_unlock_password(self) -> str:
+        if not getattr(self, "pwa_unlock_password", ""):
+            self.pwa_unlock_password = self._ensure_pwa_unlock_password()
+        return self.pwa_unlock_password
 
     def close(self) -> None:
         try:
@@ -1338,40 +1370,56 @@ class WebDashboardService:
     ) -> Dict[str, Any]:
         """
         外出先 (GitHub Pages 等) からスマートフォン PWA として閲覧するための静的アセット一式と
-        最新スナップショット (`status_snapshot.json`, `chart_snapshots.json`) を `docs/` にアトミック出力する。
-        （※APIキー・シークレット・Webhook URL等の機密情報は1文字も含まない）
+        AES-256-GCM + PBKDF2-SHA256 (150,000回) で暗号化した最新スナップショット
+        (`status_snapshot.json`, `chart_snapshots.json`) を `docs/` にアトミック出力する。
+        （※平文の口座情報・資産額・建玉・AI判定・ログ・チャートは `docs/` に1文字も出力しない）
         """
         target_dir = Path(output_dir) if output_dir is not None else self.docs_dir
         target_dir.mkdir(parents=True, exist_ok=True)
 
-        lan_url = f"http://{self.lan_ip}:{self.port}"
+        local_url = f"http://127.0.0.1:{self.port}"
         gh_url = self.github_pages_url
+        pwa_password = self.get_pwa_unlock_password()
 
         # 1. PWA 静的シェル (index.html, manifest.json, sw.js, icons, static QR codes)
         atomic_write_text(target_dir / "index.html", DASHBOARD_HTML)
         atomic_write_text(target_dir / "manifest.json", dumps_json(build_pwa_manifest(start_url="./index.html"), indent=2))
         atomic_write_text(target_dir / "sw.js", SERVICE_WORKER_JS)
         atomic_write_text(target_dir / "icon.svg", generate_app_icon_svg())
-        atomic_write_text(target_dir / "qr-lan.svg", generate_qr_svg(lan_url))
+        atomic_write_text(target_dir / "qr-lan.svg", generate_qr_svg(local_url))
         atomic_write_text(target_dir / "qr-gh.svg", generate_qr_svg(gh_url))
         (target_dir / "icon-192.png").write_bytes(generate_app_icon_png(192))
         (target_dir / "icon-512.png").write_bytes(generate_app_icon_png(512))
 
-        # 2. 最新ステータススナップショット (status_snapshot.json)
-        status_payload = self.get_status_payload(now_dt=now_dt)
-        status_payload["static_snapshot"] = True
-        atomic_write_text(target_dir / "status_snapshot.json", dumps_json(status_payload, indent=2))
-
-        # 3. チャートスナップショット (chart_snapshots.json)
+        # 2. チャートスナップショット収集 (chart_snapshots.json)
         chart_snap_path = target_dir / "chart_snapshots.json"
-        if include_charts or not chart_snap_path.exists():
-            charts_map: Dict[str, Any] = {}
-            for sym in ("BTC", "ETH", "XRP", "SOL", "DOGE"):
+        charts_map: Dict[str, Any] = dict(self._last_charts_map)
+        if include_charts or not chart_snap_path.exists() or not charts_map:
+            fresh_charts: Dict[str, Any] = {}
+            for sym in ("BTC", "ETH", "XRP", "SOL", "DOGE", "BCH", "LTC"):
                 try:
-                    charts_map[f"{sym}_1hour"] = self.get_chart_payload(symbol=sym, interval="1hour", limit=48)
+                    fresh_charts[f"{sym}_1hour"] = self.get_chart_payload(symbol=sym, interval="1hour", limit=48)
                 except Exception:
                     pass
-            atomic_write_text(chart_snap_path, dumps_json(charts_map, indent=None))
+            if fresh_charts:
+                charts_map = fresh_charts
+                self._last_charts_map = dict(fresh_charts)
+
+        if include_charts or not chart_snap_path.exists():
+            enc_charts = encrypt_json_envelope(charts_map, pwa_password)
+            atomic_write_text(chart_snap_path, dumps_json(enc_charts, indent=2))
+
+        # 3. 最新ステータススナップショット (status_snapshot.json — ゼロ知識 AES-256-GCM 暗号化エンベロープのみ)
+        status_payload = self.get_status_payload(now_dt=now_dt)
+        status_payload.pop("pwa_unlock_password", None)
+        status_payload["static_snapshot"] = True
+        if isinstance(status_payload.get("network_info"), dict):
+            status_payload["network_info"]["lan_ip"] = "127.0.0.1"
+            status_payload["network_info"]["lan_url"] = local_url
+        if charts_map:
+            status_payload["chart_snapshots"] = charts_map
+        enc_status = encrypt_json_envelope(status_payload, pwa_password)
+        atomic_write_text(target_dir / "status_snapshot.json", dumps_json(enc_status, indent=2))
 
         if auto_push and target_dir.resolve() == self.docs_dir.resolve():
             push_docs_snapshot_async(self.base_dir, force=force_push)
@@ -1776,11 +1824,83 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     height: 168px;
     border-radius: 8px;
   }
+  /* Zero-Knowledge Lock Screen (AES-256-GCM) */
+  .zk-lock-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 600;
+    background: radial-gradient(circle at top, #172554 0%, #0b0f19 60%, #050811 100%);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .zk-lock-card {
+    background: rgba(17, 24, 39, 0.96);
+    border: 1px solid #38bdf8;
+    border-radius: 16px;
+    max-width: 440px;
+    width: 100%;
+    padding: 24px 22px;
+    box-shadow: 0 25px 60px rgba(0,0,0,0.8);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    text-align: center;
+  }
+  .zk-input {
+    width: 100%;
+    padding: 12px 14px;
+    border-radius: 10px;
+    border: 1px solid #334155;
+    background: #090d16;
+    color: #f8fafc;
+    font-size: 0.95rem;
+    font-family: monospace;
+    outline: none;
+  }
+  .zk-input:focus {
+    border-color: #38bdf8;
+    box-shadow: 0 0 0 2px rgba(56,189,248,0.25);
+  }
 </style>
 </head>
 <body>
 
 <div id="toastMsg" class="toast"></div>
+
+<!-- 🔐 Zero-Knowledge Lock Screen (AES-256-GCM + PBKDF2 150,000回) -->
+<div id="zkLockOverlay" class="zk-lock-overlay">
+  <div class="zk-lock-card">
+    <div style="display:flex; justify-content:center;">
+      <img src="icon.svg" alt="icon" style="width:56px; height:56px; border-radius:14px; border:1px solid #38bdf8;">
+    </div>
+    <h2 style="font-size:1.05rem; font-weight:800; color:#f1f5f9;">
+      🔐 GMO AI Trader v2 — Zero-Knowledge Lock (AES-256-GCM)
+    </h2>
+    <p style="font-size:0.77rem; color:var(--text-secondary); line-height:1.5;">
+      スナップショットは <b>AES-256-GCM + PBKDF2-SHA256 (150,000回)</b> で暗号化されています。<br>
+      パスワードはブラウザ内の Web Crypto API でのみメモリ復号され、外部へは一切送信されません。
+    </p>
+    <div style="position:relative; display:flex; gap:6px;">
+      <input id="zkPasswordInput" type="password" class="zk-input" placeholder="ロック解除パスワードを入力..." autocomplete="current-password" onkeydown="if(event.key==='Enter')submitZkUnlock()">
+      <button type="button" class="btn" style="padding:0 12px; flex-shrink:0;" onclick="toggleZkInputVisibility()">👁️</button>
+    </div>
+    <label style="display:flex; align-items:center; justify-content:center; gap:8px; font-size:0.78rem; color:#cbd5e1; cursor:pointer; user-select:none;">
+      <input id="zkRememberCheck" type="checkbox" checked style="width:16px; height:16px; accent-color:#38bdf8;">
+      <span>この端末にパスワードを記憶する（次回から自動解除）</span>
+    </label>
+    <div id="zkErrorMsg" style="display:none; font-size:0.8rem; font-weight:700; color:#fca5a5; background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.4); border-radius:8px; padding:8px;">
+      パスワードが正しくありません
+    </div>
+    <button id="btnZkUnlock" class="btn btn-resume" style="padding:12px; font-size:0.9rem; width:100%;" onclick="submitZkUnlock()">
+      🔓 ロック解除
+    </button>
+    <div style="font-size:0.72rem; color:#64748b;">
+      ※ パスワードはPCダッシュボード（127.0.0.1:8080）の「📱 スマホアプリ接続」から確認できます
+    </div>
+  </div>
+</div>
 
 <header class="topbar">
   <div class="brand">
@@ -1794,6 +1914,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     <span id="badgeCampaign" class="badge badge-campaign">🏁 第1回締め計算中...</span>
     <button class="btn btn-qr" style="padding:5px 10px; font-size:0.76rem;" onclick="openQrModal()">📱 スマホアプリ接続</button>
     <button class="btn btn-refresh" style="padding:5px 10px; font-size:0.76rem;" onclick="forceRefreshPwa()">🔄 更新</button>
+    <button id="btnLockPwa" class="btn" style="padding:5px 10px; font-size:0.76rem; display:none; background:rgba(239,68,68,0.16); border-color:#ef4444; color:#fca5a5;" onclick="lockPwaNow()">🔒 ロック</button>
     <span id="clockJst" style="font-size:0.76rem; color:var(--text-secondary); font-family:monospace;">--:-- JST</span>
   </div>
 </header>
@@ -1816,32 +1937,32 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
     </div>
   </section>
 
-  <!-- 資産・パターンA複利・防衛ライン KPI -->
+  <!-- 資産・パターンA複利・防衛ライン KPI (初期HTMLはゼロ知識プレースホルダ) -->
   <section class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 20,000円</span></div>
-      <div id="kpiTotalEquity" class="kpi-value">20,025 円</div>
-      <div id="kpiCashDetail" class="kpi-sub">現金: 20,025 円 / 拘束: 0 円</div>
+      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 -- 円</span></div>
+      <div id="kpiTotalEquity" class="kpi-value">-- 円</div>
+      <div id="kpiCashDetail" class="kpi-sub">現金: -- 円 / 拘束: -- 円</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">+0.12%</span></div>
-      <div id="kpiTotalPnl" class="kpi-value pos-val">+25 円</div>
-      <div id="kpiRealizedDetail" class="kpi-sub">確定: +0 円 / 含み: +0 円</div>
+      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">--%</span></div>
+      <div id="kpiTotalPnl" class="kpi-value pos-val">-- 円</div>
+      <div id="kpiRealizedDetail" class="kpi-sub">確定: -- 円 / 含み: -- 円</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>📈 パターンA複利枠(45%)</span><span>最大2銘柄</span></div>
-      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">9,011 円 / 枠</div>
-      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): 300 円 (上限2%: 400 円)</div>
+      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">-- 円 / 枠</div>
+      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): -- 円 (上限2%: -- 円)</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label"><span>🛡️ HWM & L5防衛線</span><span id="kpiL5Status">正常</span></div>
-      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">17,021 円</div>
-      <div id="kpiPeakDetail" class="kpi-sub">最高資産: 20,025 円 (余裕 +3,004 円)</div>
+      <div class="kpi-label"><span>🛡️ HWM & L5防衛線</span><span id="kpiL5Status">確認中</span></div>
+      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">-- 円</div>
+      <div id="kpiPeakDetail" class="kpi-sub">最高資産: -- 円 (余裕 -- 円)</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label"><span>🚦 L3日次 / L4週次制限</span><span id="kpiCbBadge">稼働許可</span></div>
-      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: +0 円 / 制限 -601 円</div>
-      <div id="kpiWeeklyPnl" class="kpi-sub">週次: +0 円 (制限 -1,201 円) / 連敗: 0回</div>
+      <div class="kpi-label"><span>🚦 L3日次 / L4週次制限</span><span id="kpiCbBadge">確認中</span></div>
+      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: -- 円 / 制限 -- 円</div>
+      <div id="kpiWeeklyPnl" class="kpi-sub">週次: -- 円 (制限 -- 円) / 連敗: --</div>
     </div>
   </section>
 
@@ -2017,6 +2138,18 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
       <a id="qrGhLink" href="https://qanojisan.github.io/gmo-ai-trader-auto/" target="_blank" style="font-family:monospace; font-size:0.82rem; color:#38bdf8; word-break:break-all;">https://qanojisan.github.io/gmo-ai-trader-auto/</a>
       <div style="font-size:0.74rem; color:var(--text-secondary);">最新スナップショット＆リアルタイムチャートを高速表示（PC操作は <code style="color:#6ee7b7;">http://127.0.0.1:8080</code>）</div>
     </div>
+    <!-- PCローカル表示時のみスマホロック解除パスワードを表示 -->
+    <div id="pwaPasswordCard" style="display:none; background:#090d16; border:1px solid #38bdf8; border-radius:10px; padding:12px; flex-direction:column; gap:8px;">
+      <div style="font-size:0.82rem; font-weight:700; color:#7dd3fc;">🔐 スマホPWA ロック解除パスワード (AES-256-GCM ゼロ知識復号用)</div>
+      <div style="display:flex; gap:6px; align-items:center;">
+        <input id="pwaPasswordDisplay" type="password" readonly class="zk-input" style="padding:8px 10px; font-size:0.88rem;" value="">
+        <button type="button" id="btnTogglePwaPw" class="btn" style="padding:8px 10px; font-size:0.76rem; flex-shrink:0;" onclick="togglePwaPasswordVisibility()">👁️ 表示</button>
+        <button type="button" id="btnCopyPwaPw" class="btn btn-qr" style="padding:8px 10px; font-size:0.76rem; flex-shrink:0;" onclick="copyPwaPassword()">📋 コピー</button>
+      </div>
+      <div style="font-size:0.73rem; color:var(--text-secondary);">
+        ※ 初回のみスマホ画面で上記パスワードを入力してください（「端末に記憶」ONで次回から0秒自動解除されます）。
+      </div>
+    </div>
     <div style="background:#090d16; border:1px solid #1e293b; border-radius:8px; padding:10px 12px; font-size:0.76rem; color:var(--text-secondary);">
       <b>📲 スマホへのアプリ追加手順：</b><br>
       ・<b>iPhone (Safari)</b>：下部中央の「共有ボタン（□に↑）」➔ <b>「ホーム画面に追加」</b><br>
@@ -2065,9 +2198,208 @@ let isStaticSnapshotMode = false;
 let activeApiBase = ".";
 let latestStatusData = null;
 let latestNetworkInfo = {
-  lan_url: "http://192.168.11.3:8080",
+  lan_url: "http://127.0.0.1:8080",
   github_pages_url: "https://qanojisan.github.io/gmo-ai-trader-auto/"
 };
+const PWA_PW_STORAGE_KEY = "gmo_v2_pwa_unlock_pw";
+let unlockedPwaPassword = "";
+let lastEncryptedStatusEnvelope = null;
+let decryptedChartSnapshotsMap = null;
+let localServerPwaPassword = "";
+
+function b64ToBytes(b64) {
+  const bin = atob(String(b64 || "").trim());
+  const arr = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) {
+    arr[i] = bin.charCodeAt(i);
+  }
+  return arr;
+}
+
+async function decryptEnvelopeWebCrypto(envelope, password) {
+  if (!envelope || !envelope.encrypted) return envelope;
+  const pw = String(password || "").trim();
+  if (!pw) throw new Error("EMPTY_PASSWORD");
+  const enc = new TextEncoder();
+  const salt = b64ToBytes(envelope.salt);
+  const iv = b64ToBytes(envelope.iv);
+  const ctAndTag = b64ToBytes(envelope.payload);
+  const iterations = Number(envelope.iterations || 150000);
+
+  const baseKey = await window.crypto.subtle.importKey(
+    "raw",
+    enc.encode(pw),
+    { name: "PBKDF2" },
+    false,
+    ["deriveKey"]
+  );
+  const aesKey = await window.crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt: salt,
+      iterations: iterations,
+      hash: "SHA-256"
+    },
+    baseKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["decrypt"]
+  );
+  const plainBuf = await window.crypto.subtle.decrypt(
+    { name: "AES-GCM", iv: iv, tagLength: 128 },
+    aesKey,
+    ctAndTag
+  );
+  const jsonText = new TextDecoder("utf-8").decode(plainBuf);
+  return JSON.parse(jsonText);
+}
+
+function showZkLockScreen(showError=false) {
+  const ov = document.getElementById("zkLockOverlay");
+  const errEl = document.getElementById("zkErrorMsg");
+  if (ov) ov.style.display = "flex";
+  if (errEl) errEl.style.display = showError ? "block" : "none";
+}
+
+function hideZkLockScreen() {
+  const ov = document.getElementById("zkLockOverlay");
+  const errEl = document.getElementById("zkErrorMsg");
+  if (ov) ov.style.display = "none";
+  if (errEl) errEl.style.display = "none";
+}
+
+function toggleZkInputVisibility() {
+  const inp = document.getElementById("zkPasswordInput");
+  if (!inp) return;
+  inp.type = inp.type === "password" ? "text" : "password";
+}
+
+async function submitZkUnlock() {
+  const inp = document.getElementById("zkPasswordInput");
+  const rem = document.getElementById("zkRememberCheck");
+  const btn = document.getElementById("btnZkUnlock");
+  const pw = inp ? inp.value.trim() : "";
+  if (!pw) {
+    showZkLockScreen(true);
+    return;
+  }
+  if (btn) btn.disabled = true;
+  try {
+    if (!lastEncryptedStatusEnvelope) {
+      const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
+      if (snapRes.ok) {
+        lastEncryptedStatusEnvelope = await snapRes.json();
+      }
+    }
+    const dec = await decryptEnvelopeWebCrypto(lastEncryptedStatusEnvelope, pw);
+    unlockedPwaPassword = pw;
+    if (rem && rem.checked) {
+      try { localStorage.setItem(PWA_PW_STORAGE_KEY, pw); } catch (_) {}
+    } else {
+      try { localStorage.removeItem(PWA_PW_STORAGE_KEY); } catch (_) {}
+    }
+    hideZkLockScreen();
+    const lockBtn = document.getElementById("btnLockPwa");
+    if (lockBtn) lockBtn.style.display = "inline-flex";
+    latestStatusData = dec;
+    if (dec && dec.chart_snapshots) {
+      decryptedChartSnapshotsMap = dec.chart_snapshots;
+    }
+    updateDashboardUI(dec);
+    await fetchChart();
+    showToast("🔓 ゼロ知識復号が完了しました");
+  } catch (_) {
+    showZkLockScreen(true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function lockPwaNow() {
+  unlockedPwaPassword = "";
+  latestStatusData = null;
+  decryptedChartSnapshotsMap = null;
+  try { localStorage.removeItem(PWA_PW_STORAGE_KEY); } catch (_) {}
+  const inp = document.getElementById("zkPasswordInput");
+  if (inp) inp.value = "";
+  showZkLockScreen(false);
+  showToast("🔒 ロックしました（保存パスワードを消去しました）");
+}
+
+function togglePwaPasswordVisibility() {
+  const el = document.getElementById("pwaPasswordDisplay");
+  const btn = document.getElementById("btnTogglePwaPw");
+  if (!el) return;
+  if (el.type === "password") {
+    el.type = "text";
+    if (btn) btn.textContent = "🙈 隠す";
+  } else {
+    el.type = "password";
+    if (btn) btn.textContent = "👁️ 表示";
+  }
+}
+
+async function copyPwaPassword() {
+  if (!localServerPwaPassword) return;
+  try {
+    await navigator.clipboard.writeText(localServerPwaPassword);
+    showToast("📋 スマホロック解除パスワードをコピーしました");
+  } catch (_) {
+    const el = document.getElementById("pwaPasswordDisplay");
+    if (el) {
+      const prevType = el.type;
+      el.type = "text";
+      el.select();
+      document.execCommand("copy");
+      el.type = prevType;
+      showToast("📋 スマホロック解除パスワードをコピーしました");
+    }
+  }
+}
+
+async function handleStatusResponseData(rawData, isStatic) {
+  activeApiBase = ".";
+  isStaticSnapshotMode = Boolean(isStatic);
+  if (rawData && rawData.encrypted) {
+    isStaticSnapshotMode = true;
+    lastEncryptedStatusEnvelope = rawData;
+    const lockBtn = document.getElementById("btnLockPwa");
+    if (lockBtn) lockBtn.style.display = "inline-flex";
+    let pw = unlockedPwaPassword;
+    if (!pw) {
+      try { pw = localStorage.getItem(PWA_PW_STORAGE_KEY) || ""; } catch (_) {}
+    }
+    if (!pw) {
+      showZkLockScreen(false);
+      return;
+    }
+    try {
+      const dec = await decryptEnvelopeWebCrypto(rawData, pw);
+      unlockedPwaPassword = pw;
+      hideZkLockScreen();
+      latestStatusData = dec;
+      if (dec && dec.chart_snapshots) {
+        decryptedChartSnapshotsMap = dec.chart_snapshots;
+      }
+      updateDashboardUI(dec);
+    } catch (_) {
+      unlockedPwaPassword = "";
+      try { localStorage.removeItem(PWA_PW_STORAGE_KEY); } catch (_) {}
+      showZkLockScreen(false);
+    }
+    return;
+  }
+  hideZkLockScreen();
+  if (rawData && rawData.pwa_unlock_password) {
+    localServerPwaPassword = String(rawData.pwa_unlock_password);
+    const pwCard = document.getElementById("pwaPasswordCard");
+    const pwInput = document.getElementById("pwaPasswordDisplay");
+    if (pwCard) pwCard.style.display = "flex";
+    if (pwInput) pwInput.value = localServerPwaPassword;
+  }
+  latestStatusData = rawData;
+  updateDashboardUI(rawData);
+}
 
 function fmtJpy(val, showSign=false) {
   const n = Number(val || 0);
@@ -2133,16 +2465,13 @@ async function fetchWithTimeout(url, options={}, timeoutMs=2000) {
 
 async function fetchStatus() {
   // 1. GitHub Pages (*.github.io) または HTTPS 静的配信環境の場合は、
-  //    Mixed Content ブロックや LAN タイムアウト待ちを完全にスキップし、待ち時間 0 秒で status_snapshot.json を即時表示
+  //    Mixed Content ブロックや LAN タイムアウト待ちを完全にスキップし、待ち時間 0 秒で status_snapshot.json を取得・メモリ復号
   if (location.hostname.endsWith("github.io") || location.protocol === "https:") {
     try {
       const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
       if (snapRes.ok) {
         const snapData = await snapRes.json();
-        activeApiBase = ".";
-        isStaticSnapshotMode = true;
-        latestStatusData = snapData;
-        updateDashboardUI(snapData);
+        await handleStatusResponseData(snapData, true);
         return;
       }
     } catch (err) {
@@ -2151,16 +2480,13 @@ async function fetchStatus() {
     return;
   }
 
-  // 2. PC ローカル環境 (http://127.0.0.1:8080 等): 同一オリジン /api/status へ直接通信
+  // 2. PC ローカル環境 (http://127.0.0.1:8080 等): 同一オリジン /api/status へ直接通信 (ロック画面なし・0秒表示)
   try {
     const res = await fetchWithTimeout(`./api/status?_t=${Date.now()}`, { cache: "no-store" }, 3500);
     const ct = (res.headers.get("content-type") || "").toLowerCase();
     if (res.ok && ct.includes("json")) {
       const data = await res.json();
-      activeApiBase = ".";
-      isStaticSnapshotMode = false;
-      latestStatusData = data;
-      updateDashboardUI(data);
+      await handleStatusResponseData(data, false);
       return;
     }
   } catch (_) {}
@@ -2170,10 +2496,7 @@ async function fetchStatus() {
     const snapRes = await fetch(`./status_snapshot.json?_t=${Date.now()}`, { cache: "no-store" });
     if (snapRes.ok) {
       const snapData = await snapRes.json();
-      activeApiBase = ".";
-      isStaticSnapshotMode = true;
-      latestStatusData = snapData;
-      updateDashboardUI(snapData);
+      await handleStatusResponseData(snapData, true);
     }
   } catch (_) {}
 }
@@ -2242,11 +2565,29 @@ async function fetchChart() {
       }
     } catch (_) {}
 
-    // 3. 静的スナップショット (chart_snapshots.json) フォールバック
+    // 3. 静的スナップショット (chart_snapshots.json / 復号済みキャッシュ) フォールバック
+    if (decryptedChartSnapshotsMap) {
+      const chCached = decryptedChartSnapshotsMap[`${selectedSymbol}_${selectedInterval}`] || decryptedChartSnapshotsMap[`${selectedSymbol}_1hour`] || decryptedChartSnapshotsMap["BTC_1hour"];
+      if (chCached) {
+        lastChartData = chCached;
+        drawPriceChart(chCached);
+        return;
+      }
+    }
     const snapRes = await fetch(`./chart_snapshots.json?_t=${Date.now()}`, { cache: "no-store" });
     if (snapRes.ok) {
-      const map = await snapRes.json();
-      const ch = map[`${selectedSymbol}_${selectedInterval}`] || map[`${selectedSymbol}_1hour`] || map["BTC_1hour"];
+      const rawMap = await snapRes.json();
+      let map = rawMap;
+      if (rawMap && rawMap.encrypted) {
+        let pw = unlockedPwaPassword;
+        if (!pw) {
+          try { pw = localStorage.getItem(PWA_PW_STORAGE_KEY) || ""; } catch (_) {}
+        }
+        if (!pw) return;
+        map = await decryptEnvelopeWebCrypto(rawMap, pw);
+        decryptedChartSnapshotsMap = map;
+      }
+      const ch = map && (map[`${selectedSymbol}_${selectedInterval}`] || map[`${selectedSymbol}_1hour`] || map["BTC_1hour"]);
       if (ch) {
         lastChartData = ch;
         drawPriceChart(ch);
@@ -2558,7 +2899,7 @@ function drawEquityChart(curve) {
 
   let minE = Infinity, maxE = -Infinity;
   curve.forEach(pt => {
-    const v = Number(pt.equity_jpy || 20000);
+    const v = Number(pt.equity_jpy || 0);
     if (v < minE) minE = v;
     if (v > maxE) maxE = v;
   });
@@ -2819,10 +3160,37 @@ def make_dashboard_handler(service: WebDashboardService):
                 self._send_bytes(HTTPStatus.OK, "image/svg+xml; charset=utf-8", svg.encode("utf-8"))
                 return
 
-            if path in ("/api/status", "/status_snapshot.json"):
+            if path == "/api/status":
                 try:
                     data = service.get_status_payload()
+                    data["pwa_unlock_password"] = service.get_pwa_unlock_password()
                     self._send_json(HTTPStatus.OK, data)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                return
+
+            if path == "/status_snapshot.json":
+                try:
+                    snap_file = service.docs_dir / "status_snapshot.json"
+                    if snap_file.exists():
+                        self._send_bytes(HTTPStatus.OK, "application/json; charset=utf-8", snap_file.read_bytes())
+                    else:
+                        data = service.get_status_payload()
+                        data["static_snapshot"] = True
+                        enc = encrypt_json_envelope(data, service.get_pwa_unlock_password())
+                        self._send_json(HTTPStatus.OK, enc)
+                except Exception as exc:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
+                return
+
+            if path == "/chart_snapshots.json":
+                try:
+                    c_file = service.docs_dir / "chart_snapshots.json"
+                    if c_file.exists():
+                        self._send_bytes(HTTPStatus.OK, "application/json; charset=utf-8", c_file.read_bytes())
+                    else:
+                        enc = encrypt_json_envelope({}, service.get_pwa_unlock_password())
+                        self._send_json(HTTPStatus.OK, enc)
                 except Exception as exc:
                     self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"ok": False, "error": str(exc)})
                 return

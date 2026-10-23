@@ -1,8 +1,8 @@
 """
-v1 (e:\\gmo-ai-trader) から v2 (e:\\gmo-ai-trader-auto) への移行＆プリフライト検証スクリプト (migrate_from_v1.py)
+旧v1アーカイブ (archive_v1) から v2 (e:\\gmo-ai-trader-auto) への移行＆プリフライト検証スクリプト (migrate_from_v1.py)
 
-将来、現行の v1 システム（1日1回手動発注支援）を停止し、v2（24時間全自動売買）へ切り替える際に使用する。
-※ v1 フォルダ (`e:\\gmo-ai-trader`) は常に「読み取り専用」として扱い、1バイトも変更しない。
+旧v1のアーカイブ (`archive_v1/portfolio.json`) の整合性検証および v2 へのプリフライト検証に使用する。
+※ `archive_v1` フォルダは常に「読み取り専用」として扱い、1バイトも変更しない。
 
 【主な機能】
 1. v1 の `portfolio.json` の整合性検証（初期資金・残高・保有ポジション・決済履歴の検証）
@@ -40,7 +40,7 @@ from src.json_utils import load_json_file, write_json_file
 from src.validator import DEFAULT_SYMBOL_RULES, _to_decimal, format_decimal_plain, format_price_jpy
 
 BASE_DIR = Path(__file__).resolve().parent
-DEFAULT_V1_DIR = Path(r"e:\gmo-ai-trader")
+DEFAULT_V1_DIR = BASE_DIR / "archive_v1"
 DEFAULT_V1_PORTFOLIO = DEFAULT_V1_DIR / "portfolio.json"
 DEFAULT_V2_PORTFOLIO = BASE_DIR / "portfolio.json"
 
@@ -334,7 +334,7 @@ def main() -> int:
 
     load_and_unprotect_dotenv(BASE_DIR / ".env")
 
-    parser = argparse.ArgumentParser(description="v1 (e:\\gmo-ai-trader) から v2 への移行・プリフライト検証スクリプト")
+    parser = argparse.ArgumentParser(description="旧v1アーカイブ (archive_v1) から v2 への移行・プリフライト検証スクリプト")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--check", action="store_true", help="確認モード（ファイル書き換えなし・既定）")
     group.add_argument("--execute", action="store_true", help="実行モード（v1のportfolio.jsonをv2へ引き継ぐ）")

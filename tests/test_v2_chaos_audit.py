@@ -3,7 +3,7 @@ v2 全自動売買システム：全8カテゴリ・64項目＋4大複合障害 
 (tests/test_v2_chaos_audit.py)
 
 すべてのテストは `tempfile.TemporaryDirectory` およびインメモリ / ChaosMockExchange 上で完結し、
-現行 v1 (`e:\\gmo-ai-trader`) および本番ファイルに 1 バイトも干渉しない。
+本番ファイルに 1 バイトも干渉しない。
 """
 
 from __future__ import annotations
@@ -2862,8 +2862,11 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                     "chart_snapshots.json",
                 ):
                     self.assertTrue((tmp_dir / "docs" / fname).exists(), f"Missing exported file: {fname}")
+                from src.pwa_crypto import decrypt_json_envelope
                 snap_json = json.loads((tmp_dir / "docs" / "status_snapshot.json").read_text(encoding="utf-8"))
-                self.assertTrue(snap_json["static_snapshot"])
+                self.assertTrue(snap_json["encrypted"])
+                dec_snap = decrypt_json_envelope(snap_json, svc.get_pwa_unlock_password())
+                self.assertTrue(dec_snap["static_snapshot"])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -3180,6 +3183,7 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             "GMO_API_KEY",
             "GMO_API_SECRET",
             "GITHUB_TOKEN",
+            "PWA_UNLOCK_PASSWORD",
         }
         found_keys = set()
         for line in prod_env_text.splitlines():
@@ -3215,6 +3219,144 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         self.assertNotIn("ghp_", git_cfg)
         self.assertNotIn("@github.com", git_cfg)
         self.assertIn("https://github.com/QANOJISAN/gmo-ai-trader-auto.git", git_cfg)
+
+    def test_round12_zero_knowledge_pwa_aes_gcm_and_v1_decommission_audit(self) -> None:
+        """
+        Round 12 セキュリティ＆旧v1廃止監査テスト:
+        1. `src/pwa_crypto.py` (Windows `bcrypt.dll` AES-256-GCM + PBKDF2-SHA256 150,000回) の暗号化・復号ラウンドトリップ検証、
+           および改ざん検知 (認証タグ不一致エラー)・誤パスワード拒否検証
+        2. `export_static_pwa_bundle` で出力された `docs/index.html`, `docs/status_snapshot.json`, `docs/chart_snapshots.json` の
+           全ファイル内に、`20025` や `20,025`、建玉情報、AI判断根拠、ロック解除パスワード等の平文データが1文字も含まれないこと
+        3. 旧v1ディレクトリが廃止・削除され、v2が専用 `.venv\\Scripts\\python.exe` で完全独立稼働していること
+        """
+        import base64
+        import json
+        from src.pwa_crypto import decrypt_json_envelope, encrypt_json_envelope
+        from web_dashboard import WebDashboardService
+
+        # 1. Windows bcrypt.dll AES-256-GCM + PBKDF2 150,000回 ラウンドトリップ & 改ざん検知検証
+        sample_payload = {
+            "equity_summary": {"total_equity_jpy": 20025, "initial_capital_jpy": 20000},
+            "positions": {"active": [{"symbol": "BCH", "size": 0.076, "entry_price": 42987}]},
+            "latest_decision": {"action": "BUY", "reasoning": "上位足トレンドと1時間足押し目反発が合致"},
+        }
+        test_pw = "GMOv2-Test-Pass-9876"
+        env = encrypt_json_envelope(sample_payload, test_pw)
+        self.assertTrue(env["encrypted"])
+        self.assertEqual(env["version"], 1)
+        self.assertEqual(env["kdf"], "PBKDF2-SHA256")
+        self.assertEqual(env["iterations"], 150000)
+        self.assertEqual(env["cipher"], "AES-256-GCM")
+        self.assertEqual(len(base64.b64decode(env["salt"])), 16)
+        self.assertEqual(len(base64.b64decode(env["iv"])), 12)
+
+        dec = decrypt_json_envelope(env, test_pw)
+        self.assertEqual(dec, sample_payload)
+
+        # 誤パスワード時に ValueError が発生すること
+        with self.assertRaises(ValueError):
+            decrypt_json_envelope(env, "Wrong-Password-0000")
+
+        # ペイロード末尾1バイト (認証タグ) 改ざん時に ValueError が発生すること
+        tampered_env = dict(env)
+        raw_ct = bytearray(base64.b64decode(tampered_env["payload"]))
+        raw_ct[-1] ^= 0x55
+        tampered_env["payload"] = base64.b64encode(bytes(raw_ct)).decode("ascii")
+        with self.assertRaises(ValueError):
+            decrypt_json_envelope(tampered_env, test_pw)
+
+        # 2. export_static_pwa_bundle のゼロ知識化 (docs/ 内に平文資産・建玉・AI根拠が1文字も含まれないこと)
+        class _DummyPub:
+            def get_tickers(self, symbols=None):
+                return {"BCH": {"symbol": "BCH", "last": 43500.0, "bid": 43490.0, "ask": 43510.0}}
+
+            def get_klines(self, symbol="BTC", interval="1hour", limit=48, reference_dt=None):
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(base_dir=tmp_dir, execution_mode="DRY_RUN", dry_run_notify=True)
+            try:
+                pf = daemon.oco_manager.load_portfolio()
+                pf["initial_capital_jpy"] = 20000
+                pf["jpy_balance"] = 20025
+                pf["peak_equity_jpy"] = 20025
+                pf["positions"] = [
+                    {
+                        "symbol": "BCH",
+                        "side": "BUY",
+                        "size": 0.076,
+                        "entry_price": 42987.0,
+                        "current_price": 43500.0,
+                        "take_profit_price": 45500.0,
+                        "stop_loss_price": 41800.0,
+                        "sl_order_id": "777888",
+                        "state": "SL_ACTIVE",
+                    }
+                ]
+                daemon.oco_manager.save_portfolio(pf)
+                (tmp_dir / "latest_decision.json").write_text(
+                    json.dumps(
+                        {
+                            "action": "BUY",
+                            "symbol": "BCH",
+                            "reasoning": "SECRET_AI_REASONING_MARKER_999",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+
+                svc = WebDashboardService(base_dir=tmp_dir, public_client=_DummyPub())
+                try:
+                    out_docs = tmp_dir / "docs"
+                    svc.export_static_pwa_bundle(output_dir=out_docs, include_charts=True)
+                    unlock_pw = svc.get_pwa_unlock_password()
+
+                    for fname in ("index.html", "status_snapshot.json", "chart_snapshots.json"):
+                        raw_text = (out_docs / fname).read_text(encoding="utf-8")
+                        for forbidden in (
+                            "20025",
+                            "20,025",
+                            "42987",
+                            "42,987",
+                            "777888",
+                            "SECRET_AI_REASONING_MARKER_999",
+                            unlock_pw,
+                        ):
+                            self.assertNotIn(
+                                forbidden,
+                                raw_text,
+                                f"Plaintext leak '{forbidden}' found in docs/{fname}",
+                            )
+
+                    status_env = json.loads((out_docs / "status_snapshot.json").read_text(encoding="utf-8"))
+                    chart_env = json.loads((out_docs / "chart_snapshots.json").read_text(encoding="utf-8"))
+                    self.assertEqual(
+                        set(status_env.keys()),
+                        {"encrypted", "version", "kdf", "iterations", "cipher", "salt", "iv", "payload"},
+                    )
+                    self.assertEqual(
+                        set(chart_env.keys()),
+                        {"encrypted", "version", "kdf", "iterations", "cipher", "salt", "iv", "payload"},
+                    )
+                    dec_status = decrypt_json_envelope(status_env, unlock_pw)
+                    self.assertEqual(dec_status["equity_summary"]["jpy_balance"], 20025)
+                    self.assertEqual(dec_status["latest_decision"]["reasoning"], "SECRET_AI_REASONING_MARKER_999")
+                finally:
+                    svc.close()
+            finally:
+                daemon.shutdown()
+
+        # 3. 旧v1廃止・v2独立 .venv 検証
+        repo_root = Path(__file__).resolve().parent.parent
+        legacy_v1_dir = repo_root.parent / "gmo-ai-trader"
+        self.assertFalse(legacy_v1_dir.exists(), "Legacy v1 directory must be completely deleted")
+        v2_venv_py = repo_root / ".venv" / "Scripts" / "python.exe"
+        self.assertTrue(v2_venv_py.exists(), "v2 independent .venv python.exe must exist")
+        archive_v1 = repo_root / "archive_v1"
+        for f in ("portfolio.json", "history_log.csv", "latest_decision.json", "PERFORMANCE_REPORT.md"):
+            self.assertTrue((archive_v1 / f).exists(), f"archive_v1/{f} must exist")
 
 
 if __name__ == "__main__":

@@ -89,4 +89,4 @@ if (Test-Path -LiteralPath $WebRunner) {
     Write-Host ("[OK] Registered scheduled task: " + $WebTaskName)
 }
 
-Write-Host ("Note: Before switching v2 to LIVE mode, disable v1 task (GMO-AI-Trader-Daily) and run migrate_from_v1.py --execute.")
+Write-Host "[OK] GMO AI Trader v2 tasks are registered and ready."

@@ -24,7 +24,8 @@ venv/
 env/
 .pytest_cache/
 
-# OS・エディタ生成ファイル
+# OS・エディタ生成ファイル・旧v1退避アーカイブ
+archive_v1/
 .DS_Store
 Thumbs.db
 .vscode/

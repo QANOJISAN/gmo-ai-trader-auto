@@ -2,7 +2,7 @@
 v2（24時間常時監視・GMOコイン現物全自動売買システム）単体・統合テストスイート (tests/test_v2_auto.py)
 
 すべてのテストは一時ディレクトリ (`tempfile.TemporaryDirectory`) 上で隔離実行され、
-本番 v1 (`e:\\gmo-ai-trader`) や v2 ルートのデータファイルを一切書き換えない。
+v2 ルートの本番データファイルや `archive_v1` を一切書き換えない。
 
 【検証項目】
 1. テクニカル・レーダー (`TechnicalRadar`):
@@ -544,7 +544,7 @@ class TestV2AutoTradingSystem(unittest.TestCase):
         `migrate_from_v1.py --check` / `execute_migration`（一時ディレクトリ出力）および
         PowerShell スクリプト (`run_v2_daemon.ps1`, `register_v2_task.ps1`) の Pure ASCII & AST 構文検証
         """
-        v1_pf_path = Path(r"e:\gmo-ai-trader\portfolio.json")
+        v1_pf_path = ROOT_DIR / "archive_v1" / "portfolio.json"
         with tempfile.TemporaryDirectory() as tmp_dir_str:
             tmp_v2_pf = Path(tmp_dir_str) / "portfolio.json"
             check_res = run_preflight_check(v1_portfolio_path=v1_pf_path, v2_portfolio_path=tmp_v2_pf)

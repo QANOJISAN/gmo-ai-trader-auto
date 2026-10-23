@@ -47,10 +47,9 @@ if (-not $IsOneShotTool) {
     }
 }
 
-# Resolve Python executable (prefer local .venv, then v1 .venv as read-only runtime, then system python)
+# Resolve Python executable (prefer local .venv, then system python)
 $PythonCandidates = @(
     (Join-Path $ProjectDir ".venv\Scripts\python.exe"),
-    "e:\gmo-ai-trader\.venv\Scripts\python.exe",
     "python.exe"
 )
 $PythonExe = $null

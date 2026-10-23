@@ -47,7 +47,6 @@ if (Test-Path -LiteralPath $WebLockFile) {
 # Resolve Python executable
 $PythonCandidates = @(
     (Join-Path $ProjectDir ".venv\Scripts\python.exe"),
-    "e:\gmo-ai-trader\.venv\Scripts\python.exe",
     "python.exe"
 )
 $PythonExe = $null
