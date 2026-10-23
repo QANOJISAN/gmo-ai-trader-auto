@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-23T20:56:14+09:00",
+  "timestamp": "2026-10-23T21:09:02+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -94,10 +94,10 @@
     "phase2_freeze_start_jst": "2027-12-09T22:00:00+09:00",
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 258,
-    "remaining_hours": 3,
-    "remaining_minutes": 3,
-    "remaining_total_seconds": 22302225,
-    "countdown_text": "第1回締め(2027/7/9) 残り 258日 03時間 03分",
+    "remaining_hours": 2,
+    "remaining_minutes": 50,
+    "remaining_total_seconds": 22301457,
+    "countdown_text": "第1回締め(2027/7/9) 残り 258日 02時間 50分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -108,8 +108,8 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 376761.0,
-        "estimated_value_jpy": 288.8,
+        "current_bid": 375938.0,
+        "estimated_value_jpy": 288.2,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
     ]
@@ -118,26 +118,25 @@
   "closed_trades": [],
   "latest_decision": {
     "bearish_counter_thesis": [
-      "親市場BTCの環境認識悪化：BTCの日足トレンドが「DOWNTREND_OR_RANGE」であり、日足MACDヒストグラムが-48,419と下降拡大中。価格（12,825,000円）は日足SMA7（12,957,987円）およびSMA25（13,142,000円）を明確に下回っており、親市場全体の連れ安リスクが極めて高い。",
-      "全アルトコインにおける日足レジスタンス直面とトレンド逆行リスク：相対的強度が高いBCH（対BTC比+3.23%）やDOGE（1h出来高3.34倍）も含め、全銘柄の日足トレンドが下降・レンジ内に留まっており、日足SMA25（BCH: 45,732円、DOGE: 13.63円）を明確に下回る戻り売り優勢の局面にある。",
-      "スプレッド・取引コスト負荷の増大：BCH（スプレッド0.238%）やSUI（0.110%）、ADA（0.112%）など、板スプレッドが拡大している銘柄が多く、Taker手数料（0.09%）と合算した実質コストがSL距離に対して過大となり、期待値が著しく低下している。"
+      "BTCを含む全監視銘柄の日足トレンドが「DOWNTREND_OR_RANGE」にあり、BTC日足MACDヒストグラムが-49,163と下落モメンタム拡大中であるため、アルトコインの自律反発がBTC急落に巻き込まれるベータリスクが極めて高い。",
+      "相対力上位のBCHやSOLにおいても、H4足SMA25（BCH: 44,338円付近、SOL: 16,604円）が上値抵抗線として重く機能しており、H1足MACDヒストグラムがいずれも縮小・下落局面（macd_hist_rising=false）へ移行し、短期的モメンタムの減速が顕著である。"
     ],
     "bullish_conviction_factors": [
-      "BCHのレラティブ・ストレングス（対BTC+3.23%、7dリターン+2.59%）および4時間足出来高の急増（20期間比2.69倍）。",
-      "DOGEにおける1時間足出来高急増（3.34倍）とEMA12/26ゴールデンクロス直後の下値支持確認。"
+      "BCH（24時間比+3.42%、対BTC7日比+2.96%）やSOL（対BTC7日比+0.43%）において日足MACDヒストグラムの改善（rising=true）が確認され、下値支持帯での押し目買い需要が散見される点。",
+      "BTC・ETH・SOL等のスプレッドが0.003%〜0.02%未満とタイトであり、板深度も十分に厚いため、Maker注文を活用した取引コスト抑制が可能な点。"
     ],
-    "conviction_score": 38,
+    "conviction_score": 48,
     "action": "HOLD",
     "symbol": "NONE",
     "order_type": "NONE",
     "limit_price": 0,
-    "suggested_entry_offset_atr": 0,
+    "suggested_entry_offset_atr": 0.0,
     "size": 0,
     "take_profit_price": 0,
     "stop_loss_price": 0,
-    "confidence": 0.88,
-    "reasoning": "【審査結果：見送り（HOLD）】親市場BTCが日足SMA7・SMA25の下位で推移し日足MACDヒストグラムが-48,419へ悪化している環境下、監視対象全23銘柄の日足トレンドが「DOWNTREND_OR_RANGE」に沈んでいる。BCHやDOGEなど一部銘柄で短期的な出来高急増（BCH 4h出来高2.69倍、DOGE 1h出来高3.34倍）とBTCに対する相対的優位性が確認されるものの、日足SMA25直下の強固な戻り売り圧力帯を上抜けておらず、上位足の環境認識と逆行したロングエントリーは期待値が低い。また、BCHはスプレッドが0.238%と開いており、Taker手数料0.09%を加味するとコスト比率が過大となる。総資産10,025円に対する許容損失予算120〜150円（1.2〜1.5%）を無駄に晒すリスクを回避し、確信度スコアは38点（75点未満）として新規発注を厳格に拒絶（Veto）する。",
-    "timestamp": "2026-10-23T20:51:00+09:00",
+    "confidence": 0.48,
+    "reasoning": "【審査結果：エントリー見送り（HOLD）】\n1. 反対仮説の検証：BTCの日足MACDヒストグラムは-49,163と弱気拡大傾向にあり、市場全体の環境は明確な「DOWNTREND_OR_RANGE」です。主要アルトコインは日足SMA25の下方に位置し、戻り売り圧力が強く残っています。直近H1足でもBCHやSOLのMACDヒストグラムが下向き（rising=false）へ転換しており、上値追いでの飛び乗り買いは高値掴みとなるリスクが高いと判定しました。\n2. 強気根拠との比較：BCHの対BTC相対力（+2.96%）やSOLの底堅さは確認できるものの、市場全体の環境悪化を覆すほどの出来高急増やレジスタンス突破シグナルは不足しています。\n3. 資金管理：現在の総資産10,025円における許容リスク額（1.2%〜1.5%＝120円〜150円、最大上限200円）および投入上限4,511円に対し、この地合いではリスクリワード比1.5以上を満たす安全なSL配置の期待値がマイナスと試算されます。確信度スコアは48点（承認基準75点未満）にとどまるため、資本保全を最優先とし新規エントリーを見送ります。",
+    "timestamp": "2026-10-23T21:06:01+09:00",
     "provider": "gemini:gemini-3.8-flash(HIGH)",
     "expected_cost_jpy": 0,
     "expected_loss_jpy": 0,
@@ -154,10 +153,6 @@
     }
   },
   "logs": [
-    "2026-10-23 16:34:40,527 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.5-flash (thinking_level=HIGH)",
-    "2026-10-23 16:34:40,527 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
-    "2026-10-23 16:35:01,547 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent \"HTTP/1.1 200 OK\"",
-    "2026-10-23 16:49:22,701 [INFO] auto_trader: 🚀 レーダートリガー発火 (新規エントリー好機検知 (BCH: 上位足トレンド＋1時間足押し目反発が合致)) ➔ AIJudge を起動します",
     "2026-10-23 16:49:22,829 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.8-flash (thinking_level=HIGH)",
     "2026-10-23 16:49:22,830 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
     "2026-10-23 16:54:02,773 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 200 OK\"",
@@ -183,99 +178,103 @@
     "2026-10-23 20:51:03,166 [INFO] auto_trader: 🚀 レーダートリガー発火 (新規エントリー好機検知 (BCH: 上位足トレンド＋1時間足押し目反発が合致)) ➔ AIJudge を起動します",
     "2026-10-23 20:51:03,229 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.8-flash (thinking_level=HIGH)",
     "2026-10-23 20:51:03,229 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
-    "2026-10-23 20:56:13,907 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 200 OK\""
+    "2026-10-23 20:56:13,907 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 200 OK\"",
+    "2026-10-23 21:06:03,435 [INFO] auto_trader: 🚀 レーダートリガー発火 (新規エントリー好機検知 (BCH: 上位足トレンド＋1時間足押し目反発が合致)) ➔ AIJudge を起動します",
+    "2026-10-23 21:06:03,501 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.8-flash (thinking_level=HIGH)",
+    "2026-10-23 21:06:03,502 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
+    "2026-10-23 21:09:02,704 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 200 OK\""
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12816197.0,
-      "bid": 12816196.0,
+      "ask": 12800142.0,
+      "bid": 12799051.0,
       "high": 12874000.0,
       "low": 12662387.0,
-      "last": 12821202.0,
-      "volume": 155.64971,
-      "trading_value_24h": 1995616373.15,
-      "spread": 1.0,
-      "spread_pct": 0.0,
-      "timestamp": "2026-10-23T11:56:12.724Z"
+      "last": 12800174.0,
+      "volume": 155.81846,
+      "trading_value_24h": 1994503400.41,
+      "spread": 1091.0,
+      "spread_pct": 0.0085,
+      "timestamp": "2026-10-23T12:09:00.535Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 376892.0,
-      "bid": 376761.0,
+      "ask": 376041.0,
+      "bid": 375938.0,
       "high": 379321.0,
       "low": 371807.0,
-      "last": 377043.0,
-      "volume": 3259.062,
-      "trading_value_24h": 1228806513.67,
-      "spread": 131.0,
-      "spread_pct": 0.0348,
-      "timestamp": "2026-10-23T11:56:12.821Z"
+      "last": 376000.0,
+      "volume": 3228.4276,
+      "trading_value_24h": 1213888777.6,
+      "spread": 103.0,
+      "spread_pct": 0.0274,
+      "timestamp": "2026-10-23T12:09:00.199Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 44585.0,
-      "bid": 44470.0,
+      "ask": 44394.0,
+      "bid": 44363.0,
       "high": 45201.0,
       "low": 42858.0,
-      "last": 44607.0,
-      "volume": 372.633,
-      "trading_value_24h": 16622040.23,
-      "spread": 115.0,
-      "spread_pct": 0.2586,
-      "timestamp": "2026-10-23T11:56:12.820Z"
+      "last": 44391.0,
+      "volume": 375.243,
+      "trading_value_24h": 16657412.01,
+      "spread": 31.0,
+      "spread_pct": 0.0699,
+      "timestamp": "2026-10-23T12:09:00.616Z"
     },
     "LTC": {
       "symbol": "LTC",
-      "ask": 9265.0,
-      "bid": 9245.0,
+      "ask": 9228.0,
+      "bid": 9209.0,
       "high": 9388.0,
       "low": 9132.0,
       "last": 9265.0,
       "volume": 2016.86,
       "trading_value_24h": 18686207.9,
-      "spread": 20.0,
-      "spread_pct": 0.2163,
-      "timestamp": "2026-10-23T11:56:12.730Z"
+      "spread": 19.0,
+      "spread_pct": 0.2063,
+      "timestamp": "2026-10-23T12:09:01.071Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 207.297,
-      "bid": 207.24,
+      "ask": 206.927,
+      "bid": 206.81,
       "high": 208.966,
       "low": 203.696,
-      "last": 207.211,
-      "volume": 2101089.0,
-      "trading_value_24h": 435368752.78,
-      "spread": 0.05699999999998795,
-      "spread_pct": 0.0275,
-      "timestamp": "2026-10-23T11:56:12.795Z"
+      "last": 207.02,
+      "volume": 2030272.0,
+      "trading_value_24h": 420306909.44,
+      "spread": 0.11699999999999022,
+      "spread_pct": 0.0566,
+      "timestamp": "2026-10-23T12:09:01.096Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.589,
-      "bid": 12.578,
+      "ask": 12.564,
+      "bid": 12.552,
       "high": 12.637,
       "low": 12.3,
-      "last": 12.593,
-      "volume": 3705398.0,
-      "trading_value_24h": 46662077.01,
-      "spread": 0.011000000000001009,
-      "spread_pct": 0.0875,
-      "timestamp": "2026-10-23T11:56:12.216Z"
+      "last": 12.563,
+      "volume": 3733698.0,
+      "trading_value_24h": 46906447.97,
+      "spread": 0.012000000000000455,
+      "spread_pct": 0.0956,
+      "timestamp": "2026-10-23T12:09:01.064Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16410.0,
-      "bid": 16408.0,
+      "ask": 16379.0,
+      "bid": 16364.0,
       "high": 16445.0,
       "low": 16150.0,
-      "last": 16414.0,
-      "volume": 16179.42,
-      "trading_value_24h": 265568999.88,
-      "spread": 2.0,
-      "spread_pct": 0.0122,
-      "timestamp": "2026-10-23T11:56:13.037Z"
+      "last": 16379.0,
+      "volume": 16046.06,
+      "trading_value_24h": 262818416.74,
+      "spread": 15.0,
+      "spread_pct": 0.0917,
+      "timestamp": "2026-10-23T12:09:00.669Z"
     }
   },
   "static_snapshot": true
