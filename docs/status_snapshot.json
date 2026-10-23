@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-23T18:50:05+09:00",
+  "timestamp": "2026-10-23T19:05:11+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -94,10 +94,10 @@
     "phase2_freeze_start_jst": "2027-12-09T22:00:00+09:00",
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 258,
-    "remaining_hours": 5,
-    "remaining_minutes": 9,
-    "remaining_total_seconds": 22309794,
-    "countdown_text": "第1回締め(2027/7/9) 残り 258日 05時間 09分",
+    "remaining_hours": 4,
+    "remaining_minutes": 54,
+    "remaining_total_seconds": 22308888,
+    "countdown_text": "第1回締め(2027/7/9) 残り 258日 04時間 54分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -108,8 +108,8 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 375966.0,
-        "estimated_value_jpy": 288.2,
+        "current_bid": 375343.0,
+        "estimated_value_jpy": 287.7,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
     ]
@@ -153,7 +153,6 @@
     }
   },
   "logs": [
-    "2026-10-23 16:19:07,729 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
     "2026-10-23 16:22:56,115 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 200 OK\"",
     "2026-10-23 16:34:17,218 [INFO] auto_trader: 🚀 レーダートリガー発火 (新規エントリー好機検知 (BCH: 上位足トレンド＋1時間足押し目反発が合致)) ➔ AIJudge を起動します",
     "2026-10-23 16:34:17,279 [INFO] src.ai_judge: Gemini API 呼び出し中: model=gemini-3.8-flash (thinking_level=HIGH)",
@@ -182,99 +181,100 @@
     "2026-10-23 18:04:46,859 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 18:19:54,180 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
     "2026-10-23 18:34:59,736 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
-    "2026-10-23 18:50:05,636 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
+    "2026-10-23 18:50:05,636 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-23 19:05:11,319 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12792475.0,
-      "bid": 12790076.0,
+      "ask": 12784789.0,
+      "bid": 12784617.0,
       "high": 12874000.0,
       "low": 12662387.0,
-      "last": 12779519.0,
-      "volume": 163.22691,
-      "trading_value_24h": 2085961397.66,
-      "spread": 2399.0,
-      "spread_pct": 0.0188,
-      "timestamp": "2026-10-23T09:50:03.202Z"
+      "last": 12782241.0,
+      "volume": 161.69571,
+      "trading_value_24h": 2066833533.89,
+      "spread": 172.0,
+      "spread_pct": 0.0013,
+      "timestamp": "2026-10-23T10:05:10.108Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 376085.0,
-      "bid": 375966.0,
+      "ask": 375408.0,
+      "bid": 375343.0,
       "high": 379321.0,
       "low": 371807.0,
-      "last": 376085.0,
-      "volume": 3404.5042,
-      "trading_value_24h": 1280382962.06,
-      "spread": 119.0,
-      "spread_pct": 0.0317,
-      "timestamp": "2026-10-23T09:50:04.112Z"
+      "last": 375219.0,
+      "volume": 3401.9987,
+      "trading_value_24h": 1276494550.22,
+      "spread": 65.0,
+      "spread_pct": 0.0173,
+      "timestamp": "2026-10-23T10:05:09.507Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 44649.0,
-      "bid": 44590.0,
+      "ask": 44848.0,
+      "bid": 44778.0,
       "high": 45201.0,
       "low": 42858.0,
-      "last": 44649.0,
-      "volume": 367.84,
-      "trading_value_24h": 16423688.16,
-      "spread": 59.0,
-      "spread_pct": 0.1323,
-      "timestamp": "2026-10-23T09:50:04.073Z"
+      "last": 44892.0,
+      "volume": 367.083,
+      "trading_value_24h": 16479090.04,
+      "spread": 70.0,
+      "spread_pct": 0.1563,
+      "timestamp": "2026-10-23T10:05:09.172Z"
     },
     "LTC": {
       "symbol": "LTC",
-      "ask": 9295.0,
-      "bid": 9274.0,
+      "ask": 9286.0,
+      "bid": 9255.0,
       "high": 9388.0,
       "low": 9132.0,
-      "last": 9337.0,
-      "volume": 2061.45,
-      "trading_value_24h": 19247758.65,
-      "spread": 21.0,
-      "spread_pct": 0.2264,
-      "timestamp": "2026-10-23T09:50:03.579Z"
+      "last": 9311.0,
+      "volume": 2060.04,
+      "trading_value_24h": 19181032.44,
+      "spread": 31.0,
+      "spread_pct": 0.335,
+      "timestamp": "2026-10-23T10:05:10.280Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 206.658,
-      "bid": 206.38,
+      "ask": 206.577,
+      "bid": 206.442,
       "high": 208.966,
       "low": 203.696,
-      "last": 206.532,
-      "volume": 2169451.0,
-      "trading_value_24h": 448061053.93,
-      "spread": 0.2779999999999916,
-      "spread_pct": 0.1347,
-      "timestamp": "2026-10-23T09:50:03.696Z"
+      "last": 206.484,
+      "volume": 2171554.0,
+      "trading_value_24h": 448391156.14,
+      "spread": 0.1349999999999909,
+      "spread_pct": 0.0654,
+      "timestamp": "2026-10-23T10:05:09.722Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.534,
-      "bid": 12.532,
+      "ask": 12.514,
+      "bid": 12.513,
       "high": 12.637,
       "low": 12.3,
-      "last": 12.532,
-      "volume": 3372179.0,
-      "trading_value_24h": 42260147.23,
-      "spread": 0.002000000000000668,
-      "spread_pct": 0.016,
-      "timestamp": "2026-10-23T09:50:03.854Z"
+      "last": 12.513,
+      "volume": 3556764.0,
+      "trading_value_24h": 44505787.93,
+      "spread": 0.0009999999999994458,
+      "spread_pct": 0.008,
+      "timestamp": "2026-10-23T10:05:09.788Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16310.0,
-      "bid": 16309.0,
+      "ask": 16301.0,
+      "bid": 16300.0,
       "high": 16445.0,
       "low": 16150.0,
-      "last": 16308.0,
-      "volume": 15549.49,
-      "trading_value_24h": 253581082.92,
+      "last": 16301.0,
+      "volume": 15044.49,
+      "trading_value_24h": 245240231.49,
       "spread": 1.0,
       "spread_pct": 0.0061,
-      "timestamp": "2026-10-23T09:50:03.282Z"
+      "timestamp": "2026-10-23T10:05:10.032Z"
     }
   },
   "static_snapshot": true
