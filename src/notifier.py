@@ -1,8 +1,8 @@
 """
 Discord Webhook / LINE 通知モジュール (notifier.py)
 
-AI判定結果とGMOコインスマートフォンアプリ（トレーダーモード）「取引所（現物）」での
-手動発注手順（【指値/逆指値】タブでの指値（Post-Only）＋約定後SL/TP設定）を
+AI判定結果と v2 24時間常時監視・全自動売買デーモンの自動執行ステータス
+（Post-Only 指値買い発注・4時間自動有効期限・約定後0.2秒ガーディアンによる自動SL/TP保護）を
 分かりやすい日本語メッセージに整形し、コンソール・ログ・Discord・LINEへ通知する。
 """
 
@@ -64,59 +64,73 @@ def format_order_type_label(action: str, order_type: str) -> str:
 
 
 def build_manual_order_guide(decision: Dict[str, Any]) -> str:
-    """GMOコインスマートフォンアプリ（トレーダーモード）での手動発注手順テキストを生成する"""
+    """v2 24時間全自動売買デーモンの自動執行ステータス案内テキストを生成する（手動操作不要）"""
     action = str(decision.get("action", "HOLD")).upper()
     symbol = str(decision.get("symbol", "NONE"))
     limit_str = format_price_jpy(decision.get("limit_price", 0) or 0)
     size_str = format_decimal_plain(decision.get("size", 0) or 0)
     tp_str = format_price_jpy(decision.get("take_profit_price", 0) or 0)
     sl_str = format_price_jpy(decision.get("stop_loss_price", 0) or 0)
-    cost = int(round(float(decision.get("expected_cost_jpy", 0) or 0)))
-    loss = int(round(float(decision.get("expected_loss_jpy", 0) or 0)))
-    rr = decision.get("risk_reward_ratio", 0.0)
 
-    common_notes = (
-        "※前日発注して未約定のまま24時間経過した買い指値注文がある場合は、必ず【注文一覧】から取消してください。\n"
-        "※夜間の無防備な約定を避けたい場合は、就寝前に未約定指値を取り消す運用も推奨されます。"
+    exec_res = decision.get("execution_result") if isinstance(decision.get("execution_result"), dict) else {}
+    exec_status = str(exec_res.get("status", "") or "").upper()
+    pending_ord = exec_res.get("pending_order") if isinstance(exec_res.get("pending_order"), dict) else {}
+    raw_ord = exec_res.get("order") if isinstance(exec_res.get("order"), dict) else {}
+    order_id = (
+        str(pending_ord.get("order_id") or raw_ord.get("order_id") or decision.get("order_id") or "").strip()
+        or "自動発番"
     )
+    skip_reason = str(
+        exec_res.get("cancel_reason")
+        or exec_res.get("error")
+        or exec_res.get("reason")
+        or decision.get("skip_reason")
+        or ""
+    ).strip()
+
+    header = "【🤖 v2 全自動執行ステータス（手動操作不要）】"
 
     if action == "HOLD":
+        if str(decision.get("original_action", "")).upper() == "BUY" or skip_reason:
+            reason_label = skip_reason or str(decision.get("status", "執行前検証による見送り"))
+            return (
+                f"{header}\n"
+                f"BUY候補を検知しましたが、執行前検証・口座状態により自動発注を見送りました（理由: {reason_label}）。\n"
+                "24時間常駐デーモンが引き続き15秒周期で市場と口座を自動監視します（手動操作は一切不要です）。"
+            )
         return (
-            "本日は新規発注の見送り（HOLD）です。\n"
-            "GMOコインアプリでの新規注文操作は不要です。\n"
-            f"{common_notes}"
+            f"{header}\n"
+            "本日は新規発注の見送り（HOLD）です。24時間常駐デーモンが引き続き15秒周期で市場と口座を自動監視します（手動操作は一切不要です）。"
         )
 
     if action == "BUY":
+        if exec_status in ("CANCELED", "ORDER_REJECTED", "SKIPPED", "REJECTED", "FAILED"):
+            reason_label = skip_reason or f"発注ステータス={exec_status}"
+            return (
+                f"{header}\n"
+                f"BUY候補を検知しましたが、執行前検証・口座状態により自動発注を見送りました（理由: {reason_label}）。"
+            )
         return (
-            f"【GMOコインアプリ 手動発注手順：BUY（新規買い）】\n"
-            f"① GMOコインアプリ下部【レート】＞上部【取引所 現物】＞銘柄「{symbol}」＞右上【注文】＞【指値/逆指値】タブを開く\n"
-            f"② 売買区分【買】／注文タイプ【指値】／執行条件【Post-Only】を選択し、取引数量「{size_str} {symbol}」と新規指値レート「{limit_str} 円」（想定受渡代金: 約 {cost:,} 円）を入力して発注\n"
-            f"③ 買い指値が約定したら、専用Webアプリで「買付反映」をタップし、GMOコインアプリの【指値/逆指値】タブ＞売買区分【売】＞注文タイプ【逆指値】で損切レート（SL: {sl_str} 円 / 想定最大損失: 約 {loss:,} 円）を発注して待機（利確レート TP: {tp_str} 円付近まで上昇したら注文取消して【指値】で利確TPを発注 / RR比 1 : {rr}）\n"
-            f"{common_notes}"
+            f"{header}\n"
+            f"GMOコイン取引所（現物）へ Post-Only 指値買い注文（注文ID: {order_id}）を自動発注しました。"
+            f"未約定のまま4時間経過した場合は自動キャンセルされ、約定した場合は0.2秒ガーディアンが直ちに逆指値（SL: {sl_str} 円）を自動発注して保護します（手動操作は一切不要です）。"
         )
 
     if action in ("MODIFY", "MODIFY_OCO"):
         return (
-            f"【GMOコインアプリ 手動操作手順：TP/SL変更 ({symbol})】\n"
-            f"① 【保有/履歴】＞【注文一覧】から現在有効な「{symbol}」の売りの逆指値（または指値）注文を取り消す\n"
-            f"② 【指値/逆指値】タブにて新しい損切レート（SL: {sl_str} 円）または利確レート（TP: {tp_str} 円）で再度【売】注文（数量: {size_str} {symbol}）を発注し、専用WebアプリでTP/SL変更を反映\n"
-            f"{common_notes}"
+            f"{header}\n"
+            f"保有中ポジション（{symbol} / 数量: {size_str} {symbol}）の逆指値（SL: {sl_str} 円）・利確目標（TP: {tp_str} 円）を自動更新しました（手動操作は一切不要です）。"
         )
 
     if action == "SELL":
         return (
-            f"【GMOコインアプリ 手動操作手順：SELL（決済売り・{symbol}）】\n"
-            f"① 【保有/履歴】＞【注文一覧】から待機中の「{symbol}」の売り注文を取り消す\n"
-            f"② 【指値/逆指値】（目安レート: {limit_str} 円）または【成行】の売買区分【売】（数量: {size_str} {symbol}）で決済発注し、専用Webアプリで決済反映\n"
-            f"{common_notes}"
+            f"{header}\n"
+            f"保有中ポジション（{symbol} / 数量: {size_str} {symbol} / 目安単価: {limit_str} 円）の自動決済売り注文を執行しました（手動操作は一切不要です）。"
         )
 
     return (
-        f"【GMOコインアプリ 手動操作手順 ({action})】\n"
-        f"・対象銘柄: {symbol}\n"
-        f"・数量: {size_str} {symbol} / 指値: {limit_str} 円 / 利確(TP): {tp_str} 円 / 損切(SL): {sl_str} 円\n"
-        f"{common_notes}"
+        f"{header}\n"
+        f"・対象銘柄: {symbol} / 数量: {size_str} {symbol} / 指値: {limit_str} 円 / 利確(TP): {tp_str} 円 / 損切(SL): {sl_str} 円（自動執行・手動操作不要）"
     )
 
 
@@ -166,8 +180,8 @@ def format_notification_message(decision: Dict[str, Any], max_length: int = 1900
             f"■ 注文数量  : {size_str} {symbol if symbol != 'NONE' else ''}".strip(),
             f"■ 利確 (TP) : {tp_str} 円",
             f"■ 損切 (SL) : {sl_str} 円",
-            f"■ 想定代金  : 約 {cost:,} 円 (上限5,000円枠)",
-            f"■ 想定最大損失: 約 {loss:,} 円 (目標150〜200円以内)",
+            f"■ 想定代金  : 約 {cost:,} 円 (総資産45%枠上限)",
+            f"■ 想定最大損失: 約 {loss:,} 円 (総資産1.2〜1.5%目標 / 2.0%上限)",
             f"■ RR比 / 確信度: {decision.get('risk_reward_ratio', 0.0)} / {confidence:.0f}%",
             "------------------------------",
             "【AI判断根拠】",

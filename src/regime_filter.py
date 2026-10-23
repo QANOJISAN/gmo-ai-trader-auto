@@ -132,6 +132,7 @@ class MarketRegimeFilter:
         # Breadth（スクリーニング銘柄のうち 1h EMA50/SMA25 または日足/4hトレンドが上向きの比率）
         total_syms = 0
         bullish_syms = 0
+        explicit_bearish_breadth_count = 0
         for sym, summary in (market_summaries or {}).items():
             if not isinstance(summary, dict):
                 continue
@@ -146,20 +147,24 @@ class MarketRegimeFilter:
             h4_ma = float(h4.get("sma_25", 0) or 0)
             d_trend = str(daily.get("trend", ""))
 
-            is_above = False
-            if h1_close > 0 and h1_ma > 0:
-                is_above = h1_close >= h1_ma
-            elif h4_close > 0 and h4_ma > 0:
-                is_above = h4_close >= h4_ma
-            elif d_trend in ("STRONG_UPTREND", "UPTREND"):
-                is_above = True
-            elif summary.get("above_ema50") is True:
-                is_above = True
-            elif summary.get("above_ema50") is False:
-                is_above = False
-            else:
+            has_ma_or_trend = bool(
+                (h1_close > 0 and h1_ma > 0)
+                or (h4_close > 0 and h4_ma > 0)
+                or d_trend
+                or ("above_ema50" in summary)
+            )
+            if not has_ma_or_trend:
                 # 情報未指定時は中立としてカウント
                 is_above = True
+            else:
+                is_above = bool(
+                    (h1_close > 0 and h1_ma > 0 and h1_close >= h1_ma)
+                    or (h4_close > 0 and h4_ma > 0 and h4_close >= h4_ma)
+                    or (d_trend in ("STRONG_UPTREND", "UPTREND"))
+                    or (summary.get("above_ema50") is True)
+                )
+                if summary.get("above_ema50") is False:
+                    explicit_bearish_breadth_count += 1
 
             if is_above:
                 bullish_syms += 1
@@ -177,7 +182,13 @@ class MarketRegimeFilter:
         if btc_4h_rsi <= self.btc_4h_crash_rsi:
             crash_triggered = True
             reasons.append(f"BTC 4h RSIパニック圏 ({btc_4h_rsi:.1f} <= {self.btc_4h_crash_rsi:.1f})")
-        if total_syms >= 4 and breadth_ratio < self.min_breadth_ratio:
+        btc_under_pressure = (
+            btc_1h_pct <= -1.0
+            or btc_4h_pct <= -1.5
+            or btc_4h_rsi <= 38.0
+            or explicit_bearish_breadth_count >= 3
+        )
+        if total_syms >= 4 and breadth_ratio < self.min_breadth_ratio and btc_under_pressure:
             crash_triggered = True
             reasons.append(
                 f"市場Breadth悪化 ({bullish_syms}/{total_syms} = {breadth_ratio * 100:.1f}% < {self.min_breadth_ratio * 100:.0f}%)"

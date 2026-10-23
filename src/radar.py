@@ -355,6 +355,7 @@ class TechnicalRadar:
         symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
         last_ai_call_at: Optional[datetime | str] = None,
         now_dt: Optional[datetime] = None,
+        cooldown_symbols: Optional[set[str]] = None,
     ) -> Dict[str, Any]:
         """
         市場要約とポートフォリオ状態を検査し、`AIJudge` を呼び出すべきか判定する。
@@ -414,11 +415,12 @@ class TechnicalRadar:
         effective_max_min_notional = max(self.max_min_notional_jpy, total_equity * Decimal("0.25"))
         effective_target_risk = max(self.target_risk_jpy, total_equity * DYNAMIC_TARGET_RISK_PCT)
 
+        cd_syms = {str(s).strip().upper() for s in (cooldown_symbols or set()) if s}
         has_open_slot = (len(positions) + len(active_pending_buys)) < max_concurrent
         if has_open_slot and not kill_switch_active and not cb_triggered and regime_info["allow_new_buy"]:
             for sym, summary in market_summaries.items():
                 sym_up = sym.strip().upper()
-                if sym_up in held_or_pending_symbols or sym_up in GATE0_EXCLUDED_SYMBOLS:
+                if sym_up in held_or_pending_symbols or sym_up in GATE0_EXCLUDED_SYMBOLS or sym_up in cd_syms:
                     continue
 
                 daily = summary.get("daily_indicators", {}) or {}

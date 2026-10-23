@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import ssl
+import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,6 +45,9 @@ DEFAULT_GEMINI_FALLBACK_MODELS = [
     "gemini-3.7-flash",
     "gemini-3.6-flash",
     "gemini-3.5-flash",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash-lite",
 ]
 
 MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP"}
@@ -377,10 +381,12 @@ class AIJudge:
         self.symbol_ai_cooldown_minutes = float(symbol_ai_cooldown_minutes)
         self.sl_penalty_cooldown_hours = float(sl_penalty_cooldown_hours)
         self.stale_price_drift_pct = float(stale_price_drift_pct)
+        self.model_quota_cooldown_minutes = float(os.getenv("GEMINI_QUOTA_COOLDOWN_MINUTES", "60"))
 
-        # 銘柄別クールダウン管理
+        # 銘柄別クールダウン管理 & モデル別429クォータ枯渇クールダウン管理
         self._last_symbol_ai_eval_at: Dict[str, datetime] = {}
         self._last_symbol_sl_hit_at: Dict[str, datetime] = {}
+        self._model_quota_cooldown_until: Dict[str, datetime] = {}
 
     def _has_valid_key(self, key: str) -> bool:
         return bool(key) and not key.startswith("your_")
@@ -630,33 +636,74 @@ class AIJudge:
                 http_options=types.HttpOptions(httpx_client=http_client),
             )
 
-            for model_id in candidate_models:
+            now_utc = datetime.now(timezone.utc)
+            active_candidates = [
+                m
+                for m in candidate_models
+                if m not in self._model_quota_cooldown_until or self._model_quota_cooldown_until[m] <= now_utc
+            ]
+            if not active_candidates:
+                active_candidates = list(candidate_models)
+
+            for model_id in active_candidates:
                 try:
                     cfg_kwargs: Dict[str, Any] = {
                         "response_mime_type": "application/json",
                         "temperature": 0.2,
                     }
-                    if thinking_level:
+                    use_thinking = thinking_level if ("lite" not in model_id.lower()) else None
+                    if use_thinking:
                         cfg_kwargs["thinking_config"] = types.ThinkingConfig(
-                            thinking_level=thinking_level
+                            thinking_level=use_thinking
                         )
 
                     logger.info(
                         "Gemini API 呼び出し中: model=%s (thinking_level=%s)",
                         model_id,
-                        thinking_level or "DEFAULT",
+                        use_thinking or "DEFAULT",
                     )
-                    response = client.models.generate_content(
-                        model=model_id,
-                        contents=prompt,
-                        config=types.GenerateContentConfig(**cfg_kwargs),
-                    )
+                    try:
+                        response = client.models.generate_content(
+                            model=model_id,
+                            contents=prompt,
+                            config=types.GenerateContentConfig(**cfg_kwargs),
+                        )
+                    except Exception as first_exc:
+                        err_msg_up = str(first_exc).upper()
+                        # thinking_config 非対応モデルの場合は thinking_config を外して即リトライ
+                        if "thinking_config" in cfg_kwargs and (
+                            "400" in err_msg_up or "INVALID_ARGUMENT" in err_msg_up or "THINKING" in err_msg_up
+                        ):
+                            cfg_kwargs.pop("thinking_config", None)
+                            use_thinking = None
+                            response = client.models.generate_content(
+                                model=model_id,
+                                contents=prompt,
+                                config=types.GenerateContentConfig(**cfg_kwargs),
+                            )
+                        # 503 UNAVAILABLE (一時的な高負荷スパイク) の場合は短時間待機して1回リトライ
+                        elif "503" in err_msg_up or "UNAVAILABLE" in err_msg_up:
+                            time.sleep(1.2)
+                            response = client.models.generate_content(
+                                model=model_id,
+                                contents=prompt,
+                                config=types.GenerateContentConfig(**cfg_kwargs),
+                            )
+                        else:
+                            raise
+
                     text = (response.text or "").strip()
                     parsed = _extract_json_dict(text)
-                    label = f"{model_id}({thinking_level})" if thinking_level else model_id
+                    self._model_quota_cooldown_until.pop(model_id, None)
+                    label = f"{model_id}({use_thinking})" if use_thinking else model_id
                     return parsed, label
                 except Exception as exc:
                     last_err = exc
+                    err_str_up = str(exc).upper()
+                    if "429" in err_str_up or "RESOURCE_EXHAUSTED" in err_str_up:
+                        self._model_quota_cooldown_until[model_id] = datetime.now(timezone.utc) + timedelta(
+                            minutes=self.model_quota_cooldown_minutes
+                        )
                     logger.warning(
                         "Gemini モデル '%s' 呼び出し失敗 (次候補へフォールバック): %s",
                         model_id,
@@ -1002,7 +1049,8 @@ class AIJudge:
             "reasoning": (
                 f"【クオンツ判定: {best_symbol} 押し目買い推奨 (スコア {best_score:.0f}点 / 確信度スコア {conviction_score})】"
                 f" 根拠: {reason_str}。現在値から {pullback_mult:.2f}×日足ATR 下方の押し目指値・"
-                f"1ポジション上限 {int(budget_jpy):,}円・名目許容損失 {int(aim_risk_jpy):,}円以内（実損失上限200円以内）・"
+                f"1ポジション上限 {int(budget_jpy):,}円（総資産45%枠）・名目許容損失 {int(aim_risk_jpy):,}円以内"
+                f"（総資産1.2〜1.5%目標 / 実損失上限{int(round(max(200.0, total_equity * 0.02))):,}円以内）・"
                 "RR比約1.8倍の現物Maker指値買い（Post-Only）および約定後SL/TP注文を設定します。"
             ),
         }

@@ -2981,6 +2981,127 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             finally:
                 daemon.shutdown()
 
+    def test_round10_bch_buy_pipeline_lot_rounding_and_v2_auto_notifier_format(self) -> None:
+        """
+        Round 10 リグレッション検証:
+        1. BCH の BUY 判定 (42,987円 / 0.076 BCH) ➔ 数量刻み (0.001 BCH) 丸め ➔ 自動指値発注 (PENDING_BUY)
+        2. 通知メッセージ & manual_instruction に旧v1の「手動発注手順」「上限5,000円枠」「買付反映」が一切含まれず、
+           v2全自動執行ステータス・注文ID・総資産45%枠上限が出力されること
+        3. BTCが平穏な押し目局面で 1h SMA25 割れのみによって誤って RISK_OFF_CRASH キャンセルが発動しないこと
+        4. 万一 PENDING_BUY が後から自動キャンセルされた場合や SOK 即時失効した場合に、
+           latest_decision.json が「BUY 発注中」のまま残らず HOLD (ORDER_CANCELED / CANCELED) へ同期されること
+        """
+        from src.notifier import build_manual_order_guide, format_notification_message
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_dir,
+                execution_mode="DRY_RUN",
+                ai_judge=AIJudge(provider="rule_based"),
+                dry_run_notify=True,
+            )
+            try:
+                t0 = datetime(2026, 10, 23, 23, 6, 57, tzinfo=JST)
+                pf = daemon.oco_manager.load_portfolio()
+                pf["jpy_balance"] = 10025
+                pf["initial_capital_jpy"] = 10025
+                daemon.oco_manager.save_portfolio(pf, now_dt=t0)
+
+                raw_bch_decision = {
+                    "bearish_counter_thesis": ["上位足レジスタンス反落リスク", "アルト流動性低下リスク"],
+                    "bullish_conviction_factors": ["対BTC相対強度良好", "1h押し目反発"],
+                    "conviction_score": 75,
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "order_type": "LIMIT_POST_ONLY",
+                    "limit_price": 42987,
+                    "size": 0.0764,  # size_step=0.001 により 0.076 BCH へ切り捨て丸めされること
+                    "take_profit_price": 47602,
+                    "stop_loss_price": 41053,
+                    "confidence": 0.75,
+                    "provider": "rule_based_quant",
+                    "reasoning": "BCH 押し目買い推奨テスト",
+                }
+                bch_mkt = {
+                    "BCH": {
+                        "price": {"last": 43500.0, "best_bid": 43490.0, "best_ask": 43510.0, "spread_pct": 0.04},
+                        "daily_indicators": {"trend": "UPTREND", "atr_14": 900.0, "rsi_14": 50.2, "macd_hist_rising": True},
+                        "h4_indicators": {"close": 43500.0, "sma_25": 43000.0, "rsi_14": 48.0, "change_4h_pct": 0.5},
+                        "h1_indicators": {"close": 43500.0, "sma_25": 43400.0, "rsi_14": 42.0, "rsi_rebound": True, "atr_14": 180.0},
+                    },
+                    "BTC": {
+                        "price": {"last": 13000000.0, "best_bid": 12999000.0, "best_ask": 13001000.0, "spread_pct": 0.01},
+                        "daily_indicators": {"trend": "UPTREND", "atr_14": 250000.0, "rsi_14": 52.0},
+                        "h4_indicators": {"close": 13000000.0, "sma_25": 12950000.0, "rsi_14": 51.0, "change_4h_pct": 0.3},
+                        "h1_indicators": {"close": 13000000.0, "sma_25": 13010000.0, "change_1h_pct": -0.1, "rsi_14": 48.0},
+                    },
+                }
+                validated = validate_and_adjust_decision(
+                    decision=raw_bch_decision,
+                    portfolio=daemon.oco_manager.load_portfolio(),
+                    symbol_rules=DEFAULT_SYMBOL_RULES,
+                    market_summaries=bch_mkt,
+                )
+                self.assertEqual(validated["action"], "BUY")
+                self.assertEqual(validated["symbol"], "BCH")
+                self.assertAlmostEqual(float(validated["size"]), 0.076, places=6)
+
+                tickers = {
+                    "BCH": {"symbol": "BCH", "bid": 43490.0, "ask": 43510.0, "last": 43500.0},
+                    "BTC": {"symbol": "BTC", "bid": 12999000.0, "ask": 13001000.0, "last": 13000000.0},
+                }
+                exec_res = daemon.oco_manager.place_new_buy_order(validated, tickers=tickers, now_dt=t0)
+                self.assertEqual(exec_res["status"], "PENDING_BUY")
+                oid = exec_res["pending_order"]["order_id"]
+                validated["execution_result"] = exec_res
+                validated["manual_instruction"] = build_manual_order_guide(validated)
+
+                msg = format_notification_message(validated)
+                for legacy_kw in ("手動発注手順", "手動操作手順", "買付反映", "上限5,000円枠", "5,000円枠"):
+                    self.assertNotIn(legacy_kw, msg)
+                    self.assertNotIn(legacy_kw, validated["manual_instruction"])
+                self.assertIn("【🤖 v2 全自動執行ステータス（手動操作不要）】", msg)
+                self.assertIn("総資産45%枠上限", msg)
+                self.assertIn(oid, msg)
+
+                # 15分後に1h足が押し目でSMA25を割り込んでも、BTCが急落していなければ誤って RISK_OFF_CRASH にならず pending_orders が維持されること
+                calm_pullback_summaries = {
+                    "BTC": {
+                        "h1_indicators": {"close": 12990000.0, "sma_25": 13010000.0, "change_1h_pct": -0.2},
+                        "h4_indicators": {"close": 12990000.0, "sma_25": 12950000.0, "change_4h_pct": 0.2, "rsi_14": 49.0},
+                        "daily_indicators": {"trend": "DOWNTREND_OR_RANGE"},
+                    },
+                    "BCH": {
+                        "h1_indicators": {"close": 43200.0, "sma_25": 43400.0},
+                        "h4_indicators": {"close": 43200.0, "sma_25": 43000.0},
+                        "daily_indicators": {"trend": "UPTREND"},
+                    },
+                    "SOL": {"h1_indicators": {"close": 23800.0, "sma_25": 24000.0}, "daily_indicators": {"trend": "DOWNTREND_OR_RANGE"}},
+                    "XRP": {"h1_indicators": {"close": 84.0, "sma_25": 85.0}, "daily_indicators": {"trend": "DOWNTREND_OR_RANGE"}},
+                }
+                reg_eval = daemon.regime_filter.evaluate(calm_pullback_summaries, now_dt=t0 + timedelta(minutes=15))
+                self.assertNotEqual(reg_eval["regime"], "RISK_OFF_CRASH")
+                self.assertFalse(reg_eval["should_cancel_pending_buys"])
+
+                # 万一 RISK_OFF_CRASH 等で待機中指値がキャンセルされた場合、latest_decision.json も HOLD (ORDER_CANCELED) に同期されること
+                from src.json_utils import load_json_file, write_json_file
+
+                write_json_file(daemon.latest_decision_path, validated)
+                daemon._sync_latest_decision_on_pending_cancel(
+                    canceled_order_ids=[oid],
+                    cancel_reason="テスト自動取消",
+                    now_dt=t0 + timedelta(minutes=15),
+                )
+                synced_latest = load_json_file(daemon.latest_decision_path)
+                self.assertEqual(synced_latest["action"], "HOLD")
+                self.assertEqual(synced_latest["original_action"], "BUY")
+                self.assertEqual(synced_latest["status"], "HOLD (ORDER_CANCELED)")
+                self.assertIn("テスト自動取消", synced_latest["reasoning"])
+                self.assertIn("自動発注を見送りました", synced_latest["manual_instruction"])
+            finally:
+                daemon.shutdown()
+
 
 if __name__ == "__main__":
     unittest.main()

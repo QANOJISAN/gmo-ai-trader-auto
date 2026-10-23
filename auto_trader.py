@@ -21,6 +21,7 @@ import csv
 import logging
 import os
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,7 +48,7 @@ from src.gmo_private_client import (
     PaperBroker,
     create_broker_client,
 )
-from src.json_utils import write_json_file
+from src.json_utils import load_json_file, write_json_file
 from src.live_probe import GMOCoinLiveProbe
 from src.llm_shadow_evaluator import LLMShadowEvaluator
 from src.notifier import Notifier, build_manual_order_guide
@@ -910,6 +911,22 @@ class AutoTraderDaemon:
             step_events = self.oco_manager.step(tickers=current_tickers, now_dt=now_jst)
             events = list(campaign_res.get("events", [])) + guardian_events + adverse_cancel_events + step_events
 
+            # 待機中BUY指値が逆選択ガードや期限切れでキャンセルされた場合は latest_decision.json の表示状態も同期
+            for ev in adverse_cancel_events + step_events:
+                ev_type = str(ev.get("type", "")).upper()
+                if ev_type in ("ADVERSE_SELECTION_RESTING_BUY_CANCELED", "BUY_ORDER_EXPIRED"):
+                    c_oid = str(ev.get("order_id", "") or "")
+                    c_reason = (
+                        f"逆選択ガード発動 ({ev.get('reason', '')})"
+                        if ev_type == "ADVERSE_SELECTION_RESTING_BUY_CANCELED"
+                        else f"有効期限({self.order_expiry_hours:.1f}h)タイムアウト自動取消"
+                    )
+                    self._sync_latest_decision_on_pending_cancel(
+                        canceled_order_ids=[c_oid] if c_oid else [],
+                        cancel_reason=c_reason,
+                        now_dt=now_jst,
+                    )
+
             # SL 約定イベント発生時は該当銘柄に180分クールダウンを記録
             for ev in events:
                 if ev.get("type") in (
@@ -1086,12 +1103,19 @@ class AutoTraderDaemon:
                 now_dt=now_jst,
             )
 
+            cooldown_syms = {
+                str(s).strip().upper()
+                for s in (market_summaries or {}).keys()
+                if self.ai_judge.is_symbol_on_ai_cooldown(s, now_dt=now_jst)[0]
+                or self.ai_judge.is_symbol_on_sl_cooldown(s, now_dt=now_jst)[0]
+            }
             radar_eval = self.radar.evaluate_triggers(
                 market_summaries=market_summaries,
                 portfolio=pf,
                 symbol_rules=rules,
                 last_ai_call_at=self.last_ai_call_at,
                 now_dt=now_jst,
+                cooldown_symbols=cooldown_syms,
             )
             self.last_radar_run_at = now_jst
 
@@ -1107,9 +1131,32 @@ class AutoTraderDaemon:
 
             # RISK_OFF_CRASH 検知時は未約定の PENDING_BUY を即時キャンセル
             regime_info = radar_eval.get("regime_info", {})
-            if regime_info.get("should_cancel_pending_buys"):
-                self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+            if regime_info.get("should_cancel_pending_buys") and (pf.get("pending_orders") or []):
+                c_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
                 pf = self.oco_manager.load_portfolio()
+                canceled_ids = c_res.get("canceled_buy_order_ids", []) or []
+                if canceled_ids:
+                    crash_reason_str = " / ".join(regime_info.get("reasons", []) or ["RISK_OFF_CRASH"])
+                    logger.warning(
+                        "⚠️ RISK_OFF_CRASH 検知により待機中BUY指値を自動キャンセルしました: order_ids=%s (%s)",
+                        canceled_ids,
+                        crash_reason_str,
+                    )
+                    self.notifier.notify_event(
+                        title="相場急変ガード (RISK_OFF_CRASH) による待機中指値自動取消",
+                        message=(
+                            f"・取消注文ID: `{', '.join(canceled_ids)}`\n"
+                            f"・発動理由: {crash_reason_str}\n"
+                            "・未約定の新規買い指値を安全のため自動キャンセルしました（手動操作は不要です）。"
+                        ),
+                        level="WARN",
+                        dry_run=self.dry_run_notify,
+                    )
+                    self._sync_latest_decision_on_pending_cancel(
+                        canceled_order_ids=canceled_ids,
+                        cancel_reason=f"RISK_OFF_CRASH ({crash_reason_str})",
+                        now_dt=now_jst,
+                    )
 
             if not radar_eval["should_call_ai"] and not force_ai:
                 logger.info("📡 レーダースキャン完了: %s", radar_eval["reason_summary"])
@@ -1257,13 +1304,40 @@ class AutoTraderDaemon:
             # 自動発注執行
             execution_result: Dict[str, Any] = {"action": action, "status": "NOOP"}
             if action == "BUY":
-                execution_result = self.oco_manager.place_new_buy_order(
-                    decision=validated,
-                    tickers=tickers,
-                    now_dt=now_jst,
-                )
+                try:
+                    execution_result = self.oco_manager.place_new_buy_order(
+                        decision=validated,
+                        tickers=tickers,
+                        now_dt=now_jst,
+                    )
+                except Exception as ord_exc:
+                    logger.warning("⚠️ BUY候補検知 (%s) ➔ 発注例外により見送り: %s", target_sym, ord_exc)
+                    execution_result = {
+                        "action": "BUY",
+                        "status": "ORDER_REJECTED",
+                        "error": str(ord_exc),
+                    }
+
                 if execution_result.get("status") == "PENDING_BUY":
                     self._increment_daily_trade_count(now_jst)
+                    self.ai_judge.record_symbol_ai_call(target_sym, now_dt=now_jst)
+                else:
+                    skip_reason = str(
+                        execution_result.get("error")
+                        or execution_result.get("reason")
+                        or f"Post-Only即時約定拒否または発注失効 (status={execution_result.get('status', 'SKIPPED')})"
+                    )
+                    logger.warning("⚠️ BUY候補検知 (%s) ➔ 見送り（理由：%s）", target_sym, skip_reason)
+                    validated["original_action"] = "BUY"
+                    validated["action"] = "HOLD"
+                    validated["order_type"] = "NONE"
+                    validated["status"] = f"HOLD ({execution_result.get('status', 'ORDER_SKIPPED')})"
+                    validated["skip_reason"] = skip_reason
+                    validated["reasoning"] = (
+                        f"【⚠️ BUY候補検知 ({target_sym}) ➔ 見送り（理由：{skip_reason}）】 "
+                        + str(validated.get("reasoning", ""))
+                    )
+                    action = "HOLD"
                     self.ai_judge.record_symbol_ai_call(target_sym, now_dt=now_jst)
             elif action == "MODIFY":
                 mod_pos = self.oco_manager.modify_position_tp_sl(
@@ -1280,8 +1354,13 @@ class AutoTraderDaemon:
                     now_dt=now_jst,
                 )
                 execution_result = {"action": "SELL", "status": "CLOSED" if closed else "NOT_FOUND", "closed_trade": closed}
+            else:
+                # HOLD 判定時も NEW_ENTRY_OPPORTUNITY 候補銘柄にクールダウンを記録し、15分ごとの同一銘柄API連打・429枯渇を防止
+                for cand_sym in radar_eval.get("candidate_symbols", []) or []:
+                    self.ai_judge.record_symbol_ai_call(str(cand_sym), now_dt=now_jst)
 
             validated["execution_result"] = execution_result
+            validated["manual_instruction"] = build_manual_order_guide(validated)
             pf_after = self.oco_manager.load_portfolio()
             write_json_file(self.latest_decision_path, validated)
             append_history_csv(self.history_csv_path, validated, pf_after)
@@ -1294,8 +1373,8 @@ class AutoTraderDaemon:
                 history_csv_path=self.history_csv_path,
             )
             self._sync_pwa_snapshot(include_charts=True, force_push=True)
-            # 3階層通知: HOLD の場合はスパム防止のため DAILY_DIGEST バッファへ送り、BUY/SELL/MODIFY は即時通知
-            if action == "HOLD":
+            # 3階層通知: HOLD の場合はスパム防止のため DAILY_DIGEST バッファへ送り、BUY/SELL/MODIFY（またはBUY見送り警告）は通知
+            if action == "HOLD" and validated.get("original_action") != "BUY":
                 self.notification_dispatcher.dispatch(
                     tier="DAILY_DIGEST",
                     title=f"AI判定 HOLD ({target_sym})",
@@ -1322,6 +1401,55 @@ class AutoTraderDaemon:
                 "error": str(exc),
                 "circuit_breaker": cb_info,
             }
+
+    def _sync_latest_decision_on_pending_cancel(
+        self,
+        canceled_order_ids: List[str],
+        cancel_reason: str,
+        now_dt: Optional[datetime] = None,
+    ) -> None:
+        """
+        待機中だった BUY 指値がリスクオフ・逆選択ガード・有効期限等で自動キャンセルされた際、
+        `latest_decision.json` の表示が「発注中 (BUY / PENDING_BUY)」のまま残らないよう
+        `HOLD (ORDER_CANCELED)` へ自動同期する。
+        """
+        if not self.latest_decision_path.exists():
+            return
+        try:
+            now_jst = _now_jst(now_dt)
+            latest = load_json_file(self.latest_decision_path)
+            if not isinstance(latest, dict):
+                return
+            exec_res = latest.get("execution_result") if isinstance(latest.get("execution_result"), dict) else {}
+            pending_ord = exec_res.get("pending_order") if isinstance(exec_res.get("pending_order"), dict) else {}
+            latest_oid = str(pending_ord.get("order_id") or exec_res.get("order", {}).get("order_id") or "").strip()
+            latest_act = str(latest.get("action", "")).upper()
+            latest_exec_st = str(exec_res.get("status", "")).upper()
+
+            if latest_act != "BUY" and latest_exec_st != "PENDING_BUY":
+                return
+            if canceled_order_ids and latest_oid and latest_oid not in {str(x).strip() for x in canceled_order_ids}:
+                return
+
+            sym = str(latest.get("symbol", "NONE"))
+            oid_label = latest_oid or (str(canceled_order_ids[0]) if canceled_order_ids else "不明")
+            latest["original_action"] = "BUY"
+            latest["action"] = "HOLD"
+            latest["status"] = "HOLD (ORDER_CANCELED)"
+            latest["skip_reason"] = f"注文ID:{oid_label} 自動取消 ({cancel_reason})"
+            if not isinstance(latest.get("execution_result"), dict):
+                latest["execution_result"] = {}
+            latest["execution_result"]["status"] = "CANCELED"
+            latest["execution_result"]["cancel_reason"] = cancel_reason
+            latest["execution_result"]["canceled_at"] = now_jst.isoformat(timespec="seconds")
+            prefix = f"【⚠️ BUY候補検知・指値発注後自動取消 ({sym} #{oid_label}) ➔ 見送り（理由：{cancel_reason}）】 "
+            old_reasoning = str(latest.get("reasoning", ""))
+            if not old_reasoning.startswith("【⚠️"):
+                latest["reasoning"] = prefix + old_reasoning
+            latest["manual_instruction"] = build_manual_order_guide(latest)
+            write_json_file(self.latest_decision_path, latest)
+        except Exception as exc:
+            logger.debug("latest_decision.json 取消ステータス同期スキップ: %s", exc)
 
     def _sync_pwa_snapshot(self, include_charts: bool = True, force_push: bool = False) -> None:
         """
@@ -1381,8 +1509,16 @@ class AutoTraderDaemon:
                         or (now_jst - self.last_reconcile_run_at).total_seconds() >= 300.0
                     )
                 ):
-                    self.reconciler.reconcile(now_dt=now_jst)
+                    rec_periodic = self.reconciler.reconcile(now_dt=now_jst)
                     self.last_reconcile_run_at = now_jst
+                    if rec_periodic.get("ghost_orders_resolved"):
+                        pf_post_rec = self.oco_manager.load_portfolio()
+                        if not (pf_post_rec.get("pending_orders") or []):
+                            self._sync_latest_decision_on_pending_cancel(
+                                canceled_order_ids=rec_periodic.get("ghost_orders_resolved", []),
+                                cancel_reason="取引所有効注文照合による失効・取消同期",
+                                now_dt=now_jst,
+                            )
 
                 should_run_radar = (
                     self.last_radar_run_at is None
@@ -1430,14 +1566,43 @@ class AutoTraderDaemon:
             pass
 
 
+class _JSTDailyFileHandler(logging.FileHandler):
+    """常駐デーモンが日付を跨いでも自動的に当日日付の `v2_auto_YYYYMMDD.log` へ切り替えるハンドラ"""
+
+    def __init__(self, log_dir: Path, encoding: str = "utf-8") -> None:
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self._current_date_str = _now_jst().strftime("%Y%m%d")
+        initial_path = self.log_dir / f"v2_auto_{self._current_date_str}.log"
+        super().__init__(initial_path, encoding=encoding)
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            new_date_str = _now_jst().strftime("%Y%m%d")
+            if new_date_str != self._current_date_str:
+                self._current_date_str = new_date_str
+                new_path = self.log_dir / f"v2_auto_{new_date_str}.log"
+                if self.stream:
+                    try:
+                        self.stream.flush()
+                        self.stream.close()
+                    except Exception:
+                        pass
+                    self.stream = None
+                self.baseFilename = os.fspath(new_path)
+                self.stream = self._open()
+        except Exception:
+            pass
+        super().emit(record)
+
+
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    log_file = LOG_DIR / f"v2_auto_{_now_jst().strftime('%Y%m%d')}.log"
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
-            logging.FileHandler(log_file, encoding="utf-8"),
+            _JSTDailyFileHandler(LOG_DIR, encoding="utf-8"),
             logging.StreamHandler(sys.stdout),
         ],
     )

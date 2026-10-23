@@ -1,33 +1,119 @@
 {
-  "timestamp": "2026-10-22T17:30:21+09:00",
+  "bearish_counter_thesis": [
+    "上位足レジスタンス到達時の利益確定売りによる短期反落リスク",
+    "マクロ指標発表やBTC急変動に伴うアルトコインの流動性低下リスク"
+  ],
+  "bullish_conviction_factors": [
+    "対BTC7日間相対強度が良好(+3.4%)",
+    "RSI(50.2)が過熱感のない順張り好機水準",
+    "MACDヒストグラムが改善基調"
+  ],
+  "conviction_score": 75,
   "action": "HOLD",
-  "symbol": "NONE",
-  "order_type": "NONE",
-  "limit_price": 0,
-  "size": 0,
-  "take_profit_price": 0,
-  "stop_loss_price": 0,
-  "expected_cost_jpy": 0,
-  "expected_loss_jpy": 0,
-  "risk_reward_ratio": 0.0,
-  "confidence": 0.5,
-  "provider": "radar_gate_hold",
-  "execution_mode": "LIVE",
-  "radar_triggers": [],
-  "regime_info": {
-    "regime": "RISK_OFF_CRASH",
-    "allow_new_buy": false,
-    "should_cancel_pending_buys": true,
-    "in_hysteresis_cooldown": false,
-    "cooldown_until": "2026-10-22T19:30:21+09:00",
-    "btc_change_1h_pct": -0.32,
-    "btc_change_4h_pct": -1.4,
-    "btc_rsi_4h": 41.96,
-    "breadth_ratio": 0.0,
-    "reasons": [
-      "市場Breadth悪化 (0/10 = 0.0% < 25%)"
-    ]
+  "symbol": "BCH",
+  "order_type": "LIMIT_POST_ONLY",
+  "limit_price": 42987,
+  "suggested_entry_offset_atr": 0.75,
+  "size": 0.076,
+  "take_profit_price": 47602,
+  "stop_loss_price": 41053,
+  "confidence": 0.75,
+  "reasoning": "【⚠️ BUY指値発注後・自動取消済み (BCH #9073475740 @ 42,987円×0.076 BCH) ➔ 23:07:26にGMOコインへPost-Only指値発注成功後、23:22:06のサイクルで自動キャンセルされ現在待機注文0件（HOLD待機）】 【クオンツ判定: BCH 押し目買い推奨 (スコア 45点 / 確信度スコア 75)】 根拠: 対BTC7日間相対強度が良好(+3.4%) / RSI(50.2)が過熱感のない順張り好機水準 / MACDヒストグラムが改善基調。現在値から 0.75×日足ATR 下方の押し目指値・1ポジション上限 4,511円・名目許容損失 150円以内（総資産1.2〜1.5%目標 / 実損失上限200円以内）・RR比約1.8倍の現物Maker指値買い（Post-Only）および約定後SL/TP注文を設定します。",
+  "timestamp": "2026-10-23T23:06:57+09:00",
+  "provider": "rule_based_quant",
+  "expected_loss_with_slippage_jpy": 158,
+  "portfolio_total_risk_jpy": 150,
+  "expected_cost_jpy": 3267,
+  "expected_loss_jpy": 150,
+  "risk_reward_ratio": 2.39,
+  "adverse_selection_guard": {
+    "allow_entry": true,
+    "reject_reasons": [],
+    "passive_offset_applied": false,
+    "adjusted_limit_price": 42987.0,
+    "layer1": {
+      "obi_5": -0.0469,
+      "level1_bid_ratio": 0.4286,
+      "micro_price": 44638.0,
+      "mid_price": 44646.0,
+      "bid_queue_at_or_above_order": 0.3,
+      "spread": 112.0,
+      "best_bid": 44590.0,
+      "best_ask": 44702.0
+    },
+    "layer2": {
+      "tfi_60s": 0.0,
+      "ssi_60s": 0.0,
+      "sell_sweep_detected": false,
+      "v_buy_decay": 0.0,
+      "v_sell_decay": 0.0
+    },
+    "layer3": {
+      "delta_p_60s": 0.0,
+      "drop_atr_ratio_60s": 0.0,
+      "relative_spread_ratio": 1.3827,
+      "data_latency_sec": 0.0
+    }
   },
-  "reasoning": "トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
-  "status": "RADAR_SKIPPED_AI"
+  "radar_triggers": [
+    "NEW_ENTRY_OPPORTUNITY"
+  ],
+  "execution_mode": "LIVE",
+  "manual_instruction": "【🤖 v2 全自動執行ステータス（手動操作不要）】\nBUY候補を検知しましたが、執行前検証・口座状態により自動発注を見送りました（理由: 23:22:06 JST 1時間足Breadth悪化判定により自動取消）。\n24時間常駐デーモンが引き続き15秒周期で市場と口座を自動監視します（手動操作は一切不要です）。",
+  "status": "HOLD (ORDER_CANCELED)",
+  "execution_result": {
+    "status": "CANCELED",
+    "pending_order": {
+      "order_id": "9073475740",
+      "symbol": "BCH",
+      "side": "BUY",
+      "execution_type": "LIMIT",
+      "time_in_force": "SOK",
+      "limit_price": 42987.0,
+      "size": 0.076,
+      "take_profit_price": 47602.0,
+      "stop_loss_price": 41053.0,
+      "initial_risk_jpy": 150.0,
+      "state": "PENDING_BUY",
+      "placed_at": "2026-10-23T23:06:57+09:00",
+      "expires_at": "2026-10-24T03:06:57+09:00",
+      "post_only_adjusted": false,
+      "adjust_count": 0,
+      "reasoning": "【クオンツ判定: BCH 押し目買い推奨 (スコア 45点 / 確信度スコア 75)】 根拠: 対BTC7日間相対強度が良好(+3.4%) / RSI(50.2)が過熱感のない順張り好機水準 / MACDヒストグラムが改善基調。現在値から 0.75×日足ATR 下方の押し目指値・1ポジション上限 4,511円・名目許容損失 150円以内（実損失上限200円以内）・RR比約1.8倍の現物Maker指値買い（Post-Only）および約定後SL/TP注文を設定します。"
+    },
+    "order": {
+      "order_id": "9073475740",
+      "symbol": "BCH",
+      "side": "BUY",
+      "execution_type": "LIMIT",
+      "time_in_force": "SOK",
+      "price": 42987.0,
+      "size": 0.076,
+      "executed_size": 0.0,
+      "status": "ORDERED",
+      "post_only_adjusted": false,
+      "adjust_count": 0,
+      "intent_id": "intent-a31bbd9e83f0",
+      "timestamp": "2026-10-23T14:07:26.445Z",
+      "executedSize": 0.0,
+      "executionType": "LIMIT",
+      "losscutPrice": 0.0,
+      "orderId": "9073475740",
+      "orderType": "NORMAL",
+      "rootOrderId": 9073475740,
+      "settleType": "OPEN",
+      "timeInForce": "SOK",
+      "losscut_price": 0.0,
+      "remaining_size": 0.076,
+      "order_status": "ORDERED",
+      "orderStatus": "ORDERED",
+      "cancel_type": "",
+      "cancelType": "",
+      "orderTimestamp": "2026-10-23T14:07:26.445Z"
+    },
+    "cancel_reason": "23:22:06 JST 1時間足Breadth悪化判定により自動取消",
+    "canceled_at": "2026-10-23T23:22:06+09:00"
+  },
+  "original_action": "BUY",
+  "skip_reason": "注文ID:9073475740 発注後、23:22:06 JST に1時間足Breadth悪化判定により自動キャンセル済み"
 }
