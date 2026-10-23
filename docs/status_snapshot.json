@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-10-24T04:35:41+09:00",
+  "timestamp": "2026-10-24T04:50:46+09:00",
   "network_info": {
     "lan_ip": "192.168.11.3",
     "port": 8080,
@@ -95,9 +95,9 @@
     "pre_deadline_freeze_hours": 2.0,
     "remaining_days": 257,
     "remaining_hours": 19,
-    "remaining_minutes": 24,
-    "remaining_total_seconds": 22274658,
-    "countdown_text": "第1回締め(2027/7/9) 残り 257日 19時間 24分",
+    "remaining_minutes": 9,
+    "remaining_total_seconds": 22273753,
+    "countdown_text": "第1回締め(2027/7/9) 残り 257日 19時間 09分",
     "phase1_settled": false,
     "phase2_settled": false
   },
@@ -108,8 +108,8 @@
         "symbol": "ETH",
         "size": 0.00076653866858138,
         "state": "DUST_QUARANTINED",
-        "current_bid": 375804.0,
-        "estimated_value_jpy": 288.1,
+        "current_bid": 376045.0,
+        "estimated_value_jpy": 288.3,
         "opened_at": "2026-10-22T17:30:20+09:00"
       }
     ]
@@ -153,7 +153,6 @@
     }
   },
   "logs": [
-    "2026-10-24 04:05:23,393 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
     "2026-10-24 04:05:25,101 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 503 Service Unavailable\"",
     "2026-10-24 04:05:26,303 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
     "2026-10-24 04:05:26,585 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent \"HTTP/1.1 429 Too Many Requests\"",
@@ -182,99 +181,100 @@
     "2026-10-24 04:05:43,949 [INFO] google_genai.models: AFC is enabled with max remote calls: 10.",
     "2026-10-24 04:05:46,150 [INFO] httpx: HTTP Request: POST https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent \"HTTP/1.1 200 OK\"",
     "2026-10-24 04:20:36,455 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
-    "2026-10-24 04:35:41,638 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
+    "2026-10-24 04:35:41,638 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）",
+    "2026-10-24 04:50:46,822 [INFO] auto_trader: 📡 レーダースキャン完了: トリガー条件未該当（AI呼び出しスキップ・省エネ待機）"
   ],
   "tickers": {
     "BTC": {
       "symbol": "BTC",
-      "ask": 12752209.0,
-      "bid": 12752208.0,
+      "ask": 12760411.0,
+      "bid": 12760410.0,
       "high": 12874000.0,
       "low": 12662387.0,
-      "last": 12752491.0,
-      "volume": 120.34371,
-      "trading_value_24h": 1534682078.68,
+      "last": 12759617.0,
+      "volume": 120.18429,
+      "trading_value_24h": 1533505509.82,
       "spread": 1.0,
       "spread_pct": 0.0,
-      "timestamp": "2026-10-23T19:35:40.211Z"
+      "timestamp": "2026-10-23T19:50:45.172Z"
     },
     "ETH": {
       "symbol": "ETH",
-      "ask": 375983.0,
-      "bid": 375804.0,
+      "ask": 376058.0,
+      "bid": 376045.0,
       "high": 379321.0,
       "low": 371807.0,
-      "last": 375686.0,
-      "volume": 2152.1632,
-      "trading_value_24h": 808537583.96,
-      "spread": 179.0,
-      "spread_pct": 0.0476,
-      "timestamp": "2026-10-23T19:35:40.233Z"
+      "last": 375920.0,
+      "volume": 2142.9707,
+      "trading_value_24h": 805585545.54,
+      "spread": 13.0,
+      "spread_pct": 0.0035,
+      "timestamp": "2026-10-23T19:50:45.226Z"
     },
     "BCH": {
       "symbol": "BCH",
-      "ask": 44542.0,
+      "ask": 44589.0,
       "bid": 44500.0,
       "high": 45201.0,
       "low": 42858.0,
       "last": 44742.0,
-      "volume": 436.294,
-      "trading_value_24h": 19520666.15,
-      "spread": 42.0,
-      "spread_pct": 0.0944,
-      "timestamp": "2026-10-23T19:35:39.683Z"
+      "volume": 436.222,
+      "trading_value_24h": 19517444.72,
+      "spread": 89.0,
+      "spread_pct": 0.2,
+      "timestamp": "2026-10-23T19:50:44.465Z"
     },
     "LTC": {
       "symbol": "LTC",
       "ask": 9180.0,
-      "bid": 9160.0,
+      "bid": 9173.0,
       "high": 9388.0,
       "low": 9100.0,
       "last": 9180.0,
-      "volume": 1973.97,
-      "trading_value_24h": 18121044.6,
-      "spread": 20.0,
-      "spread_pct": 0.2183,
-      "timestamp": "2026-10-23T19:35:40.681Z"
+      "volume": 1873.87,
+      "trading_value_24h": 17202126.6,
+      "spread": 7.0,
+      "spread_pct": 0.0763,
+      "timestamp": "2026-10-23T19:50:45.136Z"
     },
     "XRP": {
       "symbol": "XRP",
-      "ask": 204.349,
-      "bid": 204.181,
+      "ask": 204.618,
+      "bid": 204.442,
       "high": 208.966,
       "low": 203.696,
-      "last": 204.26,
-      "volume": 1727086.0,
-      "trading_value_24h": 352774586.36,
-      "spread": 0.16799999999997794,
-      "spread_pct": 0.0823,
-      "timestamp": "2026-10-23T19:35:40.210Z"
+      "last": 204.643,
+      "volume": 1708516.0,
+      "trading_value_24h": 349635839.79,
+      "spread": 0.17599999999998772,
+      "spread_pct": 0.0861,
+      "timestamp": "2026-10-23T19:50:45.240Z"
     },
     "DOGE": {
       "symbol": "DOGE",
-      "ask": 12.404,
-      "bid": 12.386,
+      "ask": 12.418,
+      "bid": 12.401,
       "high": 12.637,
       "low": 12.3,
       "last": 12.424,
-      "volume": 3479249.0,
-      "trading_value_24h": 43226189.58,
-      "spread": 0.018000000000000682,
-      "spread_pct": 0.1453,
-      "timestamp": "2026-10-23T19:35:39.327Z"
+      "volume": 3469249.0,
+      "trading_value_24h": 43101949.58,
+      "spread": 0.01699999999999946,
+      "spread_pct": 0.1371,
+      "timestamp": "2026-10-23T19:50:45.134Z"
     },
     "SOL": {
       "symbol": "SOL",
-      "ask": 16263.0,
-      "bid": 16261.0,
+      "ask": 16266.0,
+      "bid": 16265.0,
       "high": 16486.0,
       "low": 16150.0,
-      "last": 16262.0,
-      "volume": 15102.04,
-      "trading_value_24h": 245589374.48,
-      "spread": 2.0,
-      "spread_pct": 0.0123,
-      "timestamp": "2026-10-23T19:35:40.556Z"
+      "last": 16266.0,
+      "volume": 15153.04,
+      "trading_value_24h": 246479348.64,
+      "spread": 1.0,
+      "spread_pct": 0.0061,
+      "timestamp": "2026-10-23T19:50:45.469Z"
     }
   },
   "static_snapshot": true
