@@ -423,29 +423,29 @@
   <!-- 資産・パターンA複利・防衛ライン KPI -->
   <section class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 10,000円</span></div>
-      <div id="kpiTotalEquity" class="kpi-value">10,025 円</div>
-      <div id="kpiCashDetail" class="kpi-sub">現金: 10,025 円 / 拘束: 0 円</div>
+      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 20,000円</span></div>
+      <div id="kpiTotalEquity" class="kpi-value">20,025 円</div>
+      <div id="kpiCashDetail" class="kpi-sub">現金: 20,025 円 / 拘束: 0 円</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">+0.25%</span></div>
+      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">+0.12%</span></div>
       <div id="kpiTotalPnl" class="kpi-value pos-val">+25 円</div>
       <div id="kpiRealizedDetail" class="kpi-sub">確定: +0 円 / 含み: +0 円</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>📈 パターンA複利枠(45%)</span><span>最大2銘柄</span></div>
-      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">4,511 円 / 枠</div>
-      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): 150 円</div>
+      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">9,011 円 / 枠</div>
+      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): 300 円 (上限2%: 400 円)</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>🛡️ HWM & L5防衛線</span><span id="kpiL5Status">正常</span></div>
-      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">8,521 円</div>
-      <div id="kpiPeakDetail" class="kpi-sub">最高資産: 10,025 円 (余裕 +1,504 円)</div>
+      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">17,021 円</div>
+      <div id="kpiPeakDetail" class="kpi-sub">最高資産: 20,025 円 (余裕 +3,004 円)</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>🚦 L3日次 / L4週次制限</span><span id="kpiCbBadge">稼働許可</span></div>
-      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: +0 円 / 制限 -301 円</div>
-      <div id="kpiWeeklyPnl" class="kpi-sub">週次: +0 円 (制限 -602 円) / 連敗: 0回</div>
+      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: +0 円 / 制限 -601 円</div>
+      <div id="kpiWeeklyPnl" class="kpi-sub">週次: +0 円 (制限 -1,201 円) / 連敗: 0回</div>
     </div>
   </section>
 
@@ -1162,7 +1162,7 @@ function drawEquityChart(curve) {
 
   let minE = Infinity, maxE = -Infinity;
   curve.forEach(pt => {
-    const v = Number(pt.equity_jpy || 10000);
+    const v = Number(pt.equity_jpy || 20000);
     if (v < minE) minE = v;
     if (v > maxE) maxE = v;
   });

@@ -400,15 +400,26 @@ class TechnicalRadar:
         # トリガー1: 新規エントリー好機 (空き枠あり & キルスイッチ未発動 & レジーム許可 & 上位足トレンド + 1h押し目合致)
         # ------------------------------------------------------------------
         total_equity = calculate_total_equity_jpy(enriched_pf, market_summaries)
+        raw_init_cap = enriched_pf.get("initial_capital_jpy", enriched_pf.get("initial_equity_jpy"))
+        raw_ks = enriched_pf.get("drawdown_kill_switch_jpy")
+        if raw_init_cap is not None:
+            init_cap_dec = _to_decimal(raw_init_cap)
+        elif raw_ks is not None and _to_decimal(raw_ks) > Decimal("0"):
+            init_cap_dec = (_to_decimal(raw_ks) / Decimal("0.85")).quantize(Decimal("1"))
+        else:
+            init_cap_dec = Decimal("20000")
+        if init_cap_dec <= Decimal("0"):
+            init_cap_dec = Decimal("20000")
         peak_equity = max(
             _to_decimal(enriched_pf.get("peak_equity_jpy", 0)),
-            _to_decimal(enriched_pf.get("initial_capital_jpy", 10000)),
+            init_cap_dec,
             total_equity,
         )
-        base_ks_jpy = _to_decimal(enriched_pf.get("drawdown_kill_switch_jpy", 8500))
+        init_floor_dec = max(Decimal("8500"), (init_cap_dec * Decimal("0.85")).quantize(Decimal("0.01")))
+        base_ks_jpy = _to_decimal(enriched_pf.get("drawdown_kill_switch_jpy", init_floor_dec))
         if base_ks_jpy <= Decimal("0"):
-            base_ks_jpy = Decimal("8500")
-        kill_switch_jpy = max(Decimal("8500"), base_ks_jpy, (peak_equity * Decimal("0.85")).quantize(Decimal("0.01")))
+            base_ks_jpy = init_floor_dec
+        kill_switch_jpy = max(init_floor_dec, base_ks_jpy, (peak_equity * Decimal("0.85")).quantize(Decimal("0.01")))
         kill_switch_active = total_equity < kill_switch_jpy
         cb_triggered, _ = check_btc_circuit_breaker(market_summaries)
 

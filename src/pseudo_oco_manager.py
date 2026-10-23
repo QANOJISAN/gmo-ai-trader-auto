@@ -299,8 +299,8 @@ class PseudoOCOManager:
             ts_ms = int(now_jst.timestamp() * 1000)
             portfolio["last_updated"] = now_jst.isoformat(timespec="seconds")
             portfolio["execution_mode"] = getattr(self.broker, "MODE", "DRY_RUN")
-            init_cap_val = float(portfolio.get("initial_capital_jpy", 10000) or 10000)
-            prev_peak_val = max(float(portfolio.get("peak_equity_jpy", 0) or 0), init_cap_val, 10000.0)
+            init_cap_val = float(portfolio.get("initial_capital_jpy", 20000) or 20000)
+            prev_peak_val = max(float(portfolio.get("peak_equity_jpy", 0) or 0), init_cap_val)
             active_pos_list = [
                 p
                 for p in (portfolio.get("positions", []) or [])
@@ -312,9 +312,10 @@ class PseudoOCOManager:
                 if jpy_now > prev_peak_val:
                     prev_peak_val = jpy_now
             portfolio["peak_equity_jpy"] = int(prev_peak_val) if prev_peak_val.is_integer() else round(prev_peak_val, 2)
-            hwm_ks = max(8500.0, round(prev_peak_val * 0.85, 2))
-            curr_ks = float(portfolio.get("drawdown_kill_switch_jpy", 8500) or 8500)
-            new_ks = max(8500.0, curr_ks, hwm_ks)
+            base_floor_val = max(8500.0, round(init_cap_val * 0.85, 2))
+            hwm_ks = max(base_floor_val, round(prev_peak_val * 0.85, 2))
+            curr_ks = float(portfolio.get("drawdown_kill_switch_jpy", base_floor_val) or base_floor_val)
+            new_ks = max(base_floor_val, curr_ks, hwm_ks)
             portfolio["drawdown_kill_switch_jpy"] = int(new_ks) if new_ks.is_integer() else round(new_ks, 2)
             if self.wal_db is not None:
                 for p in portfolio.get("positions", []) or []:

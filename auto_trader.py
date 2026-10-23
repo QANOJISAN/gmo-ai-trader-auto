@@ -99,6 +99,8 @@ def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     return now_dt.astimezone(JST)
 
 
+DEFAULT_INITIAL_CAPITAL_JPY = 20000
+DEFAULT_INITIAL_EQUITY_JPY = 20025
 DEFAULT_PHASE1_END_JST = "2027-07-09T00:00:00+09:00"
 DEFAULT_PHASE2_START_JST = "2027-07-10T00:00:00+09:00"
 DEFAULT_PHASE2_END_JST = "2027-12-10T00:00:00+09:00"
@@ -532,7 +534,8 @@ class AutoTraderDaemon:
                 logger.error("%s レポート出力エラー (%s): %s", phase_label, out_p, rep_exc)
 
         # 5. 初期資金からの最終総合結果サマリーを Discord へ通知
-        init_cap_val = int(pf_settled.get("initial_capital_jpy", 10000) or 10000)
+        init_cap_val = int(pf_settled.get("initial_capital_jpy", DEFAULT_INITIAL_CAPITAL_JPY) or DEFAULT_INITIAL_CAPITAL_JPY)
+        init_eq_val = int(pf_settled.get("initial_equity_jpy", init_cap_val + 25) or (init_cap_val + 25))
         final_jpy_val = int(pf_settled.get("jpy_balance", init_cap_val) or init_cap_val)
         total_pnl_val = final_jpy_val - init_cap_val
         total_pnl_pct = (total_pnl_val / init_cap_val * 100.0) if init_cap_val > 0 else 0.0
@@ -551,7 +554,7 @@ class AutoTraderDaemon:
             title=f"🏁 {phase_label} 運用期間満了・全ポジション決済＆最終総合レポート確定",
             message=(
                 f"・満了時刻: `{now_jst.isoformat(timespec='seconds')}`\n"
-                f"・初期運用資金: {init_cap_val:,} 円（実口座開始: 10,025 円）\n"
+                f"・初期運用資金: {init_cap_val:,} 円（実初期資産: {init_eq_val:,} 円）\n"
                 f"・最終確定日本円残高: **{final_jpy_val:,} 円**（通算損益: **{total_pnl_val:+,} 円 / {total_pnl_pct:+.2f}%**）\n"
                 f"・累計決済トレード数: {closed_count} 回\n"
                 f"・確定アーカイブレポート: `{report_archive_path.name}`"
@@ -939,7 +942,7 @@ class AutoTraderDaemon:
                     if ev_sym:
                         self.ai_judge.record_sl_hit_cooldown(ev_sym, now_dt=now_jst)
 
-            # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < max(8500, peak_equity * 0.85)) チェック
+            # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < max(17000, peak_equity * 0.85)) チェック
             pf_now = self.oco_manager.load_portfolio()
             l5_res = self.circuit_breaker.evaluate_l5_hard_kill_switch(pf_now, current_tickers)
             if l5_res.get("peak_updated"):
@@ -975,7 +978,7 @@ class AutoTraderDaemon:
                             logger.error("L5 キルスイッチ発動時のポジション決済エラー (%s): %s", l5_sym, l5_exc)
                 self.notification_dispatcher.dispatch(
                     tier="CRITICAL",
-                    title="L5 ハード・キルスイッチ発動（3回連続 Best Bid 清算価値 < 8,500円）",
+                    title=f"L5 ハード・キルスイッチ発動（3回連続 Best Bid 清算価値 < {l5_res['threshold_jpy']:,.0f}円）",
                     message=(
                         f"・保守的清算総資産: {l5_res['conservative_equity_jpy']:,.0f} 円 "
                         f"(< {l5_res['threshold_jpy']:,.0f} 円 × 3回連続)\n"

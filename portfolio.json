@@ -1,14 +1,14 @@
 {
-  "initial_capital_jpy": 10000,
-  "jpy_balance": 10025,
-  "peak_equity_jpy": 10025,
+  "initial_capital_jpy": 20000,
+  "jpy_balance": 20025,
+  "peak_equity_jpy": 20025,
   "realized_pnl_total_jpy": 0,
   "total_realized_pnl_jpy": 0,
   "max_allocation_per_trade_pct": 0.45,
   "max_concurrent_positions": 2,
-  "target_risk_per_trade_jpy": 150,
-  "max_risk_per_trade_jpy": 200,
-  "drawdown_kill_switch_jpy": 8521.25,
+  "target_risk_per_trade_jpy": 300,
+  "max_risk_per_trade_jpy": 400,
+  "drawdown_kill_switch_jpy": 17021.25,
   "positions": [
     {
       "symbol": "ETH",
@@ -26,7 +26,7 @@
   "closed_trades": [],
   "pending_orders": [],
   "execution_mode": "LIVE",
-  "last_updated": "2026-10-24T00:49:09+09:00",
+  "last_updated": "2026-10-24T07:28:28+09:00",
   "quarantined_dust": [],
   "campaign_schedule": {
     "phase1_end_jst": "2027-07-09T00:00:00+09:00",
@@ -34,5 +34,31 @@
     "phase2_end_jst": "2027-12-10T00:00:00+09:00",
     "pre_deadline_freeze_hours": 2.0,
     "current_phase": "PHASE1_ACTIVE"
-  }
+  },
+  "initial_equity_jpy": 20000,
+  "cash_jpy": 20025,
+  "available_jpy": 20025,
+  "total_equity_jpy": 20025,
+  "day_start_equity_jpy": 20025,
+  "daily_starting_equity_jpy": 20025,
+  "week_start_equity_jpy": 20025,
+  "weekly_starting_equity_jpy": 20025,
+  "max_position_jpy": 9011,
+  "equity_curve": [
+    {
+      "index": 0,
+      "label": "開始",
+      "equity_jpy": 20000,
+      "pnl_jpy": 0,
+      "symbol": "INIT"
+    },
+    {
+      "index": 1,
+      "label": "現在",
+      "equity_jpy": 20025,
+      "pnl_jpy": 25,
+      "symbol": "NOW",
+      "reason": "CURRENT"
+    }
+  ]
 }

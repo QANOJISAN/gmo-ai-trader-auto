@@ -66,11 +66,11 @@ def load_portfolio_data(path: Path | None = None) -> Dict[str, Any]:
     target_path = path if path is not None else PORTFOLIO_PATH
     if not target_path.exists():
         return {
-            "initial_capital_jpy": 10000,
-            "jpy_balance": 10000,
+            "initial_capital_jpy": 20000,
+            "jpy_balance": 20000,
             "realized_pnl_total_jpy": 0,
             "total_realized_pnl_jpy": 0,
-            "drawdown_kill_switch_jpy": 8500,
+            "drawdown_kill_switch_jpy": 17000,
             "positions": [],
             "closed_trades": [],
         }
@@ -103,7 +103,7 @@ def compute_performance_metrics(
 ) -> Dict[str, Any]:
     """ポートフォリオとAI判定履歴から各種運用パフォーマンス指標を算出する"""
     now_str = _now_jst().isoformat(timespec="seconds")
-    init_cap = int(portfolio.get("initial_capital_jpy", 10000) or 10000)
+    init_cap = int(portfolio.get("initial_capital_jpy", 20000) or 20000)
     jpy_balance = int(portfolio.get("jpy_balance", 0) or 0)
     realized_pnl_total = int(
         portfolio.get("realized_pnl_total_jpy", portfolio.get("total_realized_pnl_jpy", 0)) or 0

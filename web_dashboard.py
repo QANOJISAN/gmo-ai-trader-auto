@@ -63,7 +63,8 @@ logger = logging.getLogger("web_dashboard")
 JST = timezone(timedelta(hours=9))
 BASE_DIR = Path(__file__).resolve().parent
 
-DEFAULT_DRAWDOWN_KILL_SWITCH_JPY = 8500.0
+DEFAULT_INITIAL_CAPITAL_JPY = 20000.0
+DEFAULT_DRAWDOWN_KILL_SWITCH_JPY = 17000.0
 DEFAULT_MAX_ALLOCATION_PCT = 0.45
 
 SUPPORTED_CHART_SYMBOLS = ("BTC", "ETH", "XRP", "SOL", "DOGE", "BCH", "LTC")
@@ -1006,8 +1007,9 @@ class WebDashboardService:
                 }
             )
 
-        init_cap_jpy = float(pf.get("initial_capital_jpy", 10000) or 10000.0)
-        jpy_balance = float(pf.get("jpy_balance", init_cap_jpy) or 0.0)
+        init_cap_jpy = float(pf.get("initial_capital_jpy", DEFAULT_INITIAL_CAPITAL_JPY) or DEFAULT_INITIAL_CAPITAL_JPY)
+        init_eq_jpy = float(pf.get("initial_equity_jpy", init_cap_jpy) or init_cap_jpy)
+        jpy_balance = float(pf.get("jpy_balance", pf.get("cash_jpy", init_cap_jpy)) or 0.0)
         total_equity_jpy = jpy_balance + locked_pending_jpy + positions_eval_jpy
 
         l3_status = self.circuit_breaker.check_l3_daily_loss(pf, tickers, now_dt=now_jst)
@@ -1019,8 +1021,11 @@ class WebDashboardService:
             init_cap_jpy,
             total_equity_jpy,
         )
+        init_floor_jpy = max(8500.0, round(init_cap_jpy * 0.85, 2))
+        if init_cap_jpy >= DEFAULT_INITIAL_CAPITAL_JPY:
+            init_floor_jpy = max(float(DEFAULT_DRAWDOWN_KILL_SWITCH_JPY), init_floor_jpy)
         l5_floor_jpy = max(
-            float(DEFAULT_DRAWDOWN_KILL_SWITCH_JPY),
+            init_floor_jpy,
             round(peak_eq * 0.85, 2),
         )
         alloc_pct = float(pf.get("max_allocation_per_trade_pct", DEFAULT_MAX_ALLOCATION_PCT) or DEFAULT_MAX_ALLOCATION_PCT)
@@ -1107,7 +1112,10 @@ class WebDashboardService:
             },
             "equity_summary": {
                 "initial_capital_jpy": round(init_cap_jpy, 0),
+                "initial_equity_jpy": round(init_eq_jpy, 0),
                 "jpy_balance": round(jpy_balance, 0),
+                "cash_jpy": round(jpy_balance, 0),
+                "available_jpy": round(max(0.0, jpy_balance - locked_pending_jpy), 0),
                 "locked_pending_jpy": round(locked_pending_jpy, 0),
                 "positions_eval_jpy": round(positions_eval_jpy, 0),
                 "total_equity_jpy": round(total_equity_jpy, 0),
@@ -1120,7 +1128,11 @@ class WebDashboardService:
                 "realized_pnl_total_jpy": round(float(pf.get("realized_pnl_total_jpy", realized_sum) or 0.0), 0),
                 "unrealized_pnl_total_jpy": round(unrealized_pnl_total_jpy, 0),
                 "peak_equity_jpy": round(peak_eq, 0),
+                "day_start_equity_jpy": round(float(l3_status.get("daily_starting_equity_jpy", total_equity_jpy)), 0),
+                "week_start_equity_jpy": round(float(l4_status.get("weekly_starting_equity_jpy", total_equity_jpy)), 0),
                 "l5_kill_switch_jpy": round(l5_floor_jpy, 0),
+                "l5_floor_jpy": round(l5_floor_jpy, 0),
+                "max_pos_jpy": max_pos_jpy,
                 "pattern_a": {
                     "max_allocation_pct": alloc_pct,
                     "max_position_jpy": max_pos_jpy,
@@ -1800,29 +1812,29 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   <!-- 資産・パターンA複利・防衛ライン KPI -->
   <section class="kpi-grid">
     <div class="kpi-card">
-      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 10,000円</span></div>
-      <div id="kpiTotalEquity" class="kpi-value">10,025 円</div>
-      <div id="kpiCashDetail" class="kpi-sub">現金: 10,025 円 / 拘束: 0 円</div>
+      <div class="kpi-label"><span>💰 現在の総資産</span><span id="kpiInitCap">初期 20,000円</span></div>
+      <div id="kpiTotalEquity" class="kpi-value">20,025 円</div>
+      <div id="kpiCashDetail" class="kpi-sub">現金: 20,025 円 / 拘束: 0 円</div>
     </div>
     <div class="kpi-card">
-      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">+0.25%</span></div>
+      <div class="kpi-label"><span>📊 通算損益</span><span id="kpiTotalPnlPct">+0.12%</span></div>
       <div id="kpiTotalPnl" class="kpi-value pos-val">+25 円</div>
       <div id="kpiRealizedDetail" class="kpi-sub">確定: +0 円 / 含み: +0 円</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>📈 パターンA複利枠(45%)</span><span>最大2銘柄</span></div>
-      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">4,511 円 / 枠</div>
-      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): 150 円</div>
+      <div id="kpiMaxAlloc" class="kpi-value" style="color:var(--accent-blue);">9,011 円 / 枠</div>
+      <div id="kpiRisk1R" class="kpi-sub">1R許容損失(1.5%): 300 円 (上限2%: 400 円)</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>🛡️ HWM & L5防衛線</span><span id="kpiL5Status">正常</span></div>
-      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">8,521 円</div>
-      <div id="kpiPeakDetail" class="kpi-sub">最高資産: 10,025 円 (余裕 +1,504 円)</div>
+      <div id="kpiL5Floor" class="kpi-value" style="color:var(--accent-amber);">17,021 円</div>
+      <div id="kpiPeakDetail" class="kpi-sub">最高資産: 20,025 円 (余裕 +3,004 円)</div>
     </div>
     <div class="kpi-card">
       <div class="kpi-label"><span>🚦 L3日次 / L4週次制限</span><span id="kpiCbBadge">稼働許可</span></div>
-      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: +0 円 / 制限 -301 円</div>
-      <div id="kpiWeeklyPnl" class="kpi-sub">週次: +0 円 (制限 -602 円) / 連敗: 0回</div>
+      <div id="kpiDailyPnl" class="kpi-value" style="font-size:1.08rem;">日次: +0 円 / 制限 -601 円</div>
+      <div id="kpiWeeklyPnl" class="kpi-sub">週次: +0 円 (制限 -1,201 円) / 連敗: 0回</div>
     </div>
   </section>
 
@@ -2539,7 +2551,7 @@ function drawEquityChart(curve) {
 
   let minE = Infinity, maxE = -Infinity;
   curve.forEach(pt => {
-    const v = Number(pt.equity_jpy || 10000);
+    const v = Number(pt.equity_jpy || 20000);
     if (v < minE) minE = v;
     if (v > maxE) maxE = v;
   });

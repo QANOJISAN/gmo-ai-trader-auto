@@ -393,7 +393,7 @@ def calculate_total_equity_jpy(
     総資産（日本円残高 ＋ 保有ポジションの時価評価額）を算出する。
     market_summaries に現在値 (price.last) がある場合は時価評価し、ない場合は current_price または entry_price を用いる。
     """
-    jpy_balance = _to_decimal(portfolio.get("jpy_balance", 10000))
+    jpy_balance = _to_decimal(portfolio.get("jpy_balance", 20000))
     positions: List[Dict[str, Any]] = portfolio.get("positions", []) or []
     summaries = market_summaries or {}
 
@@ -573,19 +573,28 @@ def validate_and_adjust_decision(
 
     merged_rules = {**DEFAULT_SYMBOL_RULES, **(symbol_rules or {})}
     positions: List[Dict[str, Any]] = portfolio.get("positions", []) or []
-    jpy_balance = _to_decimal(portfolio.get("jpy_balance", 10000))
+    jpy_balance = _to_decimal(portfolio.get("jpy_balance", 20000))
     total_equity = calculate_total_equity_jpy(portfolio, market_summaries)
+    raw_init_cap = portfolio.get("initial_capital_jpy", portfolio.get("initial_equity_jpy"))
+    raw_ks = portfolio.get("drawdown_kill_switch_jpy")
+    if raw_init_cap is not None:
+        init_cap_val = _to_decimal(raw_init_cap)
+    elif raw_ks is not None and _to_decimal(raw_ks) > Decimal("0"):
+        init_cap_val = (_to_decimal(raw_ks) / Decimal("0.85")).quantize(Decimal("1"))
+    else:
+        init_cap_val = Decimal("20000")
+    if init_cap_val <= Decimal("0"):
+        init_cap_val = Decimal("20000")
     peak_equity_val = max(
         _to_decimal(portfolio.get("peak_equity_jpy", 0)),
-        _to_decimal(portfolio.get("initial_capital_jpy", 10000)),
-        Decimal("10000"),
+        init_cap_val,
     )
-    base_ks_jpy = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", 8500))
+    init_floor_jpy = max(Decimal("8500"), (init_cap_val * Decimal("0.85")).quantize(Decimal("0.01")))
+    base_ks_jpy = _to_decimal(portfolio.get("drawdown_kill_switch_jpy", init_floor_jpy))
     if base_ks_jpy <= 0:
-        # M-4: null・0・不正値でキルスイッチが無効化（0円）されないよう、初期資金の85%（既定8,500円）へフォールバック
-        init_cap_for_ks = _to_decimal(portfolio.get("initial_capital_jpy", 10000))
-        base_ks_jpy = (init_cap_for_ks * Decimal("0.85")) if init_cap_for_ks > 0 else Decimal("8500")
-    kill_switch_jpy = max(Decimal("8500"), base_ks_jpy, (peak_equity_val * Decimal("0.85")).quantize(Decimal("0.01")))
+        # M-4: null・0・不正値でキルスイッチが無効化（0円）されないよう、初期資金の85%（既定17,000円）へフォールバック
+        base_ks_jpy = init_floor_jpy
+    kill_switch_jpy = max(init_floor_jpy, base_ks_jpy, (peak_equity_val * Decimal("0.85")).quantize(Decimal("0.01")))
 
     # M-2: 確信度を [0.0, 1.0] に正規化（85 等の百分率表記による「8500%」表示を防止）
     adjusted["confidence"] = normalize_confidence(adjusted.get("confidence", 0))
@@ -890,12 +899,12 @@ def validate_and_adjust_decision(
 
     target_risk_cfg = _to_decimal(portfolio.get("target_risk_per_trade_jpy", 0))
     max_risk_cfg = _to_decimal(portfolio.get("max_risk_per_trade_jpy", 0))
-    if target_risk_cfg <= Decimal("0") or total_equity > Decimal("10000") or target_risk_cfg == Decimal("150"):
+    if target_risk_cfg <= Decimal("0") or total_equity > Decimal("10000") or target_risk_cfg in (Decimal("150"), Decimal("300")):
         effective_target_risk_jpy = dynamic_target_risk_jpy
     else:
         effective_target_risk_jpy = min(target_risk_cfg, dynamic_target_risk_jpy)
 
-    if max_risk_cfg <= Decimal("0") or total_equity > Decimal("10000") or max_risk_cfg == Decimal("200"):
+    if max_risk_cfg <= Decimal("0") or total_equity > Decimal("10000") or max_risk_cfg in (Decimal("200"), Decimal("400")):
         effective_max_risk_jpy = dynamic_hard_max_risk_jpy
     else:
         effective_max_risk_jpy = min(max_risk_cfg, dynamic_hard_max_risk_jpy)

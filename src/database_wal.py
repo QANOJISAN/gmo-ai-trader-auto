@@ -1317,7 +1317,7 @@ class DatabaseWAL:
                     """,
                     (dumps_json(portfolio, indent=None), ts),
                 )
-                peak_eq_val = portfolio.get("peak_equity_jpy", portfolio.get("initial_capital_jpy", 10000))
+                peak_eq_val = portfolio.get("peak_equity_jpy", portfolio.get("initial_capital_jpy", 20000))
                 self._conn.execute(
                     """
                     INSERT INTO account_meta (key, value_json, updated_ts_ms)
