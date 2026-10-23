@@ -67,7 +67,7 @@ if (Test-Path -LiteralPath $WebRunner) {
     $WebTaskName = "GMO-AI-Trader-v2-Web"
     $WebAction = New-ScheduledTaskAction `
         -Execute "wscript.exe" `
-        -Argument ("//B //NoLogo `"" + $HiddenVbs + "`" `"" + $WebRunner + "`" -BindHost 0.0.0.0 -Port 8080 -NoBrowser") `
+        -Argument ("//B //NoLogo `"" + $HiddenVbs + "`" `"" + $WebRunner + "`" -BindHost 127.0.0.1 -Port 8080 -NoBrowser") `
         -WorkingDirectory $ProjectDir
     try {
         Register-ScheduledTask `

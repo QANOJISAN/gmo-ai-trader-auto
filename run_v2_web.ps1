@@ -1,5 +1,5 @@
 param(
-    [string]$BindHost = "0.0.0.0",
+    [string]$BindHost = "127.0.0.1",
     [int]$Port = 8080,
     [switch]$NoBrowser,
     [switch]$Background

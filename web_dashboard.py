@@ -2845,7 +2845,7 @@ def make_dashboard_handler(service: WebDashboardService):
 
 
 def create_dashboard_http_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 8080,
     service: Optional[WebDashboardService] = None,
 ) -> Tuple[ThreadingHTTPServer, WebDashboardService]:
@@ -2865,7 +2865,7 @@ def main() -> int:
             pass
 
     parser = argparse.ArgumentParser(description="GMO AI Trader v2 PWA対応Webダッシュボード")
-    parser.add_argument("--host", type=str, default="0.0.0.0", help="バインドホスト (既定: 0.0.0.0 — PC & 自宅Wi-Fiスマホ両対応)")
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="バインドホスト (既定: 127.0.0.1 — ローカルループバック専用)")
     parser.add_argument("--port", type=int, default=8080, help="バインドポート (既定: 8080)")
     parser.add_argument("--open-browser", action="store_true", help="起動時に既定のブラウザでダッシュボードを開く")
     parser.add_argument("--export-static", action="store_true", help="docs/ へ静的PWA一式と最新スナップショットを出力して終了する")
@@ -2890,8 +2890,7 @@ def main() -> int:
     server, _ = create_dashboard_http_server(host=args.host, port=args.port, service=svc)
     actual_port = server.server_address[1]
     local_url = f"http://127.0.0.1:{actual_port}"
-    lan_url = f"http://{svc.lan_ip}:{actual_port}"
-    logger.info("🌐 GMO AI Trader v2 PWA Webダッシュボード起動: PC=%s / スマホ(Wi-Fi)=%s", local_url, lan_url)
+    logger.info("🌐 GMO AI Trader v2 PWA Webダッシュボード起動 (bind=%s:%d): PC=%s", args.host, actual_port, local_url)
 
     if args.open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(local_url)).start()

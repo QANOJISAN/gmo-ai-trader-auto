@@ -2633,7 +2633,8 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         import pandas as pd
         from web_dashboard import WebDashboardService, create_dashboard_http_server
 
-        # 1. run_v2_web.ps1 / launch_hidden.vbs / register_v2_task.ps1 が Pure ASCII かつ完全非表示 (wscript.exe + launch_hidden.vbs) であること
+        # 1. run_v2_web.ps1 / launch_hidden.vbs / register_v2_task.ps1 が Pure ASCII かつ完全非表示 (wscript.exe + launch_hidden.vbs) かつ 127.0.0.1 ループバック専用バインドであること
+        import inspect
         base_repo_dir = Path(__file__).resolve().parent.parent
         ps1_path = base_repo_dir / "run_v2_web.ps1"
         vbs_path = base_repo_dir / "launch_hidden.vbs"
@@ -2644,9 +2645,18 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         self.assertTrue(all(b < 128 for b in ps1_path.read_bytes()), "run_v2_web.ps1 must be 100% Pure ASCII")
         self.assertTrue(all(b < 128 for b in vbs_path.read_bytes()), "launch_hidden.vbs must be 100% Pure ASCII")
         self.assertTrue(all(b < 128 for b in reg_path.read_bytes()), "register_v2_task.ps1 must be 100% Pure ASCII")
+        ps1_text = ps1_path.read_text(encoding="ascii")
+        reg_text = reg_path.read_text(encoding="ascii")
         self.assertIn("shell.Run(cmd, 0, True)", vbs_path.read_text(encoding="ascii"))
-        self.assertIn("wscript.exe", reg_path.read_text(encoding="ascii"))
-        self.assertIn("launch_hidden.vbs", reg_path.read_text(encoding="ascii"))
+        self.assertIn("wscript.exe", reg_text)
+        self.assertIn("launch_hidden.vbs", reg_text)
+        self.assertIn('[string]$BindHost = "127.0.0.1"', ps1_text)
+        self.assertIn("-BindHost 127.0.0.1 -Port 8080 -NoBrowser", reg_text)
+        self.assertNotIn("0.0.0.0", reg_text)
+        self.assertEqual(
+            inspect.signature(create_dashboard_http_server).parameters["host"].default,
+            "127.0.0.1",
+        )
 
         class _DummyPublicClient:
             def get_tickers(self, symbols=None):
