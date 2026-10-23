@@ -40,6 +40,7 @@ from src.circuit_breaker import (
     prevent_windows_sleep,
 )
 from src.database_wal import DatabaseWAL
+from src.dpapi_vault import load_and_unprotect_dotenv
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import (
     GMOAuthHaltError,
@@ -203,6 +204,8 @@ class AutoTraderDaemon:
         pre_deadline_freeze_hours: Optional[float] = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else BASE_DIR
+        if (self.base_dir / ".env").exists():
+            load_and_unprotect_dotenv(self.base_dir / ".env")
         self.portfolio_path = self.base_dir / "portfolio.json"
         self.history_csv_path = self.base_dir / "history_log.csv"
         self.latest_decision_path = self.base_dir / "latest_decision.json"
@@ -1619,7 +1622,7 @@ def main() -> int:
         except Exception:
             pass
 
-    load_dotenv(BASE_DIR / ".env")
+    load_and_unprotect_dotenv(BASE_DIR / ".env")
     setup_logging()
 
     parser = argparse.ArgumentParser(description="GMOコイン 24時間常時監視・現物全自動売買デーモン (v2)")

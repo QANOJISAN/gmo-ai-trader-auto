@@ -47,9 +47,11 @@ from dotenv import load_dotenv
 
 from src.circuit_breaker import MultiTierCircuitBreaker, SingleInstanceLock
 from src.database_wal import DatabaseWAL, atomic_write_text
+from src.dpapi_vault import build_github_basic_auth_header, load_and_unprotect_dotenv
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import create_broker_client
 from src.json_utils import dumps_json, load_json_file
+from src.notifier import mask_secrets
 from src.pseudo_oco_manager import PseudoOCOManager
 from src.remote_control import (
     RemoteControlManager,
@@ -179,8 +181,13 @@ def push_docs_snapshot_async(
                 timeout=20,
                 creationflags=creation_flags,
             )
+            auth_header = build_github_basic_auth_header(dotenv_path=resolved / ".env")
+            push_cmd = ["git", "-C", str(resolved)]
+            if auth_header:
+                push_cmd.extend(["-c", f"http.extraheader={auth_header}"])
+            push_cmd.extend(["push", "origin", "main"])
             r_push = subprocess.run(
-                ["git", "-C", str(resolved), "push", "origin", "main"],
+                push_cmd,
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -193,7 +200,7 @@ def push_docs_snapshot_async(
                 except Exception:
                     pass
         except Exception as exc:
-            logger.debug("Auto push docs skipped: %s", exc)
+            logger.debug("Auto push docs skipped: %s", mask_secrets(str(exc)))
         finally:
             file_lock.release()
             _GIT_PUSH_LOCK.release()
@@ -685,7 +692,7 @@ class WebDashboardService:
         port: int = 8080,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else BASE_DIR
-        load_dotenv(self.base_dir / ".env")
+        load_and_unprotect_dotenv(self.base_dir / ".env")
         self.port = int(port)
 
         self.portfolio_path = self.base_dir / "portfolio.json"

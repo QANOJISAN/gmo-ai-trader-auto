@@ -26,6 +26,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_UP
 from typing import Any, Dict, List, Optional, Tuple
 
+from src.dpapi_vault import get_secret_env
 from src.json_utils import dumps_json
 from src.validator import (
     DEFAULT_SYMBOL_RULES,
@@ -371,10 +372,10 @@ class AIJudge:
         stale_price_drift_pct: float = 0.30,
     ) -> None:
         self.provider = (provider or os.getenv("AI_PROVIDER", "gemini")).strip().lower()
-        self.gemini_api_key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.gemini_api_key = get_secret_env("GEMINI_API_KEY", "").strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
         self.gemini_thinking_level = os.getenv("GEMINI_THINKING_LEVEL", "HIGH").strip()
-        self.openai_api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self.openai_api_key = get_secret_env("OPENAI_API_KEY", "").strip()
         self.openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 
         self.min_conviction_score = int(min_conviction_score)

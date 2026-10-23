@@ -3112,6 +3112,110 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             finally:
                 daemon.shutdown()
 
+    def test_round11_dpapi_vault_acl_and_git_token_security_audit(self) -> None:
+        """
+        Round 11 セキュリティ強化監査テスト:
+        1. Windows DPAPI (`Crypt32.dll`) `protect_secret` / `unprotect_secret` の暗号化・復号ラウンドトリップ、
+           二重暗号化防止、平文後方互換性、`load_and_unprotect_dotenv` の動作検証
+        2. 本番 `.env` 内の5つのシークレット (`GEMINI_API_KEY`, `DISCORD_WEBHOOK_URL`, `GMO_API_KEY`, `GMO_API_SECRET`, `GITHUB_TOKEN`)
+           がすべて `DPAPI:AQAA...` 形式で保存されており、平文キーが一切残っていないこと
+        3. 本番 `.env` の Windows ACL (`icacls`) から `BUILTIN\\Users` および `Authenticated Users` が排除されていること
+        4. `.git/config` に平文トークン (`ghp_...` / `@github.com`) が一切含まれず、`build_github_basic_auth_header()` と
+           `mask_secrets()` によるメモリ一時認証・完全マスクが機能すること
+        """
+        import subprocess
+        from src.dpapi_vault import (
+            DEFAULT_SECRET_KEYS,
+            build_github_basic_auth_header,
+            encrypt_dotenv_secrets_inplace,
+            get_secret_env,
+            is_dpapi_protected,
+            load_and_unprotect_dotenv,
+            protect_secret,
+            unprotect_secret,
+        )
+        from src.notifier import mask_secrets
+
+        # 1. DPAPI 暗号化・復号ラウンドトリップ検証
+        sample_plain = "test-secret-value-12345!@#_日本語OK"
+        enc = protect_secret(sample_plain)
+        self.assertTrue(enc.startswith("DPAPI:AQAA"))
+        self.assertTrue(is_dpapi_protected(enc))
+        # 二重暗号化されないこと
+        self.assertEqual(protect_secret(enc), enc)
+        # 復号で元の平文と完全一致すること
+        self.assertEqual(unprotect_secret(enc), sample_plain)
+        # 平文を渡した場合はそのまま返ること（後方互換）
+        self.assertEqual(unprotect_secret("plain-backward-compat"), "plain-backward-compat")
+
+        # 一時 .env ファイルでの encrypt_dotenv_secrets_inplace & load_and_unprotect_dotenv 検証
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_env = Path(tmpdir) / ".env"
+            tmp_env.write_text(
+                "GMO_API_KEY=dummy_gmo_key_abc123\n"
+                "EXECUTION_MODE=LIVE\n",
+                encoding="utf-8",
+            )
+            stats = encrypt_dotenv_secrets_inplace(tmp_env, extra_secrets={"GITHUB_TOKEN": "ghp_dummyToken999"})
+            self.assertEqual(stats["GMO_API_KEY"], "DPAPI_ENCRYPTED")
+            self.assertEqual(stats["GITHUB_TOKEN"], "DPAPI_ENCRYPTED")
+            raw_env_text = tmp_env.read_text(encoding="utf-8")
+            self.assertNotIn("dummy_gmo_key_abc123", raw_env_text)
+            self.assertNotIn("ghp_dummyToken999", raw_env_text)
+
+            auth_hdr = build_github_basic_auth_header(dotenv_path=tmp_env)
+            self.assertTrue(auth_hdr.startswith("AUTHORIZATION: basic "))
+            masked_cmd = mask_secrets(f'git -c "http.extraheader={auth_hdr}" push origin main')
+            self.assertNotIn(auth_hdr.split()[-1], masked_cmd)
+            self.assertIn("AUTHORIZATION: basic ***REDACTED***", masked_cmd)
+
+        # 2. 本番 `.env` の DPAPI 暗号化状態検証
+        repo_root = Path(__file__).resolve().parent.parent
+        prod_env = repo_root / ".env"
+        self.assertTrue(prod_env.exists())
+        prod_env_text = prod_env.read_text(encoding="utf-8")
+        required_dpapi_keys = {
+            "GEMINI_API_KEY",
+            "DISCORD_WEBHOOK_URL",
+            "GMO_API_KEY",
+            "GMO_API_SECRET",
+            "GITHUB_TOKEN",
+        }
+        found_keys = set()
+        for line in prod_env_text.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            k, v = k.strip(), v.strip()
+            if k in required_dpapi_keys:
+                found_keys.add(k)
+                self.assertTrue(v.startswith("DPAPI:AQAA"), f"{k} must be DPAPI encrypted")
+                dec_val = unprotect_secret(v)
+                self.assertGreater(len(dec_val), 10)
+        self.assertEqual(found_keys, required_dpapi_keys)
+
+        # 3. 本番 `.env` の Windows ACL (`icacls`) 検証
+        icacls_res = subprocess.run(
+            ["icacls", str(prod_env)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        acl_out = icacls_res.stdout
+        self.assertNotIn("BUILTIN\\Users", acl_out)
+        self.assertNotIn("Authenticated Users", acl_out)
+        self.assertIn("BUILTIN\\Administrators:(F)", acl_out)
+        self.assertIn("NT AUTHORITY\\SYSTEM:(F)", acl_out)
+
+        # 4. 本番 `.git/config` に平文トークンが残っていないこと
+        git_cfg = (repo_root / ".git" / "config").read_text(encoding="utf-8")
+        self.assertNotIn("ghp_", git_cfg)
+        self.assertNotIn("@github.com", git_cfg)
+        self.assertIn("https://github.com/QANOJISAN/gmo-ai-trader-auto.git", git_cfg)
+
 
 if __name__ == "__main__":
     unittest.main()

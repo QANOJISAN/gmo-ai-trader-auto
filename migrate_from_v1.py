@@ -33,6 +33,7 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+from src.dpapi_vault import load_and_unprotect_dotenv
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import GMOPrivateClient
 from src.json_utils import load_json_file, write_json_file
@@ -331,7 +332,7 @@ def main() -> int:
         except Exception:
             pass
 
-    load_dotenv(BASE_DIR / ".env")
+    load_and_unprotect_dotenv(BASE_DIR / ".env")
 
     parser = argparse.ArgumentParser(description="v1 (e:\\gmo-ai-trader) から v2 への移行・プリフライト検証スクリプト")
     group = parser.add_mutually_exclusive_group()

@@ -37,6 +37,7 @@ from typing import Any, Dict, List
 import requests
 from dotenv import load_dotenv
 
+from src.dpapi_vault import get_secret_env, load_and_unprotect_dotenv
 from src.gmo_client import SystemSSLAdapter
 from src.validator import format_decimal_plain, format_price_jpy
 
@@ -476,10 +477,10 @@ def build_discord_summary(metrics: Dict[str, Any], max_length: int = 1900) -> st
 
 def send_report_notification(message: str, dry_run: bool = False) -> Dict[str, str]:
     """生成した成績サマリーを Discord Webhook / LINE に送信する"""
-    load_dotenv(BASE_DIR / ".env")
-    discord_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-    line_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-    line_user_id = os.getenv("LINE_USER_ID", "").strip()
+    load_and_unprotect_dotenv(BASE_DIR / ".env")
+    discord_url = get_secret_env("DISCORD_WEBHOOK_URL")
+    line_token = get_secret_env("LINE_CHANNEL_ACCESS_TOKEN")
+    line_user_id = get_secret_env("LINE_USER_ID")
 
     results: Dict[str, str] = {}
     if dry_run:

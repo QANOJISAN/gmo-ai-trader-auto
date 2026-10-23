@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import requests
 
 from src.database_wal import DatabaseWAL
+from src.dpapi_vault import get_secret_env, unprotect_secret
 from src.gmo_client import GMOPublicClient, SystemSSLAdapter
 from src.json_utils import load_json_file, write_json_file
 from src.validator import (
@@ -229,8 +230,8 @@ class GMOPrivateClient:
         max_retries: int = 2,
         retry_delay: float = 0.5,
     ) -> None:
-        self.api_key = (api_key if api_key is not None else os.getenv("GMO_API_KEY", "")).strip()
-        self.api_secret = (api_secret if api_secret is not None else os.getenv("GMO_API_SECRET", "")).strip()
+        self.api_key = unprotect_secret(api_key if api_key is not None else get_secret_env("GMO_API_KEY", "")).strip()
+        self.api_secret = unprotect_secret(api_secret if api_secret is not None else get_secret_env("GMO_API_SECRET", "")).strip()
         self.public_client = public_client or GMOPublicClient(timeout=timeout)
         self.wal_db = wal_db
         self.token_bucket = token_bucket or PriorityTokenBucket()

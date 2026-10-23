@@ -15,6 +15,7 @@ from typing import Any, Dict
 
 import requests
 
+from src.dpapi_vault import get_secret_env, unprotect_secret
 from src.gmo_client import SystemSSLAdapter
 from src.validator import format_decimal_plain, format_price_jpy, normalize_confidence
 
@@ -24,27 +25,43 @@ _SECRET_ENV_KEYS = (
     "GMO_API_KEY",
     "GMO_API_SECRET",
     "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
     "DISCORD_WEBHOOK_URL",
     "LINE_CHANNEL_ACCESS_TOKEN",
     "CRYPTOPANIC_API_KEY",
+    "GITHUB_TOKEN",
 )
 
 
 def mask_secrets(text: str) -> str:
-    """通知メッセージやログ文字列から APIキー・シークレット・Webhookトークンを完全マスキングする"""
+    """通知メッセージやログ文字列から APIキー・シークレット・Webhookトークン（DPAPI復号後の実値含む）を完全マスキングする"""
     if not text:
         return ""
     masked = str(text)
     for env_key in _SECRET_ENV_KEYS:
-        val = os.getenv(env_key, "").strip()
-        if val and len(val) >= 6 and not val.startswith("your_"):
-            masked = masked.replace(val, "***REDACTED***")
+        raw_val = os.getenv(env_key, "").strip()
+        if raw_val and len(raw_val) >= 6 and not raw_val.startswith("your_"):
+            masked = masked.replace(raw_val, "***REDACTED***")
+        try:
+            dec_val = unprotect_secret(raw_val).strip()
+            if dec_val and len(dec_val) >= 6 and not dec_val.startswith("your_"):
+                masked = masked.replace(dec_val, "***REDACTED***")
+        except Exception:
+            pass
     masked = re.sub(
         r"https://discord(?:app)?\.com/api/webhooks/[^/\s]+/[^\s]+",
         "https://discord.com/api/webhooks/***/***REDACTED***",
         masked,
     )
     masked = re.sub(r"AIza[0-9A-Za-z\-_]{20,}", "AIza***REDACTED***", masked)
+    masked = re.sub(r"ghp_[0-9A-Za-z_]{10,}", "ghp_***REDACTED***", masked)
+    masked = re.sub(r"github_pat_[0-9A-Za-z_]{10,}", "github_pat_***REDACTED***", masked)
+    masked = re.sub(r"DPAPI:[A-Za-z0-9+/=]{16,}", "DPAPI:***REDACTED***", masked)
+    masked = re.sub(
+        r"(?i)(http\.extraheader\s*=\s*AUTHORIZATION:\s*basic\s+)[A-Za-z0-9+/=]+",
+        r"\1***REDACTED***",
+        masked,
+    )
     return masked
 
 
@@ -220,9 +237,9 @@ class Notifier:
     """Discord Webhook および LINE Messaging API 通知クラス"""
 
     def __init__(self) -> None:
-        self.discord_webhook_url = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-        self.line_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
-        self.line_user_id = os.getenv("LINE_USER_ID", "").strip()
+        self.discord_webhook_url = get_secret_env("DISCORD_WEBHOOK_URL", "").strip()
+        self.line_token = get_secret_env("LINE_CHANNEL_ACCESS_TOKEN", "").strip()
+        self.line_user_id = get_secret_env("LINE_USER_ID", "").strip()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "gmo-ai-trader-v2/2.0"})
         self.session.mount("https://", SystemSSLAdapter())
