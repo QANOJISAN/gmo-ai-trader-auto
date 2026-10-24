@@ -23,6 +23,7 @@ from __future__ import annotations
 import atexit
 import ctypes
 from ctypes import wintypes
+import gc
 import logging
 import os
 import subprocess
@@ -38,6 +39,28 @@ JST = timezone(timedelta(hours=9))
 CREATE_NO_WINDOW: int = 0x08000000
 STARTF_USESHOWWINDOW: int = 0x00000001
 SW_HIDE: int = 0
+
+# Windows プロセス優先度クラス定数（4階層分離：REALTIME は使用禁止）
+IDLE_PRIORITY_CLASS: int = 0x00000040
+BELOW_NORMAL_PRIORITY_CLASS: int = 0x00004000
+NORMAL_PRIORITY_CLASS: int = 0x00000020
+ABOVE_NORMAL_PRIORITY_CLASS: int = 0x00008000
+HIGH_PRIORITY_CLASS: int = 0x00000080
+REALTIME_PRIORITY_CLASS: int = 0x00000100  # 絶対使用禁止（指定時は HIGH_PRIORITY_CLASS にキャップ）
+
+TIER_PRIORITY_MAP: Dict[int, int] = {
+    1: HIGH_PRIORITY_CLASS,          # Tier 1: 取引実行ボット (auto_trader.py)
+    2: ABOVE_NORMAL_PRIORITY_CLASS,  # Tier 2: Global Risk Sentinel
+    3: NORMAL_PRIORITY_CLASS,        # Tier 3: Forensic Ledger / Web Dashboard (web_dashboard.py)
+    4: BELOW_NORMAL_PRIORITY_CLASS,  # Tier 4: GitHub自動Push / バックアップ / ローテーション
+}
+
+TIER_NAME_MAP: Dict[int, str] = {
+    1: "TIER1_TRADING_BOT_HIGH",
+    2: "TIER2_RISK_SENTINEL_ABOVE_NORMAL",
+    3: "TIER3_FORENSIC_WEB_NORMAL",
+    4: "TIER4_BACKUP_SYNC_BELOW_NORMAL",
+}
 
 # Win32 Console Control Event 定数
 CTRL_C_EVENT: int = 0
@@ -96,6 +119,178 @@ def build_hidden_subprocess_kwargs(
         kwargs["env"] = env
 
     return kwargs
+
+
+class _MEMORY_PRIORITY_INFORMATION(ctypes.Structure):
+    """Win32 `SetProcessInformation(ProcessMemoryPriority=1)` 用の構造体"""
+
+    _fields_ = [("MemoryPriority", wintypes.ULONG)]
+
+
+def configure_bot_process_isolation(
+    tier: int = 3,
+    cpu_cores: Optional[List[int]] = None,
+    priority_class_override: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Windows API (`kernel32.dll` / `ntdll.dll`) を用いて、4階層プロセス優先度分離・CPUアフィニティ・
+    メモリ/I/O優先度を設定する：
+      - `tier=1`（取引ボット `auto_trader.py`）：`HIGH_PRIORITY_CLASS (0x00000080)`
+      - `tier=2`（Global Risk Sentinel）：`ABOVE_NORMAL_PRIORITY_CLASS (0x00008000)`
+      - `tier=3`（Forensic Ledger / `web_dashboard.py`）：`NORMAL_PRIORITY_CLASS (0x00000020)`
+      - `tier=4`（GitHub自動Push / バックアップ）：`BELOW_NORMAL_PRIORITY_CLASS (0x00004000)` + Low Memory/IO Priority
+      ※ `REALTIME_PRIORITY_CLASS (0x00000100)` はOSネットワークスタック飢餓を防ぐため絶対使用禁止とし、
+         万一指定された場合も `HIGH_PRIORITY_CLASS (0x00000080)` に強制キャップする。
+    """
+    tier_int = int(tier)
+    realtime_capped = False
+    if priority_class_override is not None:
+        req_cls = int(priority_class_override)
+    elif tier_int <= 0:
+        req_cls = REALTIME_PRIORITY_CLASS
+    else:
+        req_cls = TIER_PRIORITY_MAP.get(tier_int, NORMAL_PRIORITY_CLASS)
+
+    if req_cls == REALTIME_PRIORITY_CLASS or tier_int <= 0:
+        target_cls = HIGH_PRIORITY_CLASS
+        realtime_capped = True
+        effective_tier = 1
+    else:
+        target_cls = req_cls
+        effective_tier = tier_int if tier_int in TIER_PRIORITY_MAP else 3
+
+    tier_name = TIER_NAME_MAP.get(effective_tier, "TIER3_FORENSIC_WEB_NORMAL")
+    priority_ok = False
+    actual_cls = target_cls
+    affinity_mask: Optional[int] = None
+    affinity_ok: Optional[bool] = None
+    io_low_ok = False
+
+    if cpu_cores:
+        valid_cores = [int(c) for c in cpu_cores if int(c) >= 0]
+        if valid_cores:
+            affinity_mask = 0
+            for c_idx in valid_cores:
+                affinity_mask |= (1 << c_idx)
+
+    if os.name == "nt" and hasattr(ctypes, "windll"):
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            h_proc = k32.GetCurrentProcess()
+
+            k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            k32.SetPriorityClass.restype = wintypes.BOOL
+            res_p = k32.SetPriorityClass(h_proc, wintypes.DWORD(target_cls))
+            priority_ok = bool(res_p != 0)
+
+            k32.GetPriorityClass.argtypes = [wintypes.HANDLE]
+            k32.GetPriorityClass.restype = wintypes.DWORD
+            queried_cls = int(k32.GetPriorityClass(h_proc))
+            if queried_cls > 0:
+                actual_cls = queried_cls
+
+            if affinity_mask is not None and affinity_mask > 0:
+                try:
+                    k32.SetProcessAffinityMask.argtypes = [wintypes.HANDLE, ctypes.c_size_t]
+                    k32.SetProcessAffinityMask.restype = wintypes.BOOL
+                    res_aff = k32.SetProcessAffinityMask(h_proc, ctypes.c_size_t(affinity_mask))
+                    affinity_ok = bool(res_aff != 0)
+                except Exception as aff_exc:
+                    logger.debug("SetProcessAffinityMask 例外: %s", aff_exc)
+                    affinity_ok = False
+
+            if effective_tier == 4:
+                # Tier 4 (バックアップ・Git同期) は Memory Priority = LOW(2) / IO Priority = LOW(1) を試行
+                try:
+                    if hasattr(k32, "SetProcessInformation"):
+                        mem_info = _MEMORY_PRIORITY_INFORMATION(MemoryPriority=2)  # MEMORY_PRIORITY_LOW = 2
+                        k32.SetProcessInformation.argtypes = [
+                            wintypes.HANDLE,
+                            ctypes.c_int,
+                            ctypes.c_void_p,
+                            wintypes.DWORD,
+                        ]
+                        k32.SetProcessInformation.restype = wintypes.BOOL
+                        r_mem = k32.SetProcessInformation(
+                            h_proc,
+                            1,  # ProcessMemoryPriority = 1
+                            ctypes.byref(mem_info),
+                            ctypes.sizeof(mem_info),
+                        )
+                        io_low_ok = bool(r_mem != 0)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(ctypes.windll, "ntdll"):
+                        io_prio = ctypes.c_ulong(1)  # IoPriorityLow = 1
+                        status_nt = ctypes.windll.ntdll.NtSetInformationProcess(
+                            h_proc,
+                            33,  # ProcessIoPriority = 33
+                            ctypes.byref(io_prio),
+                            ctypes.sizeof(io_prio),
+                        )
+                        if status_nt == 0:
+                            io_low_ok = True
+                except Exception:
+                    pass
+        except Exception as exc:
+            logger.debug("configure_bot_process_isolation 例外: %s", exc)
+
+    return {
+        "tier": effective_tier,
+        "tier_name": tier_name,
+        "requested_priority_class": req_cls,
+        "applied_priority_class": target_cls,
+        "actual_os_priority_class": actual_cls,
+        "realtime_capped": realtime_capped,
+        "priority_set_ok": priority_ok,
+        "cpu_cores": list(cpu_cores) if cpu_cores else None,
+        "affinity_mask": affinity_mask,
+        "affinity_set_ok": affinity_ok,
+        "io_priority_low_applied": io_low_ok,
+    }
+
+
+def trim_process_working_set() -> Dict[str, Any]:
+    """
+    `gc.collect()` 実行直後に Win32 API `EmptyWorkingSet(GetCurrentProcess())`
+    （`psapi.dll` または `kernel32.K32EmptyWorkingSet`）を呼び出し、
+    長期稼働に伴う物理RAMワーキングセットの未参照ページをOSスタンバイリストへ解放する。
+    """
+    gc_collected = int(gc.collect())
+    ok = False
+    api_used = "NONE"
+
+    if os.name == "nt" and hasattr(ctypes, "windll"):
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = wintypes.HANDLE
+            h_proc = k32.GetCurrentProcess()
+
+            if hasattr(ctypes.windll, "psapi") and hasattr(ctypes.windll.psapi, "EmptyWorkingSet"):
+                psapi = ctypes.windll.psapi
+                psapi.EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+                psapi.EmptyWorkingSet.restype = wintypes.BOOL
+                res = psapi.EmptyWorkingSet(h_proc)
+                ok = bool(res != 0)
+                api_used = "psapi.EmptyWorkingSet"
+            elif hasattr(k32, "K32EmptyWorkingSet"):
+                k32.K32EmptyWorkingSet.argtypes = [wintypes.HANDLE]
+                k32.K32EmptyWorkingSet.restype = wintypes.BOOL
+                res = k32.K32EmptyWorkingSet(h_proc)
+                ok = bool(res != 0)
+                api_used = "kernel32.K32EmptyWorkingSet"
+        except Exception as exc:
+            logger.debug("EmptyWorkingSet 呼び出し例外: %s", exc)
+            ok = False
+
+    return {
+        "ok": ok,
+        "gc_collected_objects": gc_collected,
+        "api_used": api_used,
+        "timestamp": _now_jst().isoformat(timespec="seconds"),
+    }
 
 
 class SYSTEM_POWER_STATUS(ctypes.Structure):

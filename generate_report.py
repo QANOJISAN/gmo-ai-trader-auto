@@ -39,6 +39,11 @@ from dotenv import load_dotenv
 
 from src.dpapi_vault import get_secret_env, load_and_unprotect_dotenv
 from src.gmo_client import SystemSSLAdapter
+from src.phase1_dsr_validator import (
+    calc_dsr_and_mintrl,
+    compute_wfe_and_oos_pf,
+    evaluate_phase1_to_phase2_promotion,
+)
 from src.validator import format_decimal_plain, format_price_jpy
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -272,6 +277,26 @@ def compute_performance_metrics(
 
     buy_by_symbol = dict(buy_symbol_counter.most_common())
 
+    trade_returns = [
+        float(t.get("pnl_jpy", t.get("realized_pnl_jpy", 0.0)) or 0.0) / float(max(init_cap, 1))
+        for t in closed_trades
+    ]
+    dsr_info = calc_dsr_and_mintrl(trade_returns, sr_0=0.0, confidence=0.95) if len(trade_returns) >= 2 else {
+        "T": len(trade_returns),
+        "dsr": 0.0,
+        "min_trl": float("inf"),
+        "gate1_dsr_pass": False,
+        "gate2_mintrl_pass": False,
+    }
+    wfe_info = compute_wfe_and_oos_pf(trade_returns) if len(trade_returns) >= 8 else {
+        "wfe": 0.0,
+        "pf_total": pf_val,
+        "pf_h1": pf_val,
+        "pf_h2": pf_val,
+        "gate3_wfe_pass": False,
+        "gate5_oos_pf_pass": False,
+    }
+
     return {
         "generated_at": now_str,
         "initial_capital_jpy": init_cap,
@@ -303,6 +328,7 @@ def compute_performance_metrics(
         "ai_action_counts": action_counts,
         "ai_action_pcts": action_pcts,
         "ai_buy_by_symbol": buy_by_symbol,
+        "dsr_5gate_summary": {**dsr_info, **wfe_info},
     }
 
 

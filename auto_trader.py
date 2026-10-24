@@ -71,8 +71,18 @@ from src.regime_filter import (
     evaluate_us_macro_announcement_window,
     is_in_us_macro_announcement_window,
 )
+from src.global_risk_bus import (
+    BREAKER_LEVEL_HALT_HEDGE,
+    BREAKER_LEVEL_NORMAL,
+    BREAKER_LEVEL_THROTTLE,
+    RiskBusBotReader,
+)
 from src.remote_control import RemoteControlManager, TieredNotificationDispatcher
-from src.system_lifecycle_guard import SystemLifecycleGuard
+from src.system_lifecycle_guard import (
+    SystemLifecycleGuard,
+    configure_bot_process_isolation,
+    trim_process_working_set,
+)
 from src.validator import DEFAULT_SYMBOL_RULES, validate_and_adjust_decision
 from src.wfa_backtester import ConservativeSpotBacktester
 from src.ws_hybrid_engine import WSHybridEngine
@@ -217,6 +227,7 @@ class AutoTraderDaemon:
         phase2_start_jst: Optional[Union[str, datetime]] = None,
         phase2_end_jst: Optional[Union[str, datetime]] = None,
         pre_deadline_freeze_hours: Optional[float] = None,
+        risk_bus_db_path: Optional[Union[str, Path]] = None,
     ) -> None:
         self.base_dir = Path(base_dir) if base_dir is not None else BASE_DIR
         if (self.base_dir / ".env").exists():
@@ -226,6 +237,13 @@ class AutoTraderDaemon:
         self.latest_decision_path = self.base_dir / "latest_decision.json"
         self.db_path = self.base_dir / "v2_state_wal.db"
         self.lock_path = self.base_dir / "v2_daemon.lock"
+        env_rb_path = os.getenv("GLOBAL_RISK_BUS_DB_PATH", "").strip()
+        if risk_bus_db_path is not None:
+            self.risk_bus_db_path = Path(risk_bus_db_path)
+        elif env_rb_path:
+            self.risk_bus_db_path = Path(env_rb_path)
+        else:
+            self.risk_bus_db_path = self.base_dir / "risk_bus.db"
 
         self.db_wal = db_wal or DatabaseWAL(
             self.db_path,
@@ -350,10 +368,109 @@ class AutoTraderDaemon:
         self._phase1_pre_freeze_cleared: bool = False
         self._phase2_pre_freeze_cleared: bool = False
         self.campaign_phase: str = "PHASE1_ACTIVE"
+        self.global_breaker_level: int = BREAKER_LEVEL_NORMAL
+        self.last_risk_bus_state: Dict[str, Any] = {}
         try:
             self.circuit_breaker.load_sprt_cusum_from_wal(self.db_wal)
         except Exception:
             pass
+
+    def poll_and_enforce_global_risk_bus(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        外部の SWMR 共有リスクバス (`risk_bus.db`) が存在する場合に `RiskBusBotReader` (`?mode=ro`) で非ブロッキング参照し、
+        3段階グローバル・サーキットブレーカーを執行する：
+          - `0 (NORMAL)`：通常稼働
+          - `1 (THROTTLE)`：未約定買い指値 (`PENDING_BUY`) のキャンセル・新規エントリー一時停止・既存建玉のトレールStage 4引き締め（取引所サーバー上の `STOP` は維持）
+          - `2 (HALT_HEDGE)`：未約定買い指値 (`PENDING_BUY`) の全キャンセル・新規エントリー完全ロックアウト・既存建玉のトレールStage 4引き締め（取引所サーバー上の `STOP` は維持）
+        """
+        now_jst = _now_jst(now_dt)
+        if self.risk_bus_db_path is None or not self.risk_bus_db_path.exists():
+            self.global_breaker_level = BREAKER_LEVEL_NORMAL
+            return {"active": False, "breaker_level": BREAKER_LEVEL_NORMAL, "events": []}
+
+        reader: Optional[RiskBusBotReader] = None
+        try:
+            reader = RiskBusBotReader(self.risk_bus_db_path)
+            state = reader.read_breaker_state()
+        except Exception as exc:
+            logger.debug("Global Risk Bus 読み取りスキップ: %s", exc)
+            return {"active": False, "breaker_level": self.global_breaker_level, "events": []}
+        finally:
+            if reader is not None:
+                reader.close()
+
+        lvl = int(state.get("breaker_level", BREAKER_LEVEL_NORMAL))
+        prev_lvl = self.global_breaker_level
+        self.global_breaker_level = lvl
+        self.last_risk_bus_state = state
+        events: List[Dict[str, Any]] = []
+
+        if lvl >= BREAKER_LEVEL_THROTTLE:
+            owner_actor = self.remote_control.allowed_owner_discord_id or None
+            pf = self.oco_manager.load_portfolio()
+            pending_buys = [
+                o
+                for o in (pf.get("pending_orders", []) or [])
+                if str(o.get("side", "BUY")).upper() == "BUY"
+            ]
+            canceled_ids: List[str] = []
+            preserved_sl_ids: List[str] = []
+            if pending_buys:
+                c_res = self.remote_control.cancel_pending_entries_only(
+                    actor_id=owner_actor,
+                    now_dt=now_jst,
+                )
+                canceled_ids = list(c_res.get("canceled_buy_order_ids", []))
+                preserved_sl_ids = list(c_res.get("preserved_sl_order_ids", []))
+                pf = self.oco_manager.load_portfolio()
+            else:
+                for p in pf.get("positions", []) or []:
+                    if str(p.get("state", "")).upper() != "DUST_QUARANTINED" and p.get("sl_order_id"):
+                        preserved_sl_ids.append(str(p["sl_order_id"]))
+
+            # 保有ポジションのトレーリングステージを Stage 4 へ引き締め（サーバー側 STOP 注文は維持）
+            stage_updated = False
+            for pos in pf.get("positions", []) or []:
+                if str(pos.get("state", "")).upper() == "DUST_QUARANTINED":
+                    continue
+                cur_stg = int(pos.get("trailing_stage", 0) or 0)
+                if cur_stg < 4:
+                    pos["trailing_stage"] = 4
+                    stage_updated = True
+            if lvl >= BREAKER_LEVEL_HALT_HEDGE:
+                self.remote_control.is_paused = True
+                pf["is_paused"] = True
+                stage_updated = True
+
+            if stage_updated:
+                self.oco_manager.save_portfolio(pf, now_dt=now_jst)
+
+            ev_type = (
+                "GLOBAL_RISK_BUS_HALT_HEDGE"
+                if lvl >= BREAKER_LEVEL_HALT_HEDGE
+                else "GLOBAL_RISK_BUS_THROTTLE"
+            )
+            if canceled_ids or prev_lvl != lvl:
+                events.append(
+                    {
+                        "type": ev_type,
+                        "breaker_level": lvl,
+                        "reason_code": state.get("reason_code", ""),
+                        "btc_z_score": state.get("btc_z_score", 0.0),
+                        "avg_corr_distance": state.get("avg_corr_distance", 1.0),
+                        "hedge_short_target_usd": state.get("hedge_short_target_usd", 0.0),
+                        "canceled_buy_order_ids": canceled_ids,
+                        "preserved_sl_order_ids": preserved_sl_ids,
+                        "timestamp": now_jst.isoformat(timespec="seconds"),
+                    }
+                )
+
+        return {
+            "active": True,
+            "breaker_level": lvl,
+            "state": state,
+            "events": events,
+        }
 
     def absorb_daily_fee_fraction_settlement(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """
@@ -1044,6 +1161,10 @@ class AutoTraderDaemon:
                     self.db_wal.checkpoint_truncate()
                 except Exception as tr_exc:
                     logger.warning("06:05 日次 WAL TRUNCATE チェックポイント警告: %s", tr_exc)
+                try:
+                    trim_process_working_set()
+                except Exception:
+                    pass
 
         # 0a. 第1回・第2回 運用期限スケジュール判定・自動全決済チェック
         campaign_res = self.evaluate_and_enforce_campaign_schedule(now_dt=now_jst, tickers=tickers)
@@ -1112,6 +1233,11 @@ class AutoTraderDaemon:
                     }
                 )
 
+        # 0e. SWMR 共有リスクバス (`risk_bus.db`) 参照 ＆ 3段階グローバル・サーキットブレーカー連動
+        rb_res = self.poll_and_enforce_global_risk_bus(now_dt=now_jst)
+        if rb_res.get("events"):
+            pre_maint_events.extend(rb_res["events"])
+
         # 1. 土曜メンテナンス枠チェック (08:55〜11:05 JST) または 臨時・水曜メンテナンスステータス検知
         ex_stat_clean = (exchange_status or "").strip().upper()
         if is_in_saturday_maintenance_window(now_jst) or (not self.in_maintenance_sleep and ex_stat_clean in ("MAINTENANCE", "PREOPEN")):
@@ -1122,7 +1248,7 @@ class AutoTraderDaemon:
                     self.db_wal.checkpoint_truncate()
                 except Exception:
                     pass
-                gc.collect()
+                trim_process_working_set()
                 self.notifier.notify_event(
                     title="取引所メンテナンス自動スリープ開始",
                     message="GMOコインメンテナンス枠のため、再開確認まで API 発注・変更を一時休止します。",
@@ -1429,6 +1555,15 @@ class AutoTraderDaemon:
 
         try:
             self.remote_control.poll_and_execute_db_commands(now_dt=now_jst)
+            rb_radar = self.poll_and_enforce_global_risk_bus(now_dt=now_jst)
+            if int(rb_radar.get("breaker_level", 0)) >= BREAKER_LEVEL_THROTTLE:
+                return {
+                    "status": f"GLOBAL_RISK_BUS_LOCKED_L{rb_radar.get('breaker_level')}",
+                    "breaker_level": rb_radar.get("breaker_level"),
+                    "reason_code": (rb_radar.get("state") or {}).get("reason_code", ""),
+                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                    "ai_called": False,
+                }
             pf = self.oco_manager.load_portfolio()
             held_symbols = [
                 str(p.get("symbol", "")).upper()
@@ -1874,6 +2009,11 @@ class AutoTraderDaemon:
 
         try:
             prevent_windows_sleep()
+            configure_bot_process_isolation(tier=1)
+            try:
+                self.db_wal.verify_startup_integrity()
+            except Exception as int_exc:
+                logger.warning("起動時 WAL quick_check 警告: %s", int_exc)
             logger.info(
                 "=== GMO AI Trader v2 デーモン起動 (mode=%s, fast=%ds, radar=%ds, expiry=%.1fh) ===",
                 getattr(self.broker, "MODE", self.execution_mode),

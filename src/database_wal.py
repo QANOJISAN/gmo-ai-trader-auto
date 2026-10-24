@@ -606,6 +606,77 @@ class DatabaseWAL:
         """`PRAGMA wal_checkpoint(TRUNCATE);` を実行し、WALログを本体DBへ完全統合して `.db-wal` を0バイトへ切り詰める"""
         return self.checkpoint_wal("TRUNCATE")
 
+    def verify_startup_integrity(self, full_check: bool = False) -> Dict[str, Any]:
+        """
+        起動時の WAL リカバリ競合 (`SQLITE_BUSY_RECOVERY: 261`) を防止しつつ、
+        `PRAGMA quick_check;`（または `PRAGMA integrity_check;`）で DB の整合性を検証する。
+        """
+        pragma_sql = "PRAGMA integrity_check;" if full_check else "PRAGMA quick_check;"
+        last_err: Optional[Exception] = None
+        for attempt in range(5):
+            try:
+                with self._lock:
+                    row = self._conn.execute(pragma_sql).fetchone()
+                    status_str = str(row[0] if row else "unknown").strip()
+                    is_ok = status_str.lower() == "ok"
+                    return {
+                        "ok": is_ok,
+                        "status": status_str,
+                        "db_path": str(self.db_path),
+                        "attempts": attempt + 1,
+                    }
+            except sqlite3.OperationalError as exc:
+                last_err = exc
+                time.sleep(0.1 * (attempt + 1))
+        return {
+            "ok": False,
+            "status": f"ERROR: {last_err}",
+            "db_path": str(self.db_path),
+            "attempts": 5,
+        }
+
+    def create_online_backup(
+        self,
+        dest_path: Union[str, Path],
+        pages: int = 0,
+        sleep_sec: float = 0.05,
+    ) -> Dict[str, Any]:
+        """
+        `sqlite3.Connection.backup()`（SQLite Online Backup API）を用いて、
+        WAL書き込みを止めずに一貫性のある単一ファイルのオンラインバックアップを作成し、
+        バックアップ先の `PRAGMA integrity_check;` を検証する。
+        """
+        dest = Path(dest_path)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dest = dest.with_name(f".{dest.name}.{uuid.uuid4().hex[:8]}.bak.tmp")
+        try:
+            with self._lock:
+                dst_conn = sqlite3.connect(str(tmp_dest), timeout=10.0)
+                try:
+                    self._conn.backup(dst_conn, pages=int(pages), sleep=float(sleep_sec))
+                    chk_row = dst_conn.execute("PRAGMA integrity_check;").fetchone()
+                    integrity_str = str(chk_row[0] if chk_row else "unknown").strip()
+                finally:
+                    dst_conn.close()
+
+            if integrity_str.lower() != "ok":
+                raise RuntimeError(f"バックアップ先の integrity_check が失敗しました: {integrity_str}")
+
+            os.replace(tmp_dest, dest)
+            return {
+                "ok": True,
+                "source_path": str(self.db_path),
+                "backup_path": str(dest),
+                "size_bytes": int(dest.stat().st_size) if dest.exists() else 0,
+                "integrity": integrity_str,
+            }
+        finally:
+            if tmp_dest.exists():
+                try:
+                    tmp_dest.unlink()
+                except OSError:
+                    pass
+
     def close(self) -> None:
         with self._lock:
             try:

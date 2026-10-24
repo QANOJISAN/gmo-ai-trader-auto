@@ -5320,6 +5320,492 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             finally:
                 daemon.db_wal.close()
 
+    def test_round18_process_isolation_risk_bus_forensic_tax_and_phase1_dsr_audit(self) -> None:
+        r"""
+        Round 18 Audit Test (Deep Research #3 シングルノード・マルチボット統合アーキテクチャ & 税務監査 & 5ゲートDSR検証):
+        1. `configure_bot_process_isolation` (Tier 1〜4 優先度設定・REALTIME禁止キャップ)、`trim_process_working_set` (`EmptyWorkingSet`)、
+           および `DatabaseWAL.create_online_backup` / `verify_startup_integrity` の検証。
+        2. `RiskBusSentinelWriter` (`BEGIN IMMEDIATE` + `locking_mode=NORMAL` + `journal_mode=WAL`) と `RiskBusBotReader` (`?mode=ro`)
+           による SWMR 同時読み書き・3段階グローバルブレーカー (`NORMAL` / `THROTTLE` / `HALT_HEDGE`)・2028年税務整合型ヘッジ比率・`AutoTraderDaemon` 連動検証。
+        3. `ForensicTaxAuditor` による全口座合算の移動平均法・総平均法並列計算、Makerリベート2方式切替、
+           2028年分離課税 (`20.315%`・3年繰越) と総合課税 (`HYPERLIQUID`/`QANX_DEX`) の損益通算禁止ルール
+           （黒字300万円・赤字200万円でも相殺されず300万円に課税されること）、および2027年12月タックス・ハーベスティングアラートの検証。
+        4. `phase1_dsr_validator` による報告書数値例 ($T=300, N=50, \hat{\gamma}_3=-0.1952, \hat{\gamma}_4=5.0128, \widehat{SR}^*=0.1337, SR_0=0.0698 \implies \text{DSR} \approx 0.8603 < 0.95$)
+           の精密再現検証、および CSCV PBO・WFE・5ゲート昇格判定（ケースA/B/C）の検証。
+        """
+        import json
+        import math
+        import os
+        from decimal import Decimal
+        from src.system_lifecycle_guard import (
+            ABOVE_NORMAL_PRIORITY_CLASS,
+            BELOW_NORMAL_PRIORITY_CLASS,
+            HIGH_PRIORITY_CLASS,
+            NORMAL_PRIORITY_CLASS,
+            REALTIME_PRIORITY_CLASS,
+            configure_bot_process_isolation,
+            trim_process_working_set,
+        )
+        from src.global_risk_bus import (
+            BREAKER_LEVEL_HALT_HEDGE,
+            BREAKER_LEVEL_NORMAL,
+            BREAKER_LEVEL_THROTTLE,
+            RiskBusBotReader,
+            RiskBusSentinelWriter,
+            evaluate_cross_venue_breaker_level,
+        )
+        from src.forensic_tax_auditor import ForensicTaxAuditor, TaxCategory
+        from src.phase1_dsr_validator import (
+            calc_dsr_and_mintrl,
+            compute_effective_trials,
+            compute_pbo_cscv,
+            compute_wfe_and_oos_pf,
+            evaluate_phase1_to_phase2_promotion,
+            expected_max_sr,
+        )
+
+        # ------------------------------------------------------------------
+        # ① Windows プロセス優先度4階層分離 & EmptyWorkingSet & SQLite Online Backup 検証
+        # ------------------------------------------------------------------
+        try:
+            iso_t1 = configure_bot_process_isolation(tier=1)
+            self.assertEqual(iso_t1["applied_priority_class"], HIGH_PRIORITY_CLASS)
+            self.assertFalse(iso_t1["realtime_capped"])
+
+            iso_t2 = configure_bot_process_isolation(tier=2)
+            self.assertEqual(iso_t2["applied_priority_class"], ABOVE_NORMAL_PRIORITY_CLASS)
+
+            iso_t4 = configure_bot_process_isolation(tier=4)
+            self.assertEqual(iso_t4["applied_priority_class"], BELOW_NORMAL_PRIORITY_CLASS)
+
+            # REALTIME_PRIORITY_CLASS 指定時は強制的に HIGH_PRIORITY_CLASS にキャップされること
+            iso_rt = configure_bot_process_isolation(tier=1, priority_class_override=REALTIME_PRIORITY_CLASS)
+            self.assertTrue(iso_rt["realtime_capped"])
+            self.assertEqual(iso_rt["applied_priority_class"], HIGH_PRIORITY_CLASS)
+
+            iso_t3 = configure_bot_process_isolation(tier=3)
+            self.assertEqual(iso_t3["applied_priority_class"], NORMAL_PRIORITY_CLASS)
+        finally:
+            configure_bot_process_isolation(tier=3)
+
+        trim_res = trim_process_working_set()
+        self.assertIn("ok", trim_res)
+        self.assertGreaterEqual(trim_res["gc_collected_objects"], 0)
+        if os.name == "nt":
+            self.assertTrue(trim_res["ok"])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            wal_db_path = tmp_path / "source_wal.db"
+            bak_db_path = tmp_path / "backup_snapshot.db"
+            wal = DatabaseWAL(wal_db_path, auto_sync_files=False)
+            try:
+                int_chk = wal.verify_startup_integrity(full_check=True)
+                self.assertTrue(int_chk["ok"])
+                self.assertEqual(int_chk["status"].lower(), "ok")
+
+                wal.create_intent(kind="ENTRY_BUY", symbol="SOL", payload={"size": "0.5"})
+                bak_res = wal.create_online_backup(bak_db_path)
+                self.assertTrue(bak_res["ok"])
+                self.assertEqual(bak_res["integrity"].lower(), "ok")
+                self.assertTrue(bak_db_path.exists())
+                self.assertGreater(bak_res["size_bytes"], 0)
+            finally:
+                wal.close()
+
+            # ------------------------------------------------------------------
+            # ② SWMR 共有リスクバス (`risk_bus.db`) & 3段階グローバルブレーカー & 2028年税務整合型ヘッジ比率
+            # ------------------------------------------------------------------
+            rb_path = tmp_path / "risk_bus.db"
+            writer = RiskBusSentinelWriter(rb_path)
+            reader = RiskBusBotReader(rb_path)
+            try:
+                pragmas = writer.verify_pragmas()
+                self.assertEqual(pragmas["locking_mode"], "normal")
+                self.assertEqual(pragmas["journal_mode"], "wal")
+                self.assertEqual(pragmas["busy_timeout"], 5000)
+                self.assertEqual(pragmas["wal_autocheckpoint"], 1000)
+
+                # Level 0: NORMAL
+                ev0 = writer.evaluate_and_publish(
+                    btc_z_score=-0.8,
+                    avg_corr_distance=0.62,
+                    daily_drawdown_pct=0.4,
+                    gmo_spot_notional_jpy=18000.0,
+                    comprehensive_alt_notional_jpy=15000.0,
+                    tax_year=2027,
+                )
+                self.assertEqual(ev0["breaker_level"], BREAKER_LEVEL_NORMAL)
+                st0 = reader.read_breaker_state()
+                self.assertEqual(st0["breaker_level"], BREAKER_LEVEL_NORMAL)
+
+                # Level 1: THROTTLE (Z_BTC = -2.8 < -2.5 または d_bar = 0.28 < 0.35)
+                ev1 = writer.evaluate_and_publish(
+                    btc_z_score=-2.8,
+                    avg_corr_distance=0.28,
+                    daily_drawdown_pct=1.2,
+                    gmo_spot_notional_jpy=18000.0,
+                    comprehensive_alt_notional_jpy=15000.0,
+                    tax_year=2027,
+                )
+                self.assertEqual(ev1["breaker_level"], BREAKER_LEVEL_THROTTLE)
+                st1 = reader.read_breaker_state()
+                self.assertEqual(st1["breaker_level"], BREAKER_LEVEL_THROTTLE)
+
+                # Level 2: HALT_HEDGE (2027年 vs 2028年の税務区分整合型ヘッジ比率検証)
+                # 2027年: GMO(18,000円) + QANX(15,000円) = 33,000円全体をヘッジ (33,000 / 150 = 220.0 USD)
+                ev2_2027 = evaluate_cross_venue_breaker_level(
+                    btc_z_score=-4.5,
+                    avg_corr_distance=0.20,
+                    daily_drawdown_pct=3.5,
+                    gmo_spot_notional_jpy=18000.0,
+                    comprehensive_alt_notional_jpy=15000.0,
+                    fx_usdjpy=150.0,
+                    tax_year=2027,
+                )
+                self.assertEqual(ev2_2027["breaker_level"], BREAKER_LEVEL_HALT_HEDGE)
+                self.assertFalse(ev2_2027["gmo_direct_unwind_priority"])
+                self.assertAlmostEqual(ev2_2027["hedge_short_target_usd"], 220.0, places=2)
+
+                # 2028年: 分離課税(GMO 18,000円)はGMO内優先決済とし、総合課税(QANX 15,000円)のみをPerpヘッジ (15,000 / 150 = 100.0 USD)
+                ev2_2028 = writer.evaluate_and_publish(
+                    btc_z_score=-4.5,
+                    avg_corr_distance=0.20,
+                    daily_drawdown_pct=3.5,
+                    gmo_spot_notional_jpy=18000.0,
+                    comprehensive_alt_notional_jpy=15000.0,
+                    fx_usdjpy=150.0,
+                    tax_year=2028,
+                )
+                self.assertEqual(ev2_2028["breaker_level"], BREAKER_LEVEL_HALT_HEDGE)
+                self.assertTrue(ev2_2028["gmo_direct_unwind_priority"])
+                self.assertAlmostEqual(ev2_2028["gmo_direct_unwind_target_jpy"], 18000.0, places=2)
+                self.assertAlmostEqual(ev2_2028["hedge_short_target_usd"], 100.0, places=2)
+
+                st2 = reader.read_breaker_state()
+                self.assertEqual(st2["breaker_level"], BREAKER_LEVEL_HALT_HEDGE)
+                self.assertAlmostEqual(st2["hedge_short_target_usd"], 100.0, places=2)
+
+                # AutoTraderDaemon が risk_bus.db (Level 2) を検知して未約定BUYをキャンセルし、既存STOPを維持することを確認
+                bot_dir = tmp_path / "bot_r18"
+                bot_dir.mkdir(parents=True, exist_ok=True)
+                pf_r18_path = bot_dir / "portfolio.json"
+                sl_oid_r18 = "9100000001"
+                seed_pf_r18 = {
+                    "jpy_balance": 20025.0,
+                    "initial_capital_jpy": 20000.0,
+                    "positions": [
+                        {
+                            "symbol": "SOL",
+                            "size": 0.36,
+                            "entry_price": 25000.0,
+                            "current_price": 25100.0,
+                            "stop_loss_price": 24500.0,
+                            "take_profit_price": 26500.0,
+                            "state": "SL_ACTIVE",
+                            "sl_order_id": sl_oid_r18,
+                            "trailing_stage": 1,
+                            "opened_at": "2026-10-21T18:00:00+09:00",
+                        }
+                    ],
+                    "pending_orders": [],
+                }
+                pf_r18_path.write_text(json.dumps(seed_pf_r18, ensure_ascii=False, indent=2), encoding="utf-8")
+                broker_r18 = PaperBroker(portfolio_path=pf_r18_path)
+                buy_ord_r18 = broker_r18.place_order(
+                    symbol="BTC",
+                    side="BUY",
+                    execution_type="LIMIT",
+                    price="14000000",
+                    size="0.0006",
+                )
+                buy_oid_r18 = str(buy_ord_r18["order_id"])
+                seed_pf_r18["pending_orders"] = [
+                    {
+                        "order_id": buy_oid_r18,
+                        "symbol": "BTC",
+                        "side": "BUY",
+                        "execution_type": "LIMIT",
+                        "limit_price": 14000000.0,
+                        "size": 0.0006,
+                        "stop_loss_price": 13750000.0,
+                        "take_profit_price": 14600000.0,
+                        "state": "PENDING_BUY",
+                        "placed_at": "2026-10-21T19:00:00+09:00",
+                    }
+                ]
+                pf_r18_path.write_text(json.dumps(seed_pf_r18, ensure_ascii=False, indent=2), encoding="utf-8")
+
+                daemon_r18 = AutoTraderDaemon(
+                    base_dir=bot_dir,
+                    execution_mode="PAPER",
+                    broker=broker_r18,
+                    dry_run_notify=True,
+                    risk_bus_db_path=rb_path,
+                )
+                try:
+                    dt_normal = datetime(2026, 10, 21, 19, 15, 0, tzinfo=JST)
+                    fc_res = daemon_r18.run_fast_cycle(
+                        tickers={
+                            "SOL": {"last": "25100", "bid": "25095", "ask": "25105", "high": "25150", "low": "25050"},
+                            "BTC": {"last": "14050000", "bid": "14049000", "ask": "14051000", "high": "14060000", "low": "14040000"},
+                        },
+                        now_dt=dt_normal,
+                        exchange_status="OPEN",
+                    )
+                    ev_types_r18 = [e.get("type") for e in fc_res.get("events", [])]
+                    self.assertIn("GLOBAL_RISK_BUS_HALT_HEDGE", ev_types_r18)
+                    pf_after_r18 = daemon_r18.oco_manager.load_portfolio()
+                    self.assertEqual(len(pf_after_r18.get("pending_orders", [])), 0)
+                    self.assertEqual(pf_after_r18["positions"][0]["trailing_stage"], 4)
+                    active_ids_r18 = {str(o.get("order_id")) for o in broker_r18.get_active_orders()}
+                    self.assertIn(sl_oid_r18, active_ids_r18)
+                    self.assertNotIn(buy_oid_r18, active_ids_r18)
+                finally:
+                    daemon_r18.db_wal.close()
+            finally:
+                reader.close()
+                writer.close(truncate_wal=True)
+
+        # ------------------------------------------------------------------
+        # ③ ForensicTaxAuditor: 移動平均法・総平均法並列計算、Makerリベート2方式、
+        #    2028年分離課税 vs 総合課税の損益通算禁止監査、2027年12月タックスハーベスティング
+        # ------------------------------------------------------------------
+        # 3-A. 方式① (rebate_incorporation_mode=False: 雑所得独立計上) vs 方式② (True: 取得価額控除)
+        auditor_m1 = ForensicTaxAuditor(rebate_incorporation_mode=False)
+        r_m1_buy = auditor_m1.record_spot_fill(
+            venue="GMO_COIN",
+            asset="SOL",
+            side="BUY",
+            qty="10",
+            price_jpy="20000",
+            fee_jpy="-60",  # Makerリベート 60円受取
+            timestamp_jst="2027-05-01T12:00:00+09:00",
+        )
+        self.assertEqual(r_m1_buy["cost_basis_jpy"], Decimal("200000"))
+        self.assertEqual(r_m1_buy["rebate_income_jpy"], Decimal("60"))
+
+        auditor_m2 = ForensicTaxAuditor(rebate_incorporation_mode=True)
+        r_m2_buy = auditor_m2.record_spot_fill(
+            venue="GMO_COIN",
+            asset="SOL",
+            side="BUY",
+            qty="10",
+            price_jpy="20000",
+            fee_jpy="-60",  # Makerリベート 60円を取得価額から控除
+            timestamp_jst="2027-05-01T12:00:00+09:00",
+        )
+        self.assertEqual(r_m2_buy["cost_basis_jpy"], Decimal("199940"))
+        self.assertEqual(r_m2_buy["rebate_income_jpy"], Decimal("0"))
+
+        # 3-B. 移動平均法 vs 総平均法の乖離検知 (年末高騰後の買付による総平均法トラップ)
+        auditor_m1.record_spot_fill(
+            venue="GMO_COIN",
+            asset="SOL",
+            side="SELL",
+            qty="5",
+            price_jpy="30000",
+            fee_jpy="0",
+            timestamp_jst="2027-08-01T12:00:00+09:00",
+        )
+        # 年末に高値 40,000円で 10 SOL 再買付 -> 総平均単価が引き上げられ移動平均法との乖離が発生
+        auditor_m1.record_spot_fill(
+            venue="QANX_DEX",
+            asset="SOL",
+            side="BUY",
+            qty="10",
+            price_jpy="40000",
+            fee_jpy="0",
+            timestamp_jst="2027-11-15T12:00:00+09:00",
+        )
+        comp_2027 = auditor_m1.compute_basis_method_comparison()["SOL"]
+        # 移動平均実現益 = (30,000 - 20,000) * 5 = +50,000円
+        # 総平均単価 = (200,000 + 400,000) / 20 = 30,000円 -> 総平均実現益 = (30,000 - 30,000) * 5 = 0円
+        self.assertEqual(comp_2027["moving_realized_pnl_jpy"], Decimal("50000"))
+        self.assertEqual(comp_2027["periodic_realized_pnl_jpy"], Decimal("0"))
+        self.assertEqual(comp_2027["basis_method_divergence_jpy"], Decimal("50000"))
+        self.assertTrue(comp_2027["periodic_average_trap_warning"])
+
+        # 3-C. 2028年 申告分離課税(GMO +300万円) vs 総合課税(Hyperliquid/QANX -200万円) の損益通算禁止監査
+        auditor_2028 = ForensicTaxAuditor(rebate_incorporation_mode=False)
+        auditor_2028.record_spot_fill(
+            venue="GMO_COIN",
+            asset="BTC",
+            side="BUY",
+            qty="1",
+            price_jpy="10000000",
+            fee_jpy="0",
+            timestamp_jst="2028-02-01T10:00:00+09:00",
+        )
+        auditor_2028.record_spot_fill(
+            venue="GMO_COIN",
+            asset="BTC",
+            side="SELL",
+            qty="1",
+            price_jpy="13000000",  # GMO現物 +300万円の譲渡益 (SEPARATE_20315)
+            fee_jpy="0",
+            timestamp_jst="2028-06-01T10:00:00+09:00",
+        )
+        auditor_2028.record_perp_or_defi_pnl(
+            venue="HYPERLIQUID",
+            asset="USDC",
+            realized_pnl_jpy="-1200000",  # Hyperliquid -120万円の損失 (COMPREHENSIVE_MISC)
+            timestamp_jst="2028-07-01T10:00:00+09:00",
+        )
+        auditor_2028.record_perp_or_defi_pnl(
+            venue="QANX_DEX",
+            asset="QANX",
+            realized_pnl_jpy="-800000",   # QANX DEX -80万円の損失 (合計 -200万円)
+            timestamp_jst="2028-09-01T10:00:00+09:00",
+        )
+        sum_2028 = auditor_2028.audit_year_summary(2028)
+        self.assertEqual(sum_2028["separate_20315_raw_pnl_jpy"], Decimal("3000000"))
+        self.assertEqual(sum_2028["comprehensive_misc_raw_pnl_jpy"], Decimal("-2000000"))
+        self.assertTrue(sum_2028["cross_bucket_offset_prohibited"])
+        self.assertTrue(sum_2028["cross_bucket_offset_blocked"])
+        # 相殺されず 300万円全額に 20.315% (= 609,450円) が課税され、総合課税は 0円フロアとなること
+        self.assertEqual(sum_2028["separate_20315_taxable_income_jpy"], Decimal("3000000"))
+        self.assertEqual(sum_2028["comprehensive_misc_taxable_income_jpy"], Decimal("0"))
+        self.assertEqual(sum_2028["estimated_separate_tax_jpy"], Decimal("609450.00"))
+        self.assertEqual(sum_2028["total_income_for_deduction_check_jpy"], Decimal("3000000"))
+
+        # 逆パターン: GMO現物が -150万円の赤字、Hyperliquidが +250万円の黒字の場合 -> 3年繰越控除 150万円 & 総合課税 250万円
+        auditor_2028_rev = ForensicTaxAuditor(rebate_incorporation_mode=False)
+        auditor_2028_rev.record_spot_fill(
+            venue="GMO_COIN",
+            asset="ETH",
+            side="BUY",
+            qty="10",
+            price_jpy="500000",
+            timestamp_jst="2028-03-01T10:00:00+09:00",
+        )
+        auditor_2028_rev.record_spot_fill(
+            venue="GMO_COIN",
+            asset="ETH",
+            side="SELL",
+            qty="10",
+            price_jpy="350000",  # GMO現物 -150万円
+            timestamp_jst="2028-08-01T10:00:00+09:00",
+        )
+        auditor_2028_rev.record_perp_or_defi_pnl(
+            venue="HYPERLIQUID",
+            asset="USDC",
+            realized_pnl_jpy="2500000",  # Hyperliquid +250万円
+            timestamp_jst="2028-10-01T10:00:00+09:00",
+        )
+        sum_2028_rev = auditor_2028_rev.audit_year_summary(2028)
+        self.assertEqual(sum_2028_rev["separate_20315_taxable_income_jpy"], Decimal("0"))
+        self.assertEqual(sum_2028_rev["carryforward_loss_3yr_jpy"], Decimal("1500000"))
+        self.assertEqual(sum_2028_rev["comprehensive_misc_taxable_income_jpy"], Decimal("2500000"))
+
+        # 3-D. 2027年12月タックス・ハーベスティング監査アラート
+        harv_2027 = auditor_2028.evaluate_2027_year_end_tax_harvesting(
+            realized_pnl_2027_jpy="500000",
+            open_positions=[
+                {"venue": "QANX_DEX", "symbol": "QANX", "unrealized_pnl_jpy": "-180000"},
+                {"venue": "GMO_COIN", "symbol": "SOL", "unrealized_pnl_jpy": "400000"},
+            ],
+        )
+        self.assertIn("RECOMMEND_2027_LOSS_HARVESTING", harv_2027["alerts"])
+        self.assertIn("RECOMMEND_DEFER_GMO_GAIN_TO_2028", harv_2027["alerts"])
+        self.assertGreater(harv_2027["estimated_loss_harvest_tax_saving_jpy"], Decimal("0"))
+        self.assertGreater(harv_2027["estimated_deferral_tax_saving_jpy"], Decimal("0"))
+
+        # ------------------------------------------------------------------
+        # ④ 2027年7月 Phase 1 終了時 5ゲート統計検証パイプライン (DSR / MinTRL / WFE / PBO / OOS PF)
+        # ------------------------------------------------------------------
+        # 4-A. 報告書の数値例の精密再現検証:
+        #   T=300, N=50, skew=-0.1952, kurt_pearson=5.0128, sr_hat=0.1337, sr_0=0.0698
+        #   => DSR ≈ 0.8603 (< 0.95) で Gate 1 不合格 & MinTRL ≈ 692.8 (> 300) で Gate 2 不合格
+        dsr_report_ex = calc_dsr_and_mintrl(
+            sr_0=0.0698,
+            confidence=0.95,
+            T=300,
+            sr_hat=0.1337,
+            skew=-0.1952,
+            kurt_pearson=5.0128,
+        )
+        self.assertAlmostEqual(dsr_report_ex["dsr"], 0.8602, delta=0.001)
+        self.assertFalse(dsr_report_ex["gate1_dsr_pass"])
+        self.assertGreater(dsr_report_ex["min_trl"], 690.0)
+        self.assertFalse(dsr_report_ex["gate2_mintrl_pass"])
+
+        # 4-B. 有効試行回数 N_eff, 期待最大SR_0, CSCV PBO, WFE, 5ゲート昇格判定 (ケースA / ケースB / ケースC)
+        # 一貫して高い正のリターンを持つ候補群で Case A (PROMOTE_CURRENT_LIVE_PARAMETER) を検証
+        t_obs = 160
+        strong_live = [0.008 + 0.003 * math.sin(i * 0.7) for i in range(t_obs)]
+        strong_matrix = [
+            [
+                strong_live[t],                                  # cand 0 (live: 最良)
+                0.004 + 0.004 * math.cos(t * 0.5),               # cand 1
+                0.002 + 0.005 * math.sin(t * 0.3 + 0.4),         # cand 2
+                0.001 + 0.005 * math.cos(t * 0.4 + 0.8),         # cand 3
+            ]
+            for t in range(t_obs)
+        ]
+        n_eff_res = compute_effective_trials(strong_matrix)
+        self.assertGreaterEqual(float(n_eff_res), 1.0)
+        self.assertLessEqual(float(n_eff_res), 4.0)
+
+        pbo_strong = compute_pbo_cscv(strong_matrix, n_partitions=8)
+        self.assertEqual(pbo_strong["n_combinations"], 70)
+        self.assertLess(pbo_strong["pbo"], 0.50)
+        self.assertTrue(pbo_strong["gate4_pbo_pass"])
+
+        promo_a = evaluate_phase1_to_phase2_promotion(
+            live_returns=strong_live,
+            shadow_returns_matrix=strong_matrix,
+            live_candidate_idx=0,
+            confidence=0.95,
+        )
+        self.assertEqual(promo_a["case"], "CASE_A")
+        self.assertEqual(promo_a["decision"], "PROMOTE_CURRENT_LIVE_PARAMETER")
+        self.assertTrue(promo_a["all_5_gates_live_pass"])
+
+        # 現行Live (idx=2) は未達だが、Shadow最良候補 (idx=0) が全5ゲートを突破する Case B (CANARY_PROMOTE_NEW_SHADOW_PARAMETER) を検証
+        mediocre_live = [(-0.002 if i % 2 == 0 else 0.0021) for i in range(t_obs)]
+        canary_matrix = [
+            [
+                strong_live[t],                                  # cand 0 (Shadow最良候補: 5ゲート突破)
+                0.004 + 0.004 * math.cos(t * 0.5),               # cand 1
+                mediocre_live[t],                                # cand 2 (現行Live: DSR未達)
+                0.001 + 0.005 * math.cos(t * 0.4 + 0.8),         # cand 3
+            ]
+            for t in range(t_obs)
+        ]
+        promo_b = evaluate_phase1_to_phase2_promotion(
+            live_returns=mediocre_live,
+            shadow_returns_matrix=canary_matrix,
+            live_candidate_idx=2,
+            confidence=0.95,
+        )
+        self.assertEqual(promo_b["case"], "CASE_B")
+        self.assertEqual(promo_b["decision"], "CANARY_PROMOTE_NEW_SHADOW_PARAMETER")
+        self.assertAlmostEqual(promo_b["canary_lot_ratio"], 0.50, places=2)
+        self.assertFalse(promo_b["all_5_gates_live_pass"])
+        self.assertTrue(promo_b["all_5_gates_shadow_pass"])
+
+        # ランダムノイズのみの候補群で Case C (KEEP_FROZEN_OR_SCALE_DOWN) を検証
+        weak_live = [(-0.002 if i % 2 == 0 else 0.0018) for i in range(t_obs)]
+        weak_matrix = [
+            [
+                weak_live[t],
+                (-0.0022 if (t + 1) % 2 == 0 else 0.0019),
+                (-0.0025 if (t + 2) % 3 == 0 else 0.0010),
+                (-0.0019 if (t + 3) % 2 == 0 else 0.0017),
+            ]
+            for t in range(t_obs)
+        ]
+        promo_c = evaluate_phase1_to_phase2_promotion(
+            live_returns=weak_live,
+            shadow_returns_matrix=weak_matrix,
+            live_candidate_idx=0,
+            confidence=0.95,
+        )
+        self.assertEqual(promo_c["case"], "CASE_C")
+        self.assertEqual(promo_c["decision"], "KEEP_FROZEN_OR_SCALE_DOWN")
+        self.assertFalse(promo_c["all_5_gates_live_pass"])
+
 
 if __name__ == "__main__":
     unittest.main()
