@@ -92,13 +92,65 @@ def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     return now_dt.astimezone(JST)
 
 
+SUBPROCESS_SENSITIVE_ENV_KEYS: frozenset[str] = frozenset(
+    {
+        "GMO_API_KEY",
+        "GMO_API_SECRET",
+        "GEMINI_API_KEY",
+        "GROQ_API_KEY",
+        "OPENAI_API_KEY",
+        "DISCORD_WEBHOOK_URL",
+        "LINE_CHANNEL_ACCESS_TOKEN",
+        "CRYPTOPANIC_API_KEY",
+        "GITHUB_TOKEN",
+        "PWA_UNLOCK_PASSWORD",
+    }
+)
+
+
+def sanitize_subprocess_env(
+    base_env: Optional[Dict[str, str]] = None,
+    extra_env: Optional[Dict[str, str]] = None,
+    is_git: bool = False,
+) -> Dict[str, str]:
+    """
+    子プロセス (`subprocess`) 起動用の環境変数辞書からシークレット環境変数群
+    (`GMO_API_KEY`, `GMO_API_SECRET`, `GEMINI_API_KEY`, `OPENAI_API_KEY`, `DISCORD_WEBHOOK_URL`,
+    `GITHUB_TOKEN`, `PWA_UNLOCK_PASSWORD` 等) および `DPAPI:` 文字列を完全に除去（ストリップ）し、
+    子プロセス空間への環境変数継承漏洩を100%遮断する。
+    """
+    src = dict(base_env if base_env is not None else os.environ)
+    clean_env: Dict[str, str] = {}
+    for k, v in src.items():
+        k_str = str(k)
+        v_str = str(v) if v is not None else ""
+        if k_str.upper() in SUBPROCESS_SENSITIVE_ENV_KEYS:
+            continue
+        if v_str.strip().startswith("DPAPI:"):
+            continue
+        clean_env[k_str] = v_str
+
+    if is_git:
+        clean_env["GIT_TERMINAL_PROMPT"] = "0"
+        clean_env["GCM_INTERACTIVE"] = "never"
+    if extra_env:
+        for ek, ev in extra_env.items():
+            ek_str = str(ek)
+            if ek_str.upper() in SUBPROCESS_SENSITIVE_ENV_KEYS:
+                continue
+            clean_env[ek_str] = str(ev)
+    return clean_env
+
+
 def build_hidden_subprocess_kwargs(
     extra_env: Optional[Dict[str, str]] = None,
     is_git: bool = False,
+    include_env: bool = True,
 ) -> Dict[str, Any]:
     """
     Windows環境においてコンソールウィンドウ（cmd.exe / powershell.exe / git.exe）が
-    一瞬たりともポップアップしないための `subprocess.run` / `Popen` 用キーワード引数を生成する。
+    一瞬たりともポップアップしないための `subprocess.run` / `Popen` 用キーワード引数を生成し、
+    同時に子プロセスへ渡る `env` からシークレット環境変数を100%ストリップする。
     """
     kwargs: Dict[str, Any] = {}
     if os.name == "nt":
@@ -109,14 +161,12 @@ def build_hidden_subprocess_kwargs(
             si.wShowWindow = getattr(subprocess, "SW_HIDE", SW_HIDE)
             kwargs["startupinfo"] = si
 
-    if is_git or extra_env is not None:
-        env = os.environ.copy()
-        if is_git:
-            env["GIT_TERMINAL_PROMPT"] = "0"
-            env["GCM_INTERACTIVE"] = "never"
-        if extra_env:
-            env.update(extra_env)
-        kwargs["env"] = env
+    if include_env or is_git or extra_env is not None:
+        kwargs["env"] = sanitize_subprocess_env(
+            base_env=dict(os.environ),
+            extra_env=extra_env,
+            is_git=is_git,
+        )
 
     return kwargs
 

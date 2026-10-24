@@ -23,9 +23,11 @@ GMOコイン 24時間全自動売買システム v2 — PWA対応ローカル＆
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import logging
 import os
+import secrets
 import socket
 import struct
 import subprocess
@@ -56,6 +58,7 @@ from src.dpapi_vault import (
     encrypt_dotenv_secrets_inplace,
     get_secret_env,
     load_and_unprotect_dotenv,
+    protect_secret,
 )
 from src.global_risk_bus import BREAKER_LEVEL_NAMES, BREAKER_LEVEL_NORMAL, RiskBusBotReader
 from src.gmo_client import GMOPublicClient
@@ -78,6 +81,7 @@ from src.remote_control import (
 )
 from src.system_lifecycle_guard import (
     configure_bot_process_isolation,
+    sanitize_subprocess_env,
     trim_process_working_set,
 )
 from src.validator import DEFAULT_SYMBOL_RULES
@@ -195,9 +199,7 @@ def push_docs_snapshot_async(
                 startup_info = subprocess.STARTUPINFO()
                 startup_info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
                 startup_info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
-            git_env = os.environ.copy()
-            git_env["GIT_TERMINAL_PROMPT"] = "0"
-            git_env["GCM_INTERACTIVE"] = "never"
+            git_env = sanitize_subprocess_env(os.environ, is_git=True)
 
             r_remote = subprocess.run(
                 ["git", "-C", str(resolved), "remote", "get-url", "origin"],
@@ -786,6 +788,7 @@ class WebDashboardService:
         self._last_charts_map: Dict[str, Any] = {}
         self.lan_ip: str = detect_lan_ipv4()
         self.github_pages_url: str = os.getenv("GITHUB_PAGES_URL", DEFAULT_GITHUB_PAGES_URL).strip()
+        self.local_csrf_token: str = secrets.token_urlsafe(32)
         self.pwa_unlock_password: str = self._ensure_pwa_unlock_password()
 
         self.db_wal = DatabaseWAL(
@@ -829,7 +832,7 @@ class WebDashboardService:
         pw = get_secret_env("PWA_UNLOCK_PASSWORD", "").strip()
         if not pw:
             pw = generate_default_pwa_password()
-            os.environ["PWA_UNLOCK_PASSWORD"] = pw
+            os.environ["PWA_UNLOCK_PASSWORD"] = protect_secret(pw)
             if env_file.exists():
                 try:
                     encrypt_dotenv_secrets_inplace(env_file, extra_secrets={"PWA_UNLOCK_PASSWORD": pw})
@@ -3114,9 +3117,13 @@ async function sendControl(command, nonce="") {
     return null;
   }
   try {
+    const csrfToken = window.__GMO_LOCAL_CSRF_TOKEN__ || "";
     const res = await fetch(`${activeApiBase}/api/control`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-GMO-CSRF-Token": csrfToken
+      },
       body: JSON.stringify({ command, nonce })
     });
     const data = await res.json();
@@ -3250,35 +3257,151 @@ def make_dashboard_handler(service: WebDashboardService):
         def _send_cors_headers(self) -> None:
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Accept, X-GMO-CSRF-Token")
             self.send_header("Access-Control-Allow-Private-Network", "true")
+
+        def _send_security_headers(self, cache_control: str = "no-store") -> None:
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self' 'unsafe-inline' data: blob:; "
+                "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
+                "frame-ancestors 'none';",
+            )
 
         def _send_bytes(self, status_code: int, content_type: str, data: bytes, cache_control: str = "no-store") -> None:
             self.send_response(status_code)
             self._send_cors_headers()
+            self._send_security_headers(cache_control=cache_control)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", cache_control)
             self.end_headers()
             self.wfile.write(data)
 
         def _send_json(self, status_code: int, payload: Dict[str, Any]) -> None:
+            if status_code >= 400 and getattr(self, "command", "") == "POST":
+                try:
+                    clen = int(self.headers.get("Content-Length", "0") or 0)
+                    if 0 < clen <= 65536:
+                        self.rfile.read(clen)
+                except Exception:
+                    pass
             raw = dumps_json(payload, indent=None).encode("utf-8")
-            self._send_bytes(status_code, "application/json; charset=utf-8", raw)
+            self._send_bytes(status_code, "application/json; charset=utf-8", raw, cache_control="no-store")
+
+        def _verify_zero_trust_request(self, require_csrf: bool = False) -> bool:
+            """
+            ローカルWebダッシュボード (`127.0.0.1:8080`) のゼロトラスト防御検証:
+            1. DNS Rebinding 遮断 (`Host` ヘッダーが `127.0.0.1` / `localhost` / `[::1]` 以外は 403)
+            2. Cross-Site リクエスト遮断 (`Sec-Fetch-Site: cross-site` または不正 `Origin` / `Referer` は 403)
+            3. `POST` リクエスト時の CSPRNG セッショントークン (`X-GMO-CSRF-Token`) 検証
+            """
+            raw_host = (self.headers.get("Host") or "").strip().lower()
+            if not raw_host:
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {"ok": False, "error": "DNS_REBINDING_BLOCKED", "detail": "Missing Host header"},
+                )
+                return False
+
+            if raw_host.startswith("["):
+                bracket_end = raw_host.find("]")
+                host_only = raw_host[1:bracket_end] if bracket_end > 1 else raw_host
+                port_part = raw_host[bracket_end + 2 :] if (bracket_end > 1 and len(raw_host) > bracket_end + 1 and raw_host[bracket_end + 1] == ":") else ""
+            elif ":" in raw_host:
+                host_only, port_part = raw_host.rsplit(":", 1)
+            else:
+                host_only, port_part = raw_host, ""
+
+            allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+            if host_only not in allowed_hosts or (port_part and not port_part.isdigit()):
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "ok": False,
+                        "error": "DNS_REBINDING_BLOCKED",
+                        "detail": f"Untrusted Host header: {raw_host}",
+                    },
+                )
+                return False
+
+            sec_fetch_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
+            if sec_fetch_site == "cross-site":
+                self._send_json(
+                    HTTPStatus.FORBIDDEN,
+                    {
+                        "ok": False,
+                        "error": "CROSS_SITE_REQUEST_BLOCKED",
+                        "detail": "Sec-Fetch-Site: cross-site is forbidden",
+                    },
+                )
+                return False
+
+            for hdr_name in ("Origin", "Referer"):
+                hdr_val = (self.headers.get(hdr_name) or "").strip()
+                if not hdr_val:
+                    continue
+                if hdr_val.lower() == "null":
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "ok": False,
+                            "error": "CROSS_SITE_ORIGIN_BLOCKED",
+                            "detail": f"Null {hdr_name} header is forbidden",
+                        },
+                    )
+                    return False
+                parsed_hdr = urlparse(hdr_val)
+                hdr_host = (parsed_hdr.hostname or "").strip().lower()
+                if hdr_host not in allowed_hosts:
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "ok": False,
+                            "error": "CROSS_SITE_ORIGIN_BLOCKED",
+                            "detail": f"Untrusted {hdr_name} host: {hdr_host}",
+                        },
+                    )
+                    return False
+
+            if require_csrf:
+                client_token = (self.headers.get("X-GMO-CSRF-Token") or "").strip()
+                expected_token = str(getattr(service, "local_csrf_token", "") or "").strip()
+                if not client_token or not expected_token or not hmac.compare_digest(client_token, expected_token):
+                    self._send_json(
+                        HTTPStatus.FORBIDDEN,
+                        {
+                            "ok": False,
+                            "error": "CSRF_TOKEN_INVALID_OR_MISSING",
+                            "detail": "Valid X-GMO-CSRF-Token header is required for state-changing POST requests",
+                        },
+                    )
+                    return False
+
+            return True
 
         def do_OPTIONS(self) -> None:
+            if not self._verify_zero_trust_request(require_csrf=False):
+                return
             self.send_response(HTTPStatus.NO_CONTENT)
             self._send_cors_headers()
+            self._send_security_headers(cache_control="no-store")
             self.send_header("Content-Length", "0")
             self.end_headers()
 
         def do_GET(self) -> None:
+            if not self._verify_zero_trust_request(require_csrf=False):
+                return
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
             qs = parse_qs(parsed.query)
 
             if path in ("/", "/index.html"):
-                self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", DASHBOARD_HTML.encode("utf-8"))
+                csrf_script = f'<script>window.__GMO_LOCAL_CSRF_TOKEN__ = "{service.local_csrf_token}";</script>\n</head>'
+                rendered_html = DASHBOARD_HTML.replace("</head>", csrf_script, 1)
+                self._send_bytes(HTTPStatus.OK, "text/html; charset=utf-8", rendered_html.encode("utf-8"), cache_control="no-store")
                 return
 
             if path == "/manifest.json":
@@ -3379,6 +3502,8 @@ def make_dashboard_handler(service: WebDashboardService):
             self._send_json(HTTPStatus.NOT_FOUND, {"ok": False, "error": f"Not found: {path}"})
 
         def do_POST(self) -> None:
+            if not self._verify_zero_trust_request(require_csrf=True):
+                return
             parsed = urlparse(self.path)
             path = parsed.path.rstrip("/") or "/"
 

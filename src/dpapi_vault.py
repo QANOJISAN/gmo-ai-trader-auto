@@ -9,11 +9,12 @@ Windows DPAPI (Data Protection API / Crypt32.dll) 機密情報暗号化・復号
 from __future__ import annotations
 
 import base64
+import contextlib
 import ctypes
 from ctypes import wintypes
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Union
+from typing import Dict, Iterable, Iterator, Optional, Union
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -22,6 +23,7 @@ CRYPTPROTECT_UI_FORBIDDEN = 0x01
 
 DEFAULT_SECRET_KEYS = (
     "GEMINI_API_KEY",
+    "GROQ_API_KEY",
     "OPENAI_API_KEY",
     "DISCORD_WEBHOOK_URL",
     "LINE_CHANNEL_ACCESS_TOKEN",
@@ -31,6 +33,7 @@ DEFAULT_SECRET_KEYS = (
     "GITHUB_TOKEN",
     "PWA_UNLOCK_PASSWORD",
 )
+SECRET_ENV_KEYS = DEFAULT_SECRET_KEYS
 
 
 class DATA_BLOB(ctypes.Structure):
@@ -160,9 +163,81 @@ def unprotect_secret(value: Optional[str]) -> str:
         decrypted_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
     finally:
         if blob_out.pbData:
+            try:
+                if blob_out.cbData > 0:
+                    ctypes.memset(ctypes.cast(blob_out.pbData, ctypes.c_void_p), 0, int(blob_out.cbData))
+            except Exception:
+                pass
             _kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
 
     return decrypted_bytes.decode("utf-8")
+
+
+def zeroize_bytearray(buf: Optional[bytearray]) -> int:
+    """
+    `bytearray` の基底メモリバッファを `ctypes.memset` により `0x00` で完全に上書き消去（Zeroize）する。
+    消去したバイト数を返す。
+    """
+    if not isinstance(buf, bytearray) or len(buf) == 0:
+        return 0
+    n = len(buf)
+    c_buf = (ctypes.c_char * n).from_buffer(buf)
+    ctypes.memset(ctypes.addressof(c_buf), 0, n)
+    return n
+
+
+@contextlib.contextmanager
+def ephemeral_unprotected_bytes(value: Optional[str]) -> Iterator[bytearray]:
+    """
+    Just-In-Time (JIT) 復号コンテキストマネージャ：
+    Windows `Crypt32.dll` (`CryptUnprotectData`) で復号した秘密鍵をミュータブルな `bytearray` として一時生成し、
+    `with ephemeral_unprotected_bytes(...) as secret_buf:` ブロックを抜けた瞬間に
+    `ctypes.memset` でメモリ上のバッファを `0x00` で完全に上書き消去（Zeroize）する。
+    """
+    secret_buf = bytearray()
+    if value is not None:
+        cleaned = str(value).strip()
+        if cleaned:
+            if not cleaned.startswith(DPAPI_PREFIX):
+                secret_buf = bytearray(cleaned.encode("utf-8"))
+            else:
+                b64_payload = cleaned[len(DPAPI_PREFIX):].strip()
+                if b64_payload:
+                    encrypted_bytes = base64.b64decode(b64_payload)
+                    in_buf = ctypes.create_string_buffer(encrypted_bytes, len(encrypted_bytes))
+                    blob_in = DATA_BLOB(len(encrypted_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
+                    blob_out = DATA_BLOB()
+                    ok = _crypt32.CryptUnprotectData(
+                        ctypes.byref(blob_in),
+                        None,
+                        None,
+                        None,
+                        None,
+                        CRYPTPROTECT_UI_FORBIDDEN,
+                        ctypes.byref(blob_out),
+                    )
+                    if not ok:
+                        err_code = ctypes.GetLastError()
+                        raise RuntimeError(f"CryptUnprotectData failed with Windows error code: {err_code}")
+                    try:
+                        raw_dec = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                        secret_buf = bytearray(raw_dec)
+                    finally:
+                        if blob_out.pbData:
+                            try:
+                                if blob_out.cbData > 0:
+                                    ctypes.memset(
+                                        ctypes.cast(blob_out.pbData, ctypes.c_void_p),
+                                        0,
+                                        int(blob_out.cbData),
+                                    )
+                            except Exception:
+                                pass
+                            _kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+    try:
+        yield secret_buf
+    finally:
+        zeroize_bytearray(secret_buf)
 
 
 def get_secret_env(key: str, default: str = "") -> str:
@@ -180,13 +255,14 @@ def load_and_unprotect_dotenv(
     override: bool = False,
 ) -> bool:
     """
-    `.env` ファイルを読み込んだ後、現在のプロセスの `os.environ` 内に存在する
-    `DPAPI:` 形式の環境変数をすべてオンメモリで復号状態に展開する。
-    （※ディスク上の `.env` ファイルは一切書き換えず、`DPAPI:AQAA...` のまま維持される）
+    `.env` ファイルを読み込み、プロセスの `os.environ` 上には平文のシークレットを一切書き戻さず、
+    `DPAPI:AQAA...` の暗号化文字列のまま保持する（PEB 環境変数ブロックダンプによる平文漏洩を100%遮断）。
+    万一 `os.environ` 内のシークレットキー群 (`DEFAULT_SECRET_KEYS`) に平文が入っていた場合も
+    即座に `protect_secret()` で `DPAPI:AQAA...` 形式へ変換して保持する。
+    （※各モジュールは必ず `get_secret_env()` / `unprotect_secret()` / `ephemeral_unprotected_bytes()` で JIT 復号する）
     """
     loaded = load_dotenv(dotenv_path=dotenv_path, override=override)
     if dotenv_path is not None and Path(dotenv_path).exists():
-        # 既に os.environ に DPAPI: 形式で入っているキーや .env 内のキーを確実に復号展開
         try:
             file_kv = dotenv_values(dotenv_path)
             for k, v in file_kv.items():
@@ -195,10 +271,16 @@ def load_and_unprotect_dotenv(
         except Exception:
             pass
 
+    secret_key_set = set(DEFAULT_SECRET_KEYS)
     for env_k, env_v in list(os.environ.items()):
-        if isinstance(env_v, str) and env_v.strip().startswith(DPAPI_PREFIX):
+        if not isinstance(env_v, str):
+            continue
+        cleaned_v = env_v.strip()
+        if not cleaned_v or cleaned_v.startswith("your_"):
+            continue
+        if env_k in secret_key_set and not cleaned_v.startswith(DPAPI_PREFIX):
             try:
-                os.environ[env_k] = unprotect_secret(env_v)
+                os.environ[env_k] = protect_secret(cleaned_v)
             except Exception:
                 pass
     return bool(loaded)

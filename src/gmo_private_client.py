@@ -40,8 +40,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
+from src.code_integrity_guard import EgressSecurityViolationError, validate_egress_url
 from src.database_wal import DatabaseWAL
-from src.dpapi_vault import get_secret_env, unprotect_secret
+from src.dpapi_vault import (
+    ephemeral_unprotected_bytes,
+    get_secret_env,
+    is_dpapi_protected,
+    protect_secret,
+    unprotect_secret,
+)
 from src.gmo_client import GMOPublicClient, SystemSSLAdapter
 from src.json_utils import load_json_file, write_json_file
 from src.validator import (
@@ -243,8 +250,10 @@ class GMOPrivateClient:
         max_retries: int = 2,
         retry_delay: float = 0.5,
     ) -> None:
+        self._protected_api_secret: str = ""
         self.api_key = unprotect_secret(api_key if api_key is not None else get_secret_env("GMO_API_KEY", "")).strip()
-        self.api_secret = unprotect_secret(api_secret if api_secret is not None else get_secret_env("GMO_API_SECRET", "")).strip()
+        raw_secret = (api_secret if api_secret is not None else os.getenv("GMO_API_SECRET", "")).strip()
+        self.api_secret = raw_secret
         self.public_client = public_client or GMOPublicClient(timeout=timeout)
         self.wal_db = wal_db
         self.token_bucket = token_bucket or PriorityTokenBucket()
@@ -266,12 +275,31 @@ class GMOPrivateClient:
             }
         )
 
+    @property
+    def api_secret(self) -> str:
+        """
+        インスタンス属性上の API シークレットは常時 `DPAPI:AQAA...` 暗号化文字列として保持し、
+        プロセスメモリ走査による平文シークレット漏洩を100%防止する。
+        """
+        return self._protected_api_secret
+
+    @api_secret.setter
+    def api_secret(self, value: Optional[str]) -> None:
+        cleaned = str(value or "").strip()
+        if not cleaned or cleaned.startswith("your_"):
+            self._protected_api_secret = cleaned
+            return
+        if is_dpapi_protected(cleaned):
+            self._protected_api_secret = cleaned
+        else:
+            self._protected_api_secret = protect_secret(cleaned)
+
     def has_credentials(self) -> bool:
         return (
             bool(self.api_key)
-            and bool(self.api_secret)
+            and bool(self._protected_api_secret)
             and not self.api_key.startswith("your_")
-            and not self.api_secret.startswith("your_")
+            and not self._protected_api_secret.startswith("your_")
         )
 
     def _current_timestamp_ms(self) -> int:
@@ -351,17 +379,20 @@ class GMOPrivateClient:
         method_up = method.upper()
         sign_body = "" if exclude_body_from_sign else body_str
         text = f"{timestamp}{method_up}{v1_path}{sign_body}"
-        sign = hmac.new(
-            self.api_secret.encode("utf-8"),
-            text.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
+        with ephemeral_unprotected_bytes(self._protected_api_secret) as secret_buf:
+            sign = hmac.new(
+                secret_buf,
+                text.encode("utf-8"),
+                hashlib.sha256,
+            ).hexdigest()
         return {
             "API-KEY": self.api_key,
             "API-TIMESTAMP": timestamp,
             "API-SIGN": sign,
             "Content-Type": "application/json",
         }
+
+    _build_headers = _build_auth_headers
 
     @staticmethod
     def serialize_body_strict(body: Optional[Dict[str, Any]]) -> str:
@@ -398,6 +429,7 @@ class GMOPrivateClient:
 
         v1_path = _normalize_v1_path(path)
         url = f"{self.BASE_URL}{v1_path}"
+        validate_egress_url(url)
         method_up = method.upper()
         body_str = self.serialize_body_strict(body) if (body is not None and method_up in ("POST", "PUT", "DELETE")) else ""
 
@@ -499,7 +531,12 @@ class GMOPrivateClient:
 
                 return payload.get("data")
 
-            except (GMOAuthHaltError, InsufficientAvailableAssetError, GMOMaintenanceError):
+            except (
+                GMOAuthHaltError,
+                InsufficientAvailableAssetError,
+                GMOMaintenanceError,
+                EgressSecurityViolationError,
+            ):
                 raise
             except GMORateLimitError:
                 if method_up != "GET":

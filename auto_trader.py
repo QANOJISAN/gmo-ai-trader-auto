@@ -40,6 +40,7 @@ from src.circuit_breaker import (
     is_in_saturday_pre_maintenance_clear_window,
     prevent_windows_sleep,
 )
+from src.code_integrity_guard import CodeIntegrityGuard, verify_signed_integrity_manifest
 from src.database_wal import DatabaseWAL
 from src.dpapi_vault import load_and_unprotect_dotenv
 from src.gmo_client import GMOPublicClient
@@ -328,6 +329,14 @@ class AutoTraderDaemon:
             oco_manager=self.oco_manager,
             db_wal=self.db_wal,
             dispatcher=self.notification_dispatcher,
+        )
+        self.oco_manager.remote_control = self.remote_control
+        self.code_integrity_guard = CodeIntegrityGuard(
+            base_dir=self.base_dir,
+            remote_control=self.remote_control,
+            notifier=self.notifier,
+            dry_run_notify=self.dry_run_notify,
+            auto_initialize_if_missing=True,
         )
         self.ws_engine = WSHybridEngine(
             broker=self.broker,
@@ -1308,6 +1317,24 @@ class AutoTraderDaemon:
                 tickers=current_tickers,
                 now_dt=now_jst,
             )
+
+            # Anti-Churning Sentinel（未知の外部不正注文・異常往復売買検知と即時無力化・ハードロック）
+            sentinel_res = self.oco_manager.inspect_and_neutralize_unauthorized_orders(
+                remote_control=self.remote_control,
+                now_dt=now_jst,
+            )
+            if sentinel_res.get("triggered"):
+                guardian_events.append(
+                    {
+                        "type": "CRITICAL_UNAUTHORIZED_EXTERNAL_ACTIVITY_DETECTED",
+                        "unauthorized_order_ids": sentinel_res.get("unauthorized_order_ids", []),
+                        "churning_detected": sentinel_res.get("churning_detected", False),
+                        "churning_symbols": sentinel_res.get("churning_symbols", []),
+                        "canceled_order_ids": sentinel_res.get("canceled_order_ids", []),
+                        "preserved_sl_order_ids": sentinel_res.get("preserved_sl_order_ids", []),
+                        "timestamp": now_jst.isoformat(timespec="seconds"),
+                    }
+                )
 
             # 板置きのまま滞留している PENDING_BUY の逆選択（毒性フロー）キャンセル判定
             adverse_cancel_events: List[Dict[str, Any]] = []

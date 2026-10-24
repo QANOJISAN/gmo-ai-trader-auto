@@ -264,6 +264,79 @@ class _StopOrderAlreadyExecutedError(Exception):
         self.order_info = order_info
 
 
+class AntiChurningSentinel:
+    """
+    外部不正注文 (`UNAUTHORIZED_EXTERNAL_ORDER`) および異常往復売買（口座ドレイン攻撃：
+    直近60秒間に同一銘柄で3回以上の連続発注）を検知し、即時無力化・ハードロックする監視機構。
+    """
+
+    def __init__(self, window_sec: float = 60.0, max_orders_per_window: int = 3) -> None:
+        self.window_sec = float(window_sec)
+        self.max_orders_per_window = int(max_orders_per_window)
+        self._symbol_order_events: Dict[str, Dict[str, float]] = {}
+        self._lock = threading.RLock()
+
+    def record_order_event(
+        self,
+        symbol: str,
+        order_id: str,
+        now_dt: Optional[datetime] = None,
+    ) -> int:
+        sym = str(symbol or "").strip().upper()
+        oid = str(order_id or "").strip()
+        if not sym or not oid:
+            return 0
+        now_ts = _now_jst(now_dt).timestamp()
+        with self._lock:
+            sym_map = self._symbol_order_events.setdefault(sym, {})
+            sym_map[oid] = now_ts
+            cutoff = now_ts - self.window_sec
+            for k in list(sym_map.keys()):
+                if sym_map[k] < cutoff:
+                    sym_map.pop(k, None)
+            return len(sym_map)
+
+    def evaluate_churning(
+        self,
+        active_orders: Optional[List[Dict[str, Any]]] = None,
+        preserved_sl_ids: Optional[set[str]] = None,
+        now_dt: Optional[datetime] = None,
+    ) -> Tuple[bool, List[str]]:
+        now_jst = _now_jst(now_dt)
+        now_ts = now_jst.timestamp()
+        cutoff = now_ts - self.window_sec
+        sl_set = preserved_sl_ids or set()
+        churning_symbols: List[str] = []
+
+        with self._lock:
+            active_counts: Dict[str, set[str]] = {}
+            for ord_item in active_orders or []:
+                oid = str(ord_item.get("order_id", "") or "").strip()
+                sym = str(ord_item.get("symbol", "") or "").strip().upper()
+                if not oid or not sym or oid in sl_set:
+                    continue
+                active_counts.setdefault(sym, set()).add(oid)
+                ts_str = str(ord_item.get("timestamp", "") or "").strip()
+                if ts_str:
+                    ord_dt = _parse_iso_jst(ts_str, now_jst)
+                    ord_ts = ord_dt.timestamp()
+                    if ord_ts >= cutoff:
+                        sym_map = self._symbol_order_events.setdefault(sym, {})
+                        sym_map[oid] = ord_ts
+
+            all_syms = set(self._symbol_order_events.keys()) | set(active_counts.keys())
+            for sym in sorted(all_syms):
+                sym_map = self._symbol_order_events.get(sym, {})
+                for k in list(sym_map.keys()):
+                    if sym_map[k] < cutoff or k in sl_set:
+                        sym_map.pop(k, None)
+                recent_ids = set(sym_map.keys()) | active_counts.get(sym, set())
+                if len(recent_ids) >= self.max_orders_per_window:
+                    churning_symbols.append(sym)
+
+        return bool(churning_symbols), churning_symbols
+
+
 class PseudoOCOManager:
     """現物API向け WAL意図ログ付き8状態ステートマシン・原子的決済・4段階トレーリング管理エンジン"""
 
@@ -305,7 +378,218 @@ class PseudoOCOManager:
         )
         self.stop_change_order_supported: bool = self._load_stop_change_capability()
         self.async_tp_trial_mode: bool = bool(async_tp_trial_mode)
+        self.anti_churning_sentinel = AntiChurningSentinel(window_sec=60.0, max_orders_per_window=3)
+        self.security_halt_latched: bool = False
+        self.security_halt_reason: str = ""
+        self.last_security_sentinel_result: Optional[Dict[str, Any]] = None
+        self.remote_control: Any = None
         self._lock = threading.RLock()
+
+    def get_known_local_order_ids(self, pf: Optional[Dict[str, Any]] = None) -> set[str]:
+        """
+        ローカルの `portfolio.json`（`pending_orders`, `positions`, `quarantined_dust`, `closed_trades`）
+        および SQLite WAL 台帳（`orders` テーブル）に記録されている正当な管理下注文IDの集合を返す。
+        """
+        portfolio = pf if isinstance(pf, dict) else self.load_portfolio()
+        known_ids: set[str] = set()
+
+        for o in portfolio.get("pending_orders", []) or []:
+            for k in ("order_id", "entry_order_id", "tranche_sl_order_id"):
+                val = str(o.get(k, "") or "").strip()
+                if val:
+                    known_ids.add(val)
+
+        for p in portfolio.get("positions", []) or []:
+            for k in ("buy_order_id", "entry_order_id", "sl_order_id", "tp_order_id"):
+                val = str(p.get(k, "") or "").strip()
+                if val:
+                    known_ids.add(val)
+
+        for d in portfolio.get("quarantined_dust", []) or []:
+            val = str(d.get("buy_order_id", "") or "").strip()
+            if val:
+                known_ids.add(val)
+
+        for ct in portfolio.get("closed_trades", []) or []:
+            for k in ("buy_order_id", "exit_order_id", "sl_order_id", "tp_order_id"):
+                val = str(ct.get(k, "") or "").strip()
+                if val:
+                    known_ids.add(val)
+
+        if self.wal_db is not None and hasattr(self.wal_db, "_conn") and self.wal_db._conn is not None:
+            try:
+                cur = self.wal_db._conn.execute("SELECT order_id FROM orders;")
+                for row in cur.fetchall():
+                    oid = str(row[0] if not isinstance(row, dict) else row.get("order_id", "")).strip()
+                    if oid:
+                        known_ids.add(oid)
+            except Exception:
+                pass
+
+        return known_ids
+
+    def inspect_and_neutralize_unauthorized_orders(
+        self,
+        active_orders: Optional[List[Dict[str, Any]]] = None,
+        remote_control: Any = None,
+        now_dt: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """
+        【Anti-Churning Sentinel：外部不正注文・異常往復売買（口座ドレイン攻撃）検知】
+        取引所の有効注文一覧 (`activeOrders`) の中に、ローカルの SQLite WAL 台帳および管理下の
+        `entry_order_id` / `sl_order_id` / `tp_order_id` に一切記録が存在しない未知の外部注文
+        (`UNAUTHORIZED_EXTERNAL_ORDER`) が検出された場合、または直近60秒間に同一銘柄で3回以上の
+        異常な連続発注 (`CHURNING_THRESHOLD_EXCEEDED`) が検出された場合：
+          ① 即座に `CRITICAL_UNAUTHORIZED_EXTERNAL_ACTIVITY_DETECTED` アラームを発火する。
+          ② 当該未知の未約定注文を直ちにキャンセルし、新規発注をハードロック (`PAUSE` / `HALT`) して
+             Discord へ緊急セキュリティ警告を送信する。
+          ③ 保有建玉を守る正当な登録済みサーバー `STOP` 注文 (`sl_order_id`) は 100% 無傷で維持する。
+        """
+        with self._lock:
+            now_jst = _now_jst(now_dt)
+            pf = self.load_portfolio()
+            known_ids = self.get_known_local_order_ids(pf)
+
+            preserved_sl_ids: set[str] = set()
+            for p in pf.get("positions", []) or []:
+                if str(p.get("state", "")).strip().upper() == "DUST_QUARANTINED":
+                    continue
+                sl_id = str(p.get("sl_order_id", "") or "").strip()
+                if sl_id:
+                    preserved_sl_ids.add(sl_id)
+
+            for o in pf.get("pending_orders", []) or []:
+                tr_sl = str(o.get("tranche_sl_order_id", "") or "").strip()
+                if tr_sl:
+                    preserved_sl_ids.add(tr_sl)
+
+            if active_orders is None:
+                try:
+                    active_orders = self.broker.get_active_orders()
+                except Exception as exc:
+                    logger.debug("AntiChurningSentinel activeOrders 取得スキップ: %s", exc)
+                    active_orders = []
+
+            unauthorized_orders: List[Dict[str, Any]] = []
+            for ex_ord in active_orders or []:
+                oid = str(ex_ord.get("order_id", "") or "").strip()
+                if not oid:
+                    continue
+                if oid not in known_ids:
+                    unauthorized_orders.append(ex_ord)
+
+            churning_detected, churning_symbols = self.anti_churning_sentinel.evaluate_churning(
+                active_orders=active_orders,
+                preserved_sl_ids=preserved_sl_ids,
+                now_dt=now_jst,
+            )
+
+            if not unauthorized_orders and not churning_detected:
+                return {
+                    "triggered": False,
+                    "status": "OK",
+                    "alarm_code": "",
+                    "unauthorized_order_ids": [],
+                    "churning_detected": False,
+                    "churning_symbols": [],
+                    "canceled_order_ids": [],
+                    "preserved_sl_order_ids": sorted(preserved_sl_ids),
+                    "new_entries_locked": bool(self.security_halt_latched),
+                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                }
+
+            alarm_code = "CRITICAL_UNAUTHORIZED_EXTERNAL_ACTIVITY_DETECTED"
+            self.security_halt_latched = True
+            self.security_halt_reason = alarm_code
+
+            rc = remote_control or self.remote_control
+            if rc is not None:
+                try:
+                    rc.is_paused = True
+                except Exception:
+                    pass
+
+            canceled_ids: List[str] = []
+            unauthorized_ids: List[str] = []
+
+            for unauth_ord in unauthorized_orders:
+                oid = str(unauth_ord.get("order_id", "") or "").strip()
+                if not oid or oid in preserved_sl_ids:
+                    continue
+                unauthorized_ids.append(oid)
+                try:
+                    self.broker.cancel_order(oid)
+                    canceled_ids.append(oid)
+                except Exception as cancel_exc:
+                    logger.error("未知外部注文キャンセル失敗 (order_id=%s): %s", oid, cancel_exc)
+
+            if churning_detected:
+                churn_sym_set = set(churning_symbols)
+                remaining_pending: List[Dict[str, Any]] = []
+                pf_modified = False
+                for ex_ord in active_orders or []:
+                    oid = str(ex_ord.get("order_id", "") or "").strip()
+                    sym = str(ex_ord.get("symbol", "") or "").strip().upper()
+                    exec_type = str(ex_ord.get("execution_type", "") or "").strip().upper()
+                    if not oid or oid in preserved_sl_ids or oid in canceled_ids:
+                        continue
+                    if sym in churn_sym_set and exec_type != "STOP":
+                        try:
+                            self.broker.cancel_order(oid)
+                            canceled_ids.append(oid)
+                        except Exception:
+                            pass
+                for p_ord in pf.get("pending_orders", []) or []:
+                    p_oid = str(p_ord.get("order_id", "") or "").strip()
+                    if p_oid in canceled_ids:
+                        pf_modified = True
+                    else:
+                        remaining_pending.append(p_ord)
+                if pf_modified:
+                    pf["pending_orders"] = remaining_pending
+                    self.save_portfolio(pf, now_dt=now_jst)
+
+            if self.notifier is not None:
+                try:
+                    self.notifier.notify_event(
+                        title=f"🚨 {alarm_code}: 外部不正注文・異常往復売買検知",
+                        message=(
+                            f"・アラームコード: `{alarm_code}`\n"
+                            f"・未知の外部不正注文ID (`UNAUTHORIZED_EXTERNAL_ORDER`): `{unauthorized_ids}`\n"
+                            f"・異常連続発注検知 (`CHURNING`): `{churning_detected}` (対象銘柄: `{churning_symbols}`)\n"
+                            f"・即時キャンセル済み注文ID: `{canceled_ids}`\n"
+                            f"・100%維持された保有建玉保護STOP注文ID: `{sorted(preserved_sl_ids)}`\n"
+                            f"・新規発注を即時ハードロック (`PAUSE` / `HALT`) しました。"
+                        ),
+                        level="CRITICAL",
+                        dry_run=self.dry_run_notify,
+                    )
+                except Exception:
+                    pass
+
+            result = {
+                "triggered": True,
+                "status": alarm_code,
+                "alarm_code": alarm_code,
+                "unauthorized_order_ids": unauthorized_ids,
+                "churning_detected": churning_detected,
+                "churning_symbols": churning_symbols,
+                "canceled_order_ids": canceled_ids,
+                "preserved_sl_order_ids": sorted(preserved_sl_ids),
+                "new_entries_locked": True,
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+            }
+            self.last_security_sentinel_result = result
+            logger.critical(
+                "🚨 %s: unauthorized=%s, churning=%s (%s), canceled=%s, preserved_sl=%s",
+                alarm_code,
+                unauthorized_ids,
+                churning_detected,
+                churning_symbols,
+                canceled_ids,
+                sorted(preserved_sl_ids),
+            )
+            return result
 
     def _load_stop_change_capability(self) -> bool:
         if self.capabilities_path and self.capabilities_path.exists():
@@ -892,6 +1176,12 @@ class PseudoOCOManager:
     ) -> Dict[str, Any]:
         now_jst = _now_jst(now_dt)
         now_str = now_jst.isoformat(timespec="seconds")
+
+        if self.security_halt_latched:
+            return {
+                "status": "REJECTED_SECURITY_HALT",
+                "reason": self.security_halt_reason or "CRITICAL_UNAUTHORIZED_EXTERNAL_ACTIVITY_DETECTED",
+            }
 
         if bool(decision.get("respect_fee_settlement_freeze", False)) and is_in_daily_fee_settlement_freeze_window(
             now_jst

@@ -147,7 +147,25 @@ class ThreeWayReconciler:
             for p in (pf.get("positions", []) or [])
             if str(p.get("tp_order_id", ""))
         }
-        known_local_order_ids = local_pending_ids | local_sl_ids | local_tp_ids
+        if hasattr(self.oco_manager, "get_known_local_order_ids"):
+            known_local_order_ids = self.oco_manager.get_known_local_order_ids(pf)
+        else:
+            known_local_order_ids = local_pending_ids | local_sl_ids | local_tp_ids
+
+        security_sentinel_result: Optional[Dict[str, Any]] = None
+        if self.cancel_orphan_orders and hasattr(self.oco_manager, "inspect_and_neutralize_unauthorized_orders"):
+            has_unauth = any(oid not in known_local_order_ids for oid in active_by_id)
+            if has_unauth:
+                security_sentinel_result = self.oco_manager.inspect_and_neutralize_unauthorized_orders(
+                    active_orders=list(active_by_id.values()),
+                    now_dt=now_jst,
+                )
+                for c_oid in security_sentinel_result.get("canceled_order_ids", []) or []:
+                    orphan_orders_handled.append(str(c_oid))
+                    actions_taken.append(
+                        f"CRITICAL_UNAUTHORIZED_EXTERNAL_ACTIVITY_DETECTED: 未知外部注文キャンセル order_id={c_oid}"
+                    )
+                    active_by_id.pop(str(c_oid), None)
 
         # ------------------------------------------------------------------
         # 1. 孤児注文 (Orphan Orders): 取引所に存在するがローカル台帳にない有効注文

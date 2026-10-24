@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import re
 import ssl
@@ -60,6 +61,95 @@ DEFAULT_GEMINI_FALLBACK_MODELS = [
 ]
 
 MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP", "SOL"}
+
+_PROMPT_INJECTION_PATTERNS = (
+    re.compile(r"<\|[^|]*\|>"),
+    re.compile(r"\[/?INST\]", re.IGNORECASE),
+    re.compile(r"<</?SYS>>", re.IGNORECASE),
+    re.compile(
+        r"(?i)(?:ignore|disregard|forget|override)\s+(?:all\s+|any\s+)?(?:previous|prior|above|system)\s+"
+        r"(?:instructions?|prompts?|rules?|directives?|constraints?)[^\n.;]*"
+    ),
+    re.compile(r"(?i)\b(?:system|developer|assistant|user)\s*:"),
+    re.compile(r"(?i)you\s+are\s+now\s+in\s+developer\s+mode[^\n.;]*"),
+)
+
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_NUMERIC_EXTRACT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?")
+_STRICT_NUMERIC_KEYS = frozenset(
+    {
+        "last",
+        "ask",
+        "bid",
+        "best_ask",
+        "best_bid",
+        "high",
+        "low",
+        "volume",
+        "entry_price",
+        "limit_price",
+        "stop_loss_price",
+        "take_profit_price",
+        "current_price",
+        "jpy_balance",
+        "peak_equity_jpy",
+        "initial_capital_jpy",
+        "rsi_14",
+        "atr_14",
+        "spread_pct",
+        "confidence",
+        "conviction_score",
+    }
+)
+
+
+def _sanitize_prompt_string(value: str, max_length: int = 600) -> str:
+    cleaned = _CONTROL_CHAR_RE.sub("", str(value or ""))
+    for pat in _PROMPT_INJECTION_PATTERNS:
+        cleaned = pat.sub("", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > max_length:
+        cleaned = cleaned[:max_length].rstrip()
+    return cleaned
+
+
+def sanitize_llm_prompt_context(data: Any, _key_hint: str = "") -> Any:
+    """
+    【Round 20：LLM プロンプトインジェクション無力化サニタイザ】
+    LLM プロンプトへ注入するコンテキスト辞書・リスト・スカラー値に対し：
+      1. 文字列フィールド（シンボル名・レジーム名・過去履歴要約・辞書キー等）から制御文字および
+         プロンプトインジェクション構文（`Ignore previous instructions`, `System:`, `<|...|>` 等）を完全ストリップする。
+      2. 数値フィールド（`int`, `float`, `Decimal`、および価格・指標系の数値キー）を厳密に `int` / `float`
+         としてフォーマットし、`NaN` / `Inf` の混入を `0.0` に正規化する。
+    """
+    if data is None or isinstance(data, bool):
+        return data
+    if isinstance(data, int):
+        return int(data)
+    if isinstance(data, (float, Decimal)):
+        f_val = float(data)
+        if math.isnan(f_val) or math.isinf(f_val):
+            return 0.0
+        return f_val
+    if isinstance(data, str):
+        if _key_hint in _STRICT_NUMERIC_KEYS:
+            m = _NUMERIC_EXTRACT_RE.search(data)
+            if m:
+                num_str = m.group(0)
+                if "." in num_str:
+                    return float(num_str)
+                return int(num_str)
+            return 0.0
+        return _sanitize_prompt_string(data)
+    if isinstance(data, dict):
+        sanitized_dict: Dict[str, Any] = {}
+        for k, v in data.items():
+            safe_k = _sanitize_prompt_string(str(k), max_length=120)
+            sanitized_dict[safe_k] = sanitize_llm_prompt_context(v, _key_hint=safe_k)
+        return sanitized_dict
+    if isinstance(data, (list, tuple, set)):
+        return [sanitize_llm_prompt_context(item, _key_hint=_key_hint) for item in data]
+    return _sanitize_prompt_string(str(data))
 
 SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買の最高リスク責任者（CRO: Chief Risk Officer）兼クオンツ審査AI（Veto Gate）です。
 確証バイアス（Confirmation Bias）を排除するため、以下の【4ステップ反証型「Pre-Mortem」プロトコル】を厳格に実行し、反対仮説（`bearish_invalidation_points` / `bearish_counter_thesis` 最低2項目）を上回る強気エッジ（`bullish_edge_points` / `bullish_conviction_factors`）と確信度スコア（`conviction_score`: 0〜100）が 75点以上（かつ動的較正閾値 `effective_threshold` 以上）ある場合のみ `BUY` を承認してください。
@@ -741,14 +831,16 @@ class AIJudge:
             market_regime=str((portfolio or {}).get("market_regime") or market_regime),
         )
 
-        user_payload = {
-            "timestamp_jst": now_str,
-            "portfolio": llm_portfolio_view,
-            "symbol_rules": symbol_rules,
-            "normalized_feature_tensor": normalized_feature_tensor,
-            "self_calibration_scorecard": self_calibration_scorecard,
-            "market_summaries": market_summaries,
-        }
+        user_payload = sanitize_llm_prompt_context(
+            {
+                "timestamp_jst": now_str,
+                "portfolio": llm_portfolio_view,
+                "symbol_rules": symbol_rules,
+                "normalized_feature_tensor": normalized_feature_tensor,
+                "self_calibration_scorecard": self_calibration_scorecard,
+                "market_summaries": market_summaries,
+            }
+        )
 
         decision: Dict[str, Any] | None = None
         used_provider = "rule_based"
@@ -891,9 +983,10 @@ class AIJudge:
             if fb not in candidate_models:
                 candidate_models.append(fb)
 
+        safe_payload = sanitize_llm_prompt_context(payload)
         prompt = (
             f"{SYSTEM_PROMPT}\n\n"
-            f"【入力データ (JSON)】\n{dumps_json(payload, indent=2)}"
+            f"【入力データ (JSON)】\n{dumps_json(safe_payload, indent=2)}"
         )
 
         last_err: Optional[Exception] = None
@@ -982,6 +1075,7 @@ class AIJudge:
     def _call_openai(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         from openai import OpenAI
 
+        safe_payload = sanitize_llm_prompt_context(payload)
         client = OpenAI(api_key=self.openai_api_key)
         response = client.chat.completions.create(
             model=self.openai_model,
@@ -991,7 +1085,7 @@ class AIJudge:
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
                     "role": "user",
-                    "content": dumps_json(payload, indent=2),
+                    "content": dumps_json(safe_payload, indent=2),
                 },
             ],
         )

@@ -15,6 +15,7 @@ from typing import Any, Dict
 
 import requests
 
+from src.code_integrity_guard import EgressSecurityViolationError, validate_egress_url
 from src.dpapi_vault import get_secret_env, unprotect_secret
 from src.gmo_client import SystemSSLAdapter
 from src.validator import format_decimal_plain, format_price_jpy, normalize_confidence
@@ -262,6 +263,7 @@ class Notifier:
             return results
 
         if self._is_configured(self.discord_webhook_url):
+            validate_egress_url(self.discord_webhook_url)
             try:
                 resp = self.session.post(
                     self.discord_webhook_url,
@@ -334,6 +336,7 @@ class Notifier:
             return results
 
         if self._is_configured(self.discord_webhook_url):
+            validate_egress_url(self.discord_webhook_url)
             try:
                 resp = self.session.post(
                     self.discord_webhook_url,

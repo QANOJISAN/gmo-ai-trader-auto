@@ -1499,9 +1499,13 @@ async function sendControl(command, nonce="") {
     return null;
   }
   try {
+    const csrfToken = window.__GMO_LOCAL_CSRF_TOKEN__ || "";
     const res = await fetch(`${activeApiBase}/api/control`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "X-GMO-CSRF-Token": csrfToken
+      },
       body: JSON.stringify({ command, nonce })
     });
     const data = await res.json();
