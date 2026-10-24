@@ -38,6 +38,236 @@ SOL_PRIORITY_SCORE_BONUS = 8.0
 BCH_MAX_SPREAD_PCT = 0.22
 TIER2_MAX_SELL_SLIPPAGE_PCT = 0.15
 TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY = 45000.0
+DOT_MIN_VOLUME_SURGE_RATIO = 1.80
+
+
+class SessionName(str):
+    """
+    `EU_US_OVERLAP_GOLDEN`（21:00〜03:00 JST）内の米主要マクロ経済指標発表10分間ウィンドウ
+    (`US_MACRO_ANNOUNCEMENT_WINDOW`: 平日 21:25〜21:35 / 22:25〜22:35 JST) において、
+    `"US_MACRO_ANNOUNCEMENT_WINDOW"` と `"EU_US_OVERLAP_GOLDEN"` の両方の識別名と一致判定できる互換文字列クラス。
+    """
+
+    _ALIASES = {
+        "US_MACRO_ANNOUNCEMENT_WINDOW": {"US_MACRO_ANNOUNCEMENT_WINDOW", "EU_US_OVERLAP_GOLDEN"},
+    }
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            s_self = super().__str__()
+            s_other = str.__str__(other) if isinstance(other, SessionName) else other
+            if s_self == s_other:
+                return True
+            return s_other in self._ALIASES.get(s_self, {s_self})
+        return super().__eq__(other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
+
+def is_in_us_macro_announcement_window(now_dt: Optional[datetime] = None) -> bool:
+    """
+    平日（月〜金）の 21:25〜21:35 JST（米国夏時間21:30指標前後5分）または
+    22:25〜22:35 JST（米国冬時間22:30指標前後5分）の10分間ウィンドウ内かどうかを判定する。
+    """
+    now_jst = _now_jst(now_dt)
+    if now_jst.weekday() not in (0, 1, 2, 3, 4):
+        return False
+    mins = now_jst.hour * 60 + now_jst.minute
+    in_2130 = (21 * 60 + 25) <= mins <= (21 * 60 + 35)
+    in_2230 = (22 * 60 + 25) <= mins <= (22 * 60 + 35)
+    return bool(in_2130 or in_2230)
+
+
+def evaluate_us_macro_announcement_window(now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    平日 21:30 / 22:30 JST（米主要マクロ経済指標発表）前後5分間のマイクロ・フィルタ状態を返す。
+    - 対象ウィンドウ: 平日 `21:25〜21:35 JST` および `22:25〜22:35 JST` (`US_MACRO_ANNOUNCEMENT_WINDOW`)
+    - 挙動: 新規買い指値の発注を一時保留 (`allow_new_buy = False`) し、
+      未約定の待機買い指値を一時退避 (`should_clear_pending_buys = True`)。
+      保有中建玉の取引所サーバー `STOP` 注文は絶対に解除せず維持 (`preserve_active_sl_orders = True`)。
+    """
+    now_jst = _now_jst(now_dt)
+    wd = now_jst.weekday()
+    mins = now_jst.hour * 60 + now_jst.minute
+    in_2130 = (wd in (0, 1, 2, 3, 4)) and ((21 * 60 + 25) <= mins <= (21 * 60 + 35))
+    in_2230 = (wd in (0, 1, 2, 3, 4)) and ((22 * 60 + 25) <= mins <= (22 * 60 + 35))
+    active = bool(in_2130 or in_2230)
+    slot_label = "21:25-21:35_JST" if in_2130 else ("22:25-22:35_JST" if in_2230 else "NONE")
+    return {
+        "in_us_macro_announcement_window": active,
+        "window_name": "US_MACRO_ANNOUNCEMENT_WINDOW" if active else "NONE",
+        "window_slot": slot_label,
+        "allow_new_buy": not active,
+        "should_clear_pending_buys": active,
+        "preserve_active_sl_orders": True,
+        "timestamp": now_jst.isoformat(timespec="seconds"),
+    }
+
+
+def evaluate_tier2_symbol_micro_conditions(
+    symbol: str,
+    now_dt: Optional[datetime] = None,
+    portfolio: Optional[Dict[str, Any]] = None,
+    market_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
+    ticker: Optional[Dict[str, Any]] = None,
+    jst_schedule_matrix: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Deep Research #2 表内の Tier 2 個別銘柄（`LINK`, `XLM`, `DOT`）細部マイクロ条件を評価する:
+    1. `LINK`: 欧米重複の最活況時間帯（平日 `21:00〜03:00 JST`）のみスキャン・発注を許可し、それ以外の時間帯は除外。
+    2. `XLM`: 原則として `XRP` を優先し、現在すでに `XRP` のポジションを保有中（または有効な `XRP` 買い指値が待機中）の場合のみ補完銘柄として許可。
+    3. `DOT`: 平常時の板薄スリッページ（1.32R損失拡大リスク）を防ぐため、出来高急増時（1h/4h出来高が移動平均の `1.8倍` 以上、または `volume_surge=True`）のみ許可。
+    """
+    sym_up = str(symbol or "").strip().upper()
+    pf = portfolio or {}
+    summaries = market_summaries or {}
+    sym_sum = summaries.get(sym_up, {}) if isinstance(summaries, dict) else {}
+    t_info = ticker or sym_sum.get("price", {}) or {}
+    h1_info = sym_sum.get("h1_indicators", {}) or {}
+    h4_info = sym_sum.get("h4_indicators", {}) or {}
+    daily_info = sym_sum.get("daily_indicators", {}) or {}
+
+    # 1) LINK: 欧米重複の最活況時間帯（平日 21:00〜03:00 JST）のみ許可
+    if sym_up == "LINK":
+        eff_now = now_dt or pf.get("now_dt") or sym_sum.get("now_dt")
+        if isinstance(eff_now, str):
+            try:
+                eff_now = datetime.fromisoformat(eff_now.replace("Z", "+00:00"))
+            except Exception:
+                eff_now = None
+
+        if jst_schedule_matrix is not None:
+            base_sess = str(jst_schedule_matrix.get("base_session_name") or jst_schedule_matrix.get("session_name") or "")
+            in_overlap = base_sess in ("EU_US_OVERLAP_GOLDEN", "US_MACRO_ANNOUNCEMENT_WINDOW")
+        elif eff_now is not None:
+            dt_jst = _now_jst(eff_now)
+            wd = dt_jst.weekday()
+            mins = dt_jst.hour * 60 + dt_jst.minute
+            # 月〜金の 21:00〜23:59 JST、または火〜土の 00:00〜02:59 JST
+            in_overlap = bool(
+                (wd in (0, 1, 2, 3, 4) and mins >= 21 * 60)
+                or (wd in (1, 2, 3, 4, 5) and mins < 3 * 60)
+            )
+        else:
+            # 時刻未指定時も明示フラグ `enforce_link_session_window` がなければ時刻チェックを実行
+            dt_jst = _now_jst(None)
+            wd = dt_jst.weekday()
+            mins = dt_jst.hour * 60 + dt_jst.minute
+            in_overlap = bool(
+                (wd in (0, 1, 2, 3, 4) and mins >= 21 * 60)
+                or (wd in (1, 2, 3, 4, 5) and mins < 3 * 60)
+            )
+
+        if not in_overlap:
+            return {
+                "symbol": sym_up,
+                "passed": False,
+                "failed_code": "LINK_OUTSIDE_EU_US_OVERLAP_WINDOW",
+                "reason": "LINK は欧米重複の最活況時間帯（平日 21:00〜03:00 JST）のみ許可されています。",
+            }
+        return {
+            "symbol": sym_up,
+            "passed": True,
+            "failed_code": None,
+            "reason": "LINK 欧米重複最活況時間帯 (21:00〜03:00 JST) 合格",
+        }
+
+    # 2) XLM: 原則 XRP を優先し、現在 XRP を保有中（または有効な XRP 買い指値が待機中）の場合のみ補完銘柄として許可
+    if sym_up == "XLM":
+        positions = pf.get("positions", []) or []
+        pending_orders = pf.get("pending_orders", []) or []
+        xrp_held = any(
+            str(p.get("symbol", "")).strip().upper() == "XRP"
+            and str(p.get("state", "PROTECTED")).strip().upper() != "DUST_QUARANTINED"
+            and float(p.get("size", 0) or 0) > 0
+            for p in positions
+        )
+        xrp_pending = any(
+            str(o.get("symbol", "")).strip().upper() == "XRP"
+            and str(o.get("side", "BUY")).strip().upper() == "BUY"
+            and str(o.get("state", "PENDING_BUY")).strip().upper() in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED")
+            for o in pending_orders
+        )
+        if not (xrp_held or xrp_pending):
+            return {
+                "symbol": sym_up,
+                "passed": False,
+                "failed_code": "XLM_REQUIRES_XRP_HELD_OR_PENDING",
+                "reason": "XLM は原則 XRP 優先のため、現在 XRP を保有中または買い指値待機中の場合のみ補完銘柄として許可されます。",
+                "xrp_held_or_pending": False,
+            }
+        return {
+            "symbol": sym_up,
+            "passed": True,
+            "failed_code": None,
+            "reason": "XLM 補完エントリー条件合格 (XRP 保有中または待機中)",
+            "xrp_held_or_pending": True,
+        }
+
+    # 3) DOT: 平常時の板薄スリッページ(1.32R)防止のため、出来高急増時 (1h/4h出来高倍率 >= 1.8x または volume_surge=True) のみ許可
+    if sym_up == "DOT":
+        raw_ratio = (
+            sym_sum.get("volume_ratio")
+            or t_info.get("volume_ratio")
+            or h1_info.get("volume_ratio")
+            or h4_info.get("volume_ratio")
+            or daily_info.get("volume_ratio")
+            or h1_info.get("relative_volume")
+            or h4_info.get("relative_volume")
+            or t_info.get("relative_volume")
+        )
+        vol_ratio: Optional[float] = float(raw_ratio) if raw_ratio is not None else None
+        if vol_ratio is None:
+            for blk in (h1_info, h4_info, daily_info, t_info):
+                v_cur = float(blk.get("volume", 0) or 0)
+                v_ma = float(blk.get("volume_sma_20") or blk.get("volume_ma") or blk.get("avg_volume") or 0)
+                if v_cur > 0 and v_ma > 0:
+                    vol_ratio = v_cur / v_ma
+                    break
+
+        explicit_surge = bool(
+            sym_sum.get("volume_surge")
+            or t_info.get("volume_surge")
+            or h1_info.get("volume_surge")
+            or h4_info.get("volume_surge")
+        )
+        if vol_ratio is not None:
+            passed_dot = bool(vol_ratio >= DOT_MIN_VOLUME_SURGE_RATIO)
+        else:
+            passed_dot = explicit_surge
+
+        eff_ratio = round(float(vol_ratio if vol_ratio is not None else (2.0 if explicit_surge else 1.0)), 4)
+        if not passed_dot:
+            return {
+                "symbol": sym_up,
+                "passed": False,
+                "failed_code": "DOT_NO_VOLUME_SURGE",
+                "reason": (
+                    f"DOT は平常時の板薄スリッページ(1.32R)防止のため、出来高急増時"
+                    f"(1h/4h出来高倍率 >= {DOT_MIN_VOLUME_SURGE_RATIO:.1f}x)のみ許可されます (現在={eff_ratio:.2f}x)。"
+                ),
+                "volume_ratio": eff_ratio,
+                "min_volume_surge_ratio": DOT_MIN_VOLUME_SURGE_RATIO,
+            }
+        return {
+            "symbol": sym_up,
+            "passed": True,
+            "failed_code": None,
+            "reason": f"DOT 出来高急増条件合格 (倍率={eff_ratio:.2f}x >= {DOT_MIN_VOLUME_SURGE_RATIO:.1f}x)",
+            "volume_ratio": eff_ratio,
+            "min_volume_surge_ratio": DOT_MIN_VOLUME_SURGE_RATIO,
+        }
+
+    return {
+        "symbol": sym_up,
+        "passed": True,
+        "failed_code": None,
+        "reason": "マイクロ条件対象外（常時通過）",
+    }
 
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
@@ -440,13 +670,46 @@ def evaluate_jst_session_and_schedule_matrix(
 
     # ------------------------------------------------------------------
     # ④-B 平日 21:00〜03:00 JST: 欧米重複ゴールデンタイム (EU_US_OVERLAP_GOLDEN)
+    #      ※平日 21:25〜21:35 JST および 22:25〜22:35 JST は米マクロ経済指標発表前後5分間の
+    #        マイクロ・フィルタ (`US_MACRO_ANNOUNCEMENT_WINDOW`: 新規BUY保留＆待機BUY退避、STOP維持)
     # ------------------------------------------------------------------
     if mins >= (21 * 60) or mins < (3 * 60):
+        macro_info = evaluate_us_macro_announcement_window(now_jst)
+        if macro_info["in_us_macro_announcement_window"]:
+            return {
+                "session_name": SessionName("US_MACRO_ANNOUNCEMENT_WINDOW"),
+                "base_session_name": "EU_US_OVERLAP_GOLDEN",
+                "sub_phase": "US_MACRO_ANNOUNCEMENT_WINDOW",
+                "block_reason": "US_MACRO_ANNOUNCEMENT_WINDOW",
+                "in_us_macro_announcement_window": True,
+                "us_macro_window_info": macro_info,
+                "allow_new_buy": False,
+                "allow_limit_modification": False,
+                "should_clear_pending_buys": True,
+                "preserve_active_sl_orders": True,
+                "should_pre_maintenance_exit": False,
+                "in_exchange_maintenance": False,
+                "post_maintenance_stabilization_wait": False,
+                "allowed_tiers": ["TIER1", "TIER2"],
+                "allowed_symbols": all_12_symbols,
+                "max_spread_pct": 0.35,
+                "confidence_threshold_delta": -0.02,
+                "limit_offset_atr_mult": 0.90,
+                "size_mult": 1.00,
+                "max_concurrent_slots": 2,
+                "order_ttl_mult": 1.00,
+                "allow_mode1_breakout_peg": False,
+                "cme_gap_info": None,
+            }
         return {
             "session_name": "EU_US_OVERLAP_GOLDEN",
+            "base_session_name": "EU_US_OVERLAP_GOLDEN",
+            "in_us_macro_announcement_window": False,
+            "us_macro_window_info": macro_info,
             "allow_new_buy": True,
             "allow_limit_modification": True,
             "should_clear_pending_buys": False,
+            "preserve_active_sl_orders": True,
             "should_pre_maintenance_exit": False,
             "in_exchange_maintenance": False,
             "post_maintenance_stabilization_wait": False,
@@ -464,18 +727,23 @@ def evaluate_jst_session_and_schedule_matrix(
 
     # ------------------------------------------------------------------
     # ④-A 平日 15:00〜21:00 JST (欧州参入 EUROPE_ACTIVE) および 06:15〜12:00 JST (東京午前 TOKYO_MORNING_ACTIVE)
+    #      ※LINK は欧米重複の最活況時間帯 (21:00〜03:00 JST) のみ対象のため、この時間帯の allowed_symbols から除外
     # ------------------------------------------------------------------
     session_label = "EUROPE_ACTIVE" if mins >= (15 * 60) else "TOKYO_MORNING_ACTIVE"
+    non_link_11_symbols = [s for s in all_12_symbols if s != "LINK"]
     return {
         "session_name": session_label,
+        "base_session_name": session_label,
+        "in_us_macro_announcement_window": False,
         "allow_new_buy": True,
         "allow_limit_modification": True,
         "should_clear_pending_buys": False,
+        "preserve_active_sl_orders": True,
         "should_pre_maintenance_exit": False,
         "in_exchange_maintenance": False,
         "post_maintenance_stabilization_wait": False,
         "allowed_tiers": ["TIER1", "TIER2"],
-        "allowed_symbols": all_12_symbols,
+        "allowed_symbols": non_link_11_symbols,
         "max_spread_pct": 0.35,
         "confidence_threshold_delta": 0.00,
         "limit_offset_atr_mult": 1.00,

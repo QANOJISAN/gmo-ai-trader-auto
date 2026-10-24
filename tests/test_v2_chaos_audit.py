@@ -4395,6 +4395,7 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             evaluate_mintrl_freeze_stage,
         )
         from src.radar import TechnicalRadar, evaluate_tier2_effective_depth_filter
+        import json
         from src.regime_filter import (
             BCH_MAX_SPREAD_PCT,
             BLACKLISTED_SYMBOLS,
@@ -4942,6 +4943,382 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             finally:
                 ro_conn.close()
             wal.close()
+
+    def test_round17_link_xlm_dot_micro_conditions_and_us_macro_announcement_window_audit(self) -> None:
+        """
+        Round 17 Audit Test (Deep Research #2 細部マイクロ条件4点の100%完全一致検証):
+        1. Tier 2 個別銘柄の細部フィルタ (`src/regime_filter.py`, `src/radar.py`, `src/validator.py`):
+           - `LINK`: 欧米重複の最活況時間帯（平日 21:00〜03:00 JST）のみスキャン・発注を許可し、それ以外の時間帯（例: 16:00 JST）は除外。
+           - `XLM`: 原則 `XRP` を優先し、現在すでに `XRP` ポジションを保有中（または有効な `XRP` 買い指値が待機中）の場合のみ補完銘柄として許可。
+           - `DOT`: 平常時の板薄スリッページ（1.32R損失拡大リスク）を防ぐため、出来高急増時（`volume_ratio >= 1.8`）のみ許可し、平常時はスキップ。
+        2. 平日 21:30 / 22:30 JST（米主要マクロ経済指標発表）前後5分間のマイクロ・フィルタ (`21:25〜21:35` / `22:25〜22:35 JST`):
+           - 新規買い指値の発注を一時保留 (`allow_new_buy=False`)。
+           - `AutoTraderDaemon.run_fast_cycle` にて未約定の待機買い指値 (`PENDING_BUY`) を一時退避（キャンセル）し、保有中建玉の取引所サーバー `STOP` 注文は絶対に解除せず維持。
+        """
+        import json
+        from src.regime_filter import (
+            DOT_MIN_VOLUME_SURGE_RATIO,
+            evaluate_jst_session_and_schedule_matrix,
+            evaluate_tier2_symbol_micro_conditions,
+            evaluate_us_macro_announcement_window,
+            is_in_us_macro_announcement_window,
+        )
+
+        deep_ob_link = {
+            "bids": [
+                {"price": "2000.0", "size": "15.0"},   # 30,000円
+                {"price": "1999.0", "size": "15.0"},   # 29,985円 (合計 59,985円 >= 45,000円)
+            ],
+            "asks": [{"price": "2001.0", "size": "15.0"}],
+        }
+
+        # ------------------------------------------------------------------
+        # 1-A. LINK: 平日 16:00 JST (EUROPE_ACTIVE) では除外、23:00 JST (EU_US_OVERLAP_GOLDEN) では許可
+        # ------------------------------------------------------------------
+        dt_1600 = datetime(2026, 10, 21, 16, 0, 0, tzinfo=JST)  # 水曜 16:00 JST
+        dt_2300 = datetime(2026, 10, 21, 23, 0, 0, tzinfo=JST)  # 水曜 23:00 JST (米指標ウィンドウ外)
+
+        link_cond_1600 = evaluate_tier2_symbol_micro_conditions("LINK", now_dt=dt_1600)
+        self.assertFalse(link_cond_1600["passed"])
+        self.assertEqual(link_cond_1600["failed_code"], "LINK_OUTSIDE_EU_US_OVERLAP_WINDOW")
+
+        link_cond_2300 = evaluate_tier2_symbol_micro_conditions("LINK", now_dt=dt_2300)
+        self.assertTrue(link_cond_2300["passed"])
+
+        # validator でも 16:00 JST の LINK BUY は HOLD へ補正され、23:00 JST では BUY が通ることを確認
+        link_summaries = {
+            "BTC": {"daily_indicators": {"trend": "STRONG_UPTREND"}, "h4_indicators": {"rsi_14": 58.0}},
+            "LINK": {
+                "price": {"last": 2000.0, "best_bid": 2000.0, "best_ask": 2001.0, "spread_pct": 0.05},
+                "daily_indicators": {"trend": "STRONG_UPTREND", "rsi_14": 55.0, "atr_14": 80.0},
+                "h4_indicators": {"close": 2000.0, "sma_25": 1950.0, "rsi_14": 52.0, "atr_14": 40.0},
+                "h1_indicators": {"rsi_14": 44.0, "atr_14": 25.0, "rsi_rebound": True},
+                "orderbook": deep_ob_link,
+            },
+        }
+        val_link_1600 = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "LINK",
+                "confidence": 0.85,
+                "limit_price": 2000.0,
+                "take_profit_price": 2120.0,
+                "stop_loss_price": 1960.0,
+                "now_dt": dt_1600,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries=link_summaries,
+        )
+        self.assertEqual(val_link_1600["action"], "HOLD")
+        self.assertTrue(val_link_1600.get("link_session_window_rejected"))
+        self.assertEqual(val_link_1600.get("tier2_micro_failed_code"), "LINK_OUTSIDE_EU_US_OVERLAP_WINDOW")
+
+        val_link_2300 = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "LINK",
+                "confidence": 0.85,
+                "limit_price": 2000.0,
+                "take_profit_price": 2120.0,
+                "stop_loss_price": 1960.0,
+                "now_dt": dt_2300,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries=link_summaries,
+        )
+        self.assertEqual(val_link_2300["action"], "BUY")
+
+        # ------------------------------------------------------------------
+        # 1-B. XLM: 原則 XRP 優先・XRP 保有中（または待機指値あり）の場合のみ補完銘柄として許可
+        # ------------------------------------------------------------------
+        deep_ob_xlm = {
+            "bids": [
+                {"price": "50.0", "size": "600.0"},    # 30,000円
+                {"price": "49.95", "size": "500.0"},   # 24,975円 (合計 54,975円 >= 45,000円)
+            ],
+            "asks": [{"price": "50.05", "size": "600.0"}],
+        }
+        xlm_summaries = {
+            "XLM": {
+                "price": {"last": 50.0, "best_bid": 50.0, "best_ask": 50.05, "spread_pct": 0.10},
+                "daily_indicators": {"trend": "STRONG_UPTREND", "rsi_14": 54.0, "atr_14": 2.0},
+                "h4_indicators": {"close": 50.0, "sma_25": 48.0, "rsi_14": 50.0, "atr_14": 1.2},
+                "h1_indicators": {"rsi_14": 42.0, "atr_14": 0.8, "rsi_rebound": True},
+                "orderbook": deep_ob_xlm,
+            }
+        }
+        # XRP 未保有時は XLM 単体エントリーを拒否
+        val_xlm_no_xrp = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "XLM",
+                "confidence": 0.85,
+                "limit_price": 50.0,
+                "take_profit_price": 53.0,
+                "stop_loss_price": 49.0,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": [], "pending_orders": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries=xlm_summaries,
+        )
+        self.assertEqual(val_xlm_no_xrp["action"], "HOLD")
+        self.assertTrue(val_xlm_no_xrp.get("xlm_requires_xrp_rejected"))
+        self.assertEqual(val_xlm_no_xrp.get("tier2_micro_failed_code"), "XLM_REQUIRES_XRP_HELD_OR_PENDING")
+
+        # XRP 保有中（または XRP 待機指値あり）の時は補完銘柄として許可
+        val_xlm_with_xrp = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "XLM",
+                "confidence": 0.85,
+                "limit_price": 50.0,
+                "take_profit_price": 53.0,
+                "stop_loss_price": 49.0,
+            },
+            portfolio={
+                "jpy_balance": 20025,
+                "initial_capital_jpy": 20000,
+                "positions": [],
+                "pending_orders": [
+                    {
+                        "order_id": "xrp_buy_1",
+                        "symbol": "XRP",
+                        "side": "BUY",
+                        "state": "PENDING_BUY",
+                        "limit_price": "100.0",
+                        "size": "80",
+                    }
+                ],
+            },
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries=xlm_summaries,
+        )
+        self.assertEqual(val_xlm_with_xrp["action"], "BUY")
+
+        # ------------------------------------------------------------------
+        # 1-C. DOT: 出来高急増時 (volume_ratio >= 1.8) のみ許可、平常出来高はスキップ
+        # ------------------------------------------------------------------
+        self.assertAlmostEqual(DOT_MIN_VOLUME_SURGE_RATIO, 1.80, places=2)
+        deep_ob_dot = {
+            "bids": [
+                {"price": "800.0", "size": "40.0"},    # 32,000円
+                {"price": "799.0", "size": "30.0"},    # 23,970円 (合計 55,970円 >= 45,000円)
+            ],
+            "asks": [{"price": "800.5", "size": "40.0"}],
+        }
+        dot_normal_summaries = {
+            "DOT": {
+                "price": {"last": 800.0, "best_bid": 800.0, "best_ask": 800.5, "spread_pct": 0.06},
+                "daily_indicators": {"trend": "STRONG_UPTREND", "rsi_14": 54.0, "atr_14": 30.0},
+                "h4_indicators": {"close": 800.0, "sma_25": 780.0, "rsi_14": 50.0, "atr_14": 18.0, "volume_ratio": 1.15},
+                "h1_indicators": {"rsi_14": 43.0, "atr_14": 12.0, "rsi_rebound": True, "volume_ratio": 1.20},
+                "orderbook": deep_ob_dot,
+            }
+        }
+        val_dot_normal = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "DOT",
+                "confidence": 0.85,
+                "limit_price": 800.0,
+                "take_profit_price": 848.0,
+                "stop_loss_price": 784.0,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries=dot_normal_summaries,
+        )
+        self.assertEqual(val_dot_normal["action"], "HOLD")
+        self.assertTrue(val_dot_normal.get("dot_volume_surge_rejected"))
+        self.assertEqual(val_dot_normal.get("tier2_micro_failed_code"), "DOT_NO_VOLUME_SURGE")
+
+        dot_surge_summaries = {
+            "DOT": {
+                "price": {"last": 800.0, "best_bid": 800.0, "best_ask": 800.5, "spread_pct": 0.06},
+                "daily_indicators": {"trend": "STRONG_UPTREND", "rsi_14": 54.0, "atr_14": 30.0},
+                "h4_indicators": {"close": 800.0, "sma_25": 780.0, "rsi_14": 50.0, "atr_14": 18.0, "volume_ratio": 2.15},
+                "h1_indicators": {"rsi_14": 43.0, "atr_14": 12.0, "rsi_rebound": True, "volume_ratio": 2.25, "volume_surge": True},
+                "orderbook": deep_ob_dot,
+            }
+        }
+        val_dot_surge = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "DOT",
+                "confidence": 0.85,
+                "limit_price": 800.0,
+                "take_profit_price": 848.0,
+                "stop_loss_price": 784.0,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries=dot_surge_summaries,
+        )
+        self.assertEqual(val_dot_surge["action"], "BUY")
+
+        # Radar でも LINK(16:00除外), XLM(XRP未保有時除外), DOT(平常出来高除外) が機能することを確認
+        radar_r17 = TechnicalRadar()
+        r17_trig_1600 = radar_r17.evaluate_triggers(
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": [], "pending_orders": []},
+            market_summaries={
+                **link_summaries,
+                **xlm_summaries,
+                **dot_normal_summaries,
+            },
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            now_dt=dt_1600,
+        )
+        self.assertNotIn("LINK", r17_trig_1600["candidate_symbols"])
+        self.assertNotIn("XLM", r17_trig_1600["candidate_symbols"])
+        self.assertNotIn("DOT", r17_trig_1600["candidate_symbols"])
+
+        # ------------------------------------------------------------------
+        # 2. 平日 21:30 / 22:30 JST 米主要マクロ経済指標発表前後5分間マイクロ・フィルタ
+        #    (21:25〜21:35 JST / 22:25〜22:35 JST)
+        # ------------------------------------------------------------------
+        dt_macro_2130 = datetime(2026, 10, 21, 21, 30, 0, tzinfo=JST)  # 水曜 21:30 JST (夏時間 8:30 ET)
+        dt_macro_2230 = datetime(2026, 10, 21, 22, 30, 0, tzinfo=JST)  # 水曜 22:30 JST (冬時間 8:30 EST)
+        dt_non_macro = datetime(2026, 10, 21, 21, 45, 0, tzinfo=JST)   # 水曜 21:45 JST (通常時)
+
+        self.assertTrue(is_in_us_macro_announcement_window(dt_macro_2130))
+        self.assertTrue(is_in_us_macro_announcement_window(dt_macro_2230))
+        self.assertFalse(is_in_us_macro_announcement_window(dt_non_macro))
+
+        m_macro_2130 = evaluate_jst_session_and_schedule_matrix(now_dt=dt_macro_2130)
+        self.assertEqual(m_macro_2130["session_name"], "US_MACRO_ANNOUNCEMENT_WINDOW")
+        self.assertTrue(m_macro_2130["in_us_macro_announcement_window"])
+        self.assertFalse(m_macro_2130["allow_new_buy"])
+        self.assertTrue(m_macro_2130["should_clear_pending_buys"])
+        self.assertTrue(m_macro_2130["preserve_active_sl_orders"])
+
+        # 新規BUYが米指標ウィンドウ中に一時保留 (HOLD) されることを確認
+        val_macro_hold = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "SOL",
+                "confidence": 0.90,
+                "limit_price": 25000.0,
+                "take_profit_price": 26500.0,
+                "stop_loss_price": 24500.0,
+                "now_dt": dt_macro_2130,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries={
+                "SOL": {
+                    "price": {"last": 25000.0, "best_bid": 25000.0, "best_ask": 25010.0, "spread_pct": 0.04},
+                    "daily_indicators": {"atr_14": 1000.0},
+                }
+            },
+        )
+        self.assertEqual(val_macro_hold["action"], "HOLD")
+        self.assertTrue(val_macro_hold.get("us_macro_announcement_window_rejected"))
+
+        # AutoTraderDaemon.run_fast_cycle(21:30 JST) で未約定買い指値のみ退避され、保有建玉の STOP 注文は維持されることを確認
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            pf_path = tmp_path / "portfolio.json"
+            hist_path = tmp_path / "history_log.csv"
+            dec_path = tmp_path / "latest_decision.json"
+            wal_path = tmp_path / "macro_test.sqlite3"
+
+            sl_oid = "9100000001"
+            seed_pf = {
+                "jpy_balance": 20025.0,
+                "initial_capital_jpy": 20000.0,
+                "positions": [
+                    {
+                        "symbol": "SOL",
+                        "size": 0.36,
+                        "entry_price": 25000.0,
+                        "current_price": 25100.0,
+                        "stop_loss_price": 24500.0,
+                        "take_profit_price": 26500.0,
+                        "state": "SL_ACTIVE",
+                        "sl_order_id": sl_oid,
+                        "opened_at": "2026-10-21T20:00:00+09:00",
+                    }
+                ],
+                "pending_orders": [],
+            }
+            pf_path.write_text(json.dumps(seed_pf, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            broker = PaperBroker(portfolio_path=pf_path)
+
+            # 2枠目: 待機中の未約定 BTC BUY 指値注文を発注
+            buy_ord = broker.place_order(
+                symbol="BTC",
+                side="BUY",
+                execution_type="LIMIT",
+                price="14000000",
+                size="0.0006",
+            )
+            buy_oid = str(buy_ord["order_id"])
+
+            init_pf = {
+                "jpy_balance": 20025.0,
+                "initial_capital_jpy": 20000.0,
+                "positions": [
+                    {
+                        "symbol": "SOL",
+                        "size": 0.36,
+                        "entry_price": 25000.0,
+                        "current_price": 25100.0,
+                        "stop_loss_price": 24500.0,
+                        "take_profit_price": 26500.0,
+                        "state": "SL_ACTIVE",
+                        "sl_order_id": sl_oid,
+                        "opened_at": "2026-10-21T20:00:00+09:00",
+                    }
+                ],
+                "pending_orders": [
+                    {
+                        "order_id": buy_oid,
+                        "symbol": "BTC",
+                        "side": "BUY",
+                        "execution_type": "LIMIT",
+                        "limit_price": 14000000.0,
+                        "size": 0.0006,
+                        "stop_loss_price": 13750000.0,
+                        "take_profit_price": 14600000.0,
+                        "state": "PENDING_BUY",
+                        "placed_at": "2026-10-21T21:10:00+09:00",
+                    }
+                ],
+            }
+            pf_path.write_text(json.dumps(init_pf, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            daemon = AutoTraderDaemon(
+                base_dir=tmp_path,
+                execution_mode="PAPER",
+                broker=broker,
+                dry_run_notify=True,
+            )
+            try:
+                fast_res = daemon.run_fast_cycle(
+                    tickers={
+                        "SOL": {"last": "25100", "bid": "25095", "ask": "25105", "high": "25150", "low": "25050"},
+                        "BTC": {"last": "14050000", "bid": "14049000", "ask": "14051000", "high": "14060000", "low": "14040000"},
+                    },
+                    now_dt=dt_macro_2130,
+                    exchange_status="OPEN",
+                )
+                ev_types = [e.get("type") for e in fast_res.get("events", [])]
+                self.assertIn("US_MACRO_ANNOUNCEMENT_PENDING_BUY_EVACUATED", ev_types)
+
+                pf_after = daemon.oco_manager.load_portfolio()
+                # 未約定の買い指値はキャンセルされて空になっていること
+                self.assertEqual(len(pf_after.get("pending_orders", [])), 0)
+                # 保有中の SOL ポジションと取引所サーバー STOP 注文は100%そのまま維持されていること
+                self.assertEqual(len(pf_after.get("positions", [])), 1)
+                self.assertEqual(pf_after["positions"][0]["sl_order_id"], sl_oid)
+                active_ids = {str(o.get("order_id")) for o in broker.get_active_orders()}
+                self.assertIn(sl_oid, active_ids)
+                self.assertNotIn(buy_oid, active_ids)
+            finally:
+                daemon.db_wal.close()
 
 
 if __name__ == "__main__":

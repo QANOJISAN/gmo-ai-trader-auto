@@ -60,12 +60,16 @@ from src.radar import TechnicalRadar, evaluate_tier2_effective_depth_filter
 from src.reconciler import ThreeWayReconciler
 from src.regime_filter import (
     BLACKLISTED_SYMBOLS,
+    DOT_MIN_VOLUME_SURGE_RATIO,
     TIER1_SYMBOLS,
     TIER2_SYMBOLS,
     MarketRegimeFilter,
     classify_symbol_tier,
     evaluate_cme_monday_gap,
     evaluate_jst_session_and_schedule_matrix,
+    evaluate_tier2_symbol_micro_conditions,
+    evaluate_us_macro_announcement_window,
+    is_in_us_macro_announcement_window,
 )
 from src.remote_control import RemoteControlManager, TieredNotificationDispatcher
 from src.system_lifecycle_guard import SystemLifecycleGuard
@@ -1053,13 +1057,14 @@ class AutoTraderDaemon:
 
         # 0b. 日次ロールオーバー直前 (05:45〜05:59 JST) 未約定 BUY 自動クリア
         mins_now = now_jst.hour * 60 + now_jst.minute
+        owner_actor = self.remote_control.allowed_owner_discord_id or None
         if (5 * 60 + 45) <= mins_now < (6 * 60):
             roll_day = now_jst.strftime("%Y-%m-%d")
             if self._last_rollover_clear_date != roll_day:
                 self._last_rollover_clear_date = roll_day
                 pf_roll = self.oco_manager.load_portfolio()
                 if pf_roll.get("pending_orders"):
-                    self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                    self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
 
         # 0c. 土曜 08:00 JST 待機注文クリア / 08:45〜08:49 JST メンテ前ポジションエグジット / 08:50〜08:55 JST 未約定 BUY 事前クリア
         pre_maint_events: List[Dict[str, Any]] = []
@@ -1067,7 +1072,7 @@ class AutoTraderDaemon:
             if (8 * 60) <= mins_now < (8 * 60 + 5) and not self.saturday_0800_cleared:
                 self.saturday_0800_cleared = True
                 if (self.oco_manager.load_portfolio().get("pending_orders") or []):
-                    self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                    self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
             if (8 * 60 + 45) <= mins_now < (8 * 60 + 50) and not self.saturday_0845_exited:
                 exit_res = self.execute_saturday_pre_maintenance_exit(now_dt=now_jst, tickers=tickers)
                 if exit_res.get("closed_positions") or exit_res.get("canceled_order_ids"):
@@ -1081,6 +1086,31 @@ class AutoTraderDaemon:
                     )
         if is_in_saturday_pre_maintenance_clear_window(now_jst) and not self.pre_maintenance_cleared:
             self.clear_pending_buys_before_maintenance(now_dt=now_jst)
+
+        # 0d. 平日 21:30 / 22:30 JST 米主要マクロ経済指標発表前後5分間 (21:25〜21:35 / 22:25〜22:35 JST) マイクロ・フィルタ:
+        #     未約定の待機買い指値 (PENDING_BUY) を一時退避（キャンセル）し、保有中建玉の取引所 STOP 注文は厳格に維持する
+        if is_in_us_macro_announcement_window(now_jst):
+            pf_macro = self.oco_manager.load_portfolio()
+            pending_buys_macro = [
+                o
+                for o in (pf_macro.get("pending_orders", []) or [])
+                if str(o.get("side", "BUY")).upper() == "BUY"
+            ]
+            if pending_buys_macro:
+                macro_win_info = evaluate_us_macro_announcement_window(now_jst)
+                c_macro = self.remote_control.cancel_pending_entries_only(
+                    actor_id=owner_actor,
+                    now_dt=now_jst,
+                )
+                pre_maint_events.append(
+                    {
+                        "type": "US_MACRO_ANNOUNCEMENT_PENDING_BUY_EVACUATED",
+                        "window_label": macro_win_info.get("window_label"),
+                        "canceled_buy_order_ids": c_macro.get("canceled_buy_order_ids", []),
+                        "preserved_sl_order_ids": c_macro.get("preserved_sl_order_ids", []),
+                        "timestamp": now_jst.isoformat(timespec="seconds"),
+                    }
+                )
 
         # 1. 土曜メンテナンス枠チェック (08:55〜11:05 JST) または 臨時・水曜メンテナンスステータス検知
         ex_stat_clean = (exchange_status or "").strip().upper()

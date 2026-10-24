@@ -24,11 +24,15 @@ from typing import Any, Dict, List, Optional, Union
 from src.regime_filter import (
     BCH_MAX_SPREAD_PCT,
     BLACKLISTED_SYMBOLS,
+    DOT_MIN_VOLUME_SURGE_RATIO,
     TIER1_SYMBOLS,
     TIER2_SYMBOLS,
     classify_symbol_tier,
     evaluate_cme_monday_gap,
     evaluate_jst_session_and_schedule_matrix,
+    evaluate_tier2_symbol_micro_conditions,
+    evaluate_us_macro_announcement_window,
+    is_in_us_macro_announcement_window,
 )
 
 logger = logging.getLogger(__name__)
@@ -1179,6 +1183,10 @@ def validate_and_adjust_decision(
             if not bool(jst_mat.get("allow_new_buy", True)):
                 adjusted["jst_schedule_rejected"] = True
                 adjusted["jst_schedule_reject_reason"] = str(jst_mat.get("block_reason") or jst_mat.get("session_name"))
+                if bool(jst_mat.get("in_us_macro_announcement_window", False)):
+                    adjusted["us_macro_announcement_window_rejected"] = True
+                    adjusted["should_clear_pending_buys"] = bool(jst_mat.get("should_clear_pending_buys", True))
+                    adjusted["preserve_active_sl_orders"] = bool(jst_mat.get("preserve_active_sl_orders", True))
                 return _hold_decision(
                     adjusted,
                     symbol=symbol,
@@ -1199,6 +1207,29 @@ def validate_and_adjust_decision(
                         f"現在時間帯の許可ティアは {allowed_tiers} のみのため、{symbol} ({tier_info['tier']}) の新規BUYを見送ります。"
                     ),
                 )
+            if symbol == "LINK":
+                link_micro = evaluate_tier2_symbol_micro_conditions(
+                    symbol="LINK",
+                    now_dt=adjusted.get("now_dt") or portfolio.get("now_dt"),
+                    portfolio=portfolio,
+                    market_summaries=market_summaries,
+                    ticker=((market_summaries or {}).get(symbol) or {}).get("price"),
+                    jst_schedule_matrix=jst_mat,
+                )
+                adjusted["tier2_micro_condition"] = link_micro
+                if not bool(link_micro.get("passed", True)):
+                    adjusted["jst_schedule_rejected"] = True
+                    adjusted["tier2_micro_condition_rejected"] = True
+                    adjusted["tier2_micro_failed_code"] = str(link_micro.get("failed_code", "LINK_OUTSIDE_EU_US_OVERLAP_WINDOW"))
+                    adjusted["link_session_window_rejected"] = True
+                    return _hold_decision(
+                        adjusted,
+                        symbol=symbol,
+                        reason_prefix=(
+                            f"[Tier 2 個別マイクロ条件 ({link_micro.get('failed_code')}) によりHOLDへ自動補正] "
+                            f"{link_micro.get('failed_reason')}"
+                        ),
+                    )
 
     max_concurrent = int(portfolio.get("max_concurrent_positions", 2))
     if jst_mat is not None and not is_legacy_10k_bch_mock and jst_mat.get("max_concurrent_slots") is not None:
@@ -1692,6 +1723,35 @@ def validate_and_adjust_decision(
                     reason_prefix=(
                         f"[Tier 2 実効板厚フィルタ ({t2_depth.get('failed_code')}) によりHOLDへ自動補正] "
                         f"{t2_depth.get('failed_reason')}"
+                    ),
+                )
+
+        # 2a-bis. Tier 2 個別銘柄細部マイクロ条件:
+        #   - XLM: 原則 XRP を優先し、XRP を保有中または有効な XRP 買い指値が待機中の場合のみ補完銘柄として許可
+        #   - DOT: 平常時の板薄スリッページ (1.32R損失拡大リスク) を防ぐため、出来高急増時 (>= 1.8x) のみ許可
+        if symbol in ("XLM", "DOT"):
+            t2_micro = evaluate_tier2_symbol_micro_conditions(
+                symbol=symbol,
+                now_dt=adjusted.get("now_dt") or portfolio.get("now_dt"),
+                portfolio=portfolio,
+                market_summaries=market_summaries,
+                ticker=price_info,
+                jst_schedule_matrix=jst_mat,
+            )
+            adjusted["tier2_micro_condition"] = t2_micro
+            if not bool(t2_micro.get("passed", True)):
+                adjusted["tier2_micro_condition_rejected"] = True
+                adjusted["tier2_micro_failed_code"] = str(t2_micro.get("failed_code", "TIER2_MICRO_CONDITION_REJECT"))
+                if symbol == "XLM":
+                    adjusted["xlm_requires_xrp_rejected"] = True
+                elif symbol == "DOT":
+                    adjusted["dot_volume_surge_rejected"] = True
+                return _hold_decision(
+                    adjusted,
+                    symbol=symbol,
+                    reason_prefix=(
+                        f"[Tier 2 個別マイクロ条件 ({t2_micro.get('failed_code')}) によりHOLDへ自動補正] "
+                        f"{t2_micro.get('failed_reason')}"
                     ),
                 )
 

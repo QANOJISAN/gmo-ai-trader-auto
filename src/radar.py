@@ -41,6 +41,7 @@ from src.indicators import (
 from src.regime_filter import (
     BCH_MAX_SPREAD_PCT,
     BLACKLISTED_SYMBOLS,
+    DOT_MIN_VOLUME_SURGE_RATIO,
     SOL_PRIORITY_SCORE_BONUS,
     TIER1_SYMBOLS,
     TIER2_MAX_SELL_SLIPPAGE_PCT,
@@ -50,6 +51,9 @@ from src.regime_filter import (
     classify_symbol_tier,
     evaluate_cme_monday_gap,
     evaluate_jst_session_and_schedule_matrix,
+    evaluate_tier2_symbol_micro_conditions,
+    evaluate_us_macro_announcement_window,
+    is_in_us_macro_announcement_window,
 )
 from src.validator import (
     DEFAULT_SYMBOL_RULES,
@@ -858,6 +862,19 @@ class TechnicalRadar:
                     if not t2_chk["passed"]:
                         gate3_skipped_symbols.append(sym_up)
                         continue
+                    # Deep Research #2 細部マイクロ条件: LINK(21:00〜03:00限定), XLM(XRP保有/待機時のみ補完), DOT(出来高急増>=1.8xのみ)
+                    if sym_up in ("LINK", "XLM", "DOT"):
+                        micro_cond = evaluate_tier2_symbol_micro_conditions(
+                            symbol=sym_up,
+                            now_dt=now_jst,
+                            portfolio=enriched_pf,
+                            market_summaries=market_summaries,
+                            ticker=price_info,
+                            jst_schedule_matrix=jst_schedule,
+                        )
+                        if not micro_cond["passed"]:
+                            gate3_skipped_symbols.append(sym_up)
+                            continue
 
                 # テーマ2-(2): BTC_DOMINANCE_DRAIN 時は BTC / ETH または対BTC相対強度上位のみに限定
                 rel_7d = float(
@@ -920,7 +937,7 @@ class TechnicalRadar:
                     candidate_symbols.append(sym_up)
 
             if candidate_symbols:
-                # SOL (+8.0pt) 等の優先スコアボーナス＋7日対BTC相対強度順で候補を優先ソート
+                # SOL (+8.0pt) 等の優先スコアボーナス＋XRPのXLM優先ルール＋7日対BTC相対強度順で候補を優先ソート
                 def _cand_priority_key(c_sym: str) -> float:
                     t_inf = classify_symbol_tier(c_sym)
                     c_sum = (market_summaries or {}).get(c_sym, {}) or {}
@@ -931,7 +948,20 @@ class TechnicalRadar:
                         )
                         or 0.0
                     )
-                    return float(t_inf["priority_score_bonus"]) + rs_val
+                    base_score = float(t_inf["priority_score_bonus"]) + rs_val
+                    # XLM は原則 XRP を優先選択するため、XRP が候補にいる場合または同スコア帯では常に XRP > XLM とする
+                    if c_sym == "XLM" and "XRP" in candidate_symbols:
+                        xrp_sum = (market_summaries or {}).get("XRP", {}) or {}
+                        xrp_rs = float(
+                            (xrp_sum.get("price") or {}).get(
+                                "relative_strength_vs_btc_7d_pct",
+                                (xrp_sum.get("daily_indicators") or {}).get("relative_strength_vs_btc_7d_pct", 0.0),
+                            )
+                            or 0.0
+                        )
+                        xrp_score = float(classify_symbol_tier("XRP")["priority_score_bonus"]) + xrp_rs
+                        base_score = min(base_score, xrp_score - 0.5)
+                    return base_score
 
                 candidate_symbols.sort(key=_cand_priority_key, reverse=True)
                 triggers.append("NEW_ENTRY_OPPORTUNITY")
