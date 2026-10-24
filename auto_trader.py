@@ -1667,9 +1667,14 @@ class AutoTraderDaemon:
                 self.radar_loop_sec,
                 self.order_expiry_hours,
             )
-            # 起動時 3-Way Reconciliation
-            self.reconciler.reconcile(now_dt=_now_jst())
-            self.last_reconcile_run_at = _now_jst()
+            # 起動時 3-Way Reconciliation（土曜定期メンテナンス枠を除く）
+            now_start = _now_jst()
+            if not is_in_saturday_maintenance_window(now_start):
+                try:
+                    self.reconciler.reconcile(now_dt=now_start)
+                    self.last_reconcile_run_at = now_start
+                except Exception as rec_exc:
+                    logger.warning("起動時 3-Way Reconciliation スキップ (メンテ中等): %s", rec_exc)
 
             cycle_count = 0
             while True:
@@ -1696,8 +1701,12 @@ class AutoTraderDaemon:
                             )
 
                 should_run_radar = (
-                    self.last_radar_run_at is None
-                    or (now_jst - self.last_radar_run_at).total_seconds() >= self.radar_loop_sec
+                    not self.in_maintenance_sleep
+                    and not is_in_saturday_maintenance_window(now_jst)
+                    and (
+                        self.last_radar_run_at is None
+                        or (now_jst - self.last_radar_run_at).total_seconds() >= self.radar_loop_sec
+                    )
                 )
                 if should_run_radar:
                     self.run_radar_and_ai_cycle(now_dt=now_jst)
