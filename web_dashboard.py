@@ -76,6 +76,10 @@ from src.remote_control import (
     ReplayOrExpiredNonceError,
     UnauthorizedCommandError,
 )
+from src.system_lifecycle_guard import (
+    configure_bot_process_isolation,
+    trim_process_working_set,
+)
 from src.validator import DEFAULT_SYMBOL_RULES
 
 logger = logging.getLogger("web_dashboard")
@@ -3430,6 +3434,11 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
+    try:
+        configure_bot_process_isolation(tier=3)
+    except Exception:
+        pass
+
     svc = WebDashboardService(port=args.port)
     try:
         svc.export_static_pwa_bundle(include_charts=True)
@@ -3440,6 +3449,11 @@ def main() -> int:
         logger.info("📄 docs/ への静的PWAスナップショット出力完了")
         svc.close()
         return 0
+
+    try:
+        trim_process_working_set()
+    except Exception:
+        pass
 
     server, _ = create_dashboard_http_server(host=args.host, port=args.port, service=svc)
     actual_port = server.server_address[1]
