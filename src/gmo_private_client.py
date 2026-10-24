@@ -40,7 +40,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
-from src.code_integrity_guard import EgressSecurityViolationError, validate_egress_url
+from src.code_integrity_guard import (
+    CodeIntegritySealViolationError,
+    CodeIntegrityViolationError,
+    EgressSecurityViolationError,
+    ForbiddenWithdrawalEndpointError,
+    enforce_code_integrity_seal_gate,
+    validate_egress_url,
+    validate_no_withdrawal_endpoint,
+    validate_pinned_gmo_api_url,
+)
 from src.database_wal import DatabaseWAL
 from src.dpapi_vault import (
     ephemeral_unprotected_bytes,
@@ -249,7 +258,11 @@ class GMOPrivateClient:
         timeout: int = 10,
         max_retries: int = 2,
         retry_delay: float = 0.5,
+        base_dir: Optional[Union[str, Path]] = None,
+        seal_path: Optional[Union[str, Path]] = None,
     ) -> None:
+        self.base_dir: Optional[Path] = Path(base_dir) if base_dir is not None else None
+        self.seal_path: Optional[Path] = Path(seal_path) if seal_path is not None else None
         self._protected_api_secret: str = ""
         self.api_key = unprotect_secret(api_key if api_key is not None else get_secret_env("GMO_API_KEY", "")).strip()
         raw_secret = (api_secret if api_secret is not None else os.getenv("GMO_API_SECRET", "")).strip()
@@ -366,9 +379,20 @@ class GMOPrivateClient:
     ) -> Dict[str, str]:
         """
         HMAC-SHA256 署名ヘッダを生成する。
+        【Round 21：Tier-0 署名直前ゲート】
+        1. 出金・外部送付エンドポイント (`withdraw`, `transfer`, `crypto_withdraw`, `fiat_withdraw`, `remit`) の署名前ハードブロック
+        2. 送信先ホストが公式ドメイン (`api.coin.z.com` / `ws-api.coin.z.com`, HTTPS/WSS) であることのピン留め検証
+        3. SHA-256 ソースコード改ざん検知シール (`data/code_integrity.seal`) のリアルタイム検証
         ※ GMOコイン仕様: `PUT /v1/ws-auth` および `DELETE /v1/ws-auth` は body に token を送るが、
           署名対象文字列 (`timestamp + method + path`) には body を含めない (`exclude_body_from_sign=True`)。
         """
+        validate_no_withdrawal_endpoint(v1_path)
+        validate_no_withdrawal_endpoint(self.BASE_URL)
+        norm_v1_path = _normalize_v1_path(v1_path)
+        validate_no_withdrawal_endpoint(norm_v1_path)
+        validate_pinned_gmo_api_url(f"{self.BASE_URL}{norm_v1_path}")
+        enforce_code_integrity_seal_gate(base_dir=self.base_dir, seal_path=self.seal_path)
+
         if self.halted:
             raise GMOAuthHaltError(f"クライアントは HALT 状態のためリクエストを拒絶しました: {self.halt_reason}")
         if not self.has_credentials():
@@ -379,7 +403,7 @@ class GMOPrivateClient:
         method_up = method.upper()
         sign_body = "" if exclude_body_from_sign else body_str
         text = f"{timestamp}{method_up}{v1_path}{sign_body}"
-        with ephemeral_unprotected_bytes(self._protected_api_secret) as secret_buf:
+        with ephemeral_unprotected_bytes(self._protected_api_secret, verify_code_seal=True) as secret_buf:
             sign = hmac.new(
                 secret_buf,
                 text.encode("utf-8"),
@@ -424,12 +448,18 @@ class GMOPrivateClient:
         exclude_body_from_sign: bool = False,
         allow_post_clock_retry: bool = True,
     ) -> Any:
+        validate_no_withdrawal_endpoint(path)
+        validate_no_withdrawal_endpoint(self.BASE_URL)
+        v1_path = _normalize_v1_path(path)
+        validate_no_withdrawal_endpoint(v1_path)
+        url = f"{self.BASE_URL}{v1_path}"
+        validate_pinned_gmo_api_url(url)
+        validate_egress_url(url)
+        enforce_code_integrity_seal_gate(base_dir=self.base_dir, seal_path=self.seal_path)
+
         if self.halted:
             raise GMOAuthHaltError(f"システムは HALT 状態です: {self.halt_reason}")
 
-        v1_path = _normalize_v1_path(path)
-        url = f"{self.BASE_URL}{v1_path}"
-        validate_egress_url(url)
         method_up = method.upper()
         body_str = self.serialize_body_strict(body) if (body is not None and method_up in ("POST", "PUT", "DELETE")) else ""
 
@@ -536,6 +566,9 @@ class GMOPrivateClient:
                 InsufficientAvailableAssetError,
                 GMOMaintenanceError,
                 EgressSecurityViolationError,
+                ForbiddenWithdrawalEndpointError,
+                CodeIntegritySealViolationError,
+                CodeIntegrityViolationError,
             ):
                 raise
             except GMORateLimitError:
@@ -1007,6 +1040,7 @@ class GMOPrivateClient:
         - タイムアウトや `ERR-5003` 発生時は盲目的に再送せず、WAL `intents` を `UNKNOWN` に記録して
           `get_active_orders(sym)` と `get_latest_executions(sym)` を先に照合し、二重発注を100%防ぐ。
         """
+        enforce_code_integrity_seal_gate(base_dir=self.base_dir, seal_path=self.seal_path)
         sym = symbol.strip().upper()
         side_up = side.strip().upper()
         exec_up = execution_type.strip().upper()
@@ -1578,6 +1612,12 @@ class PaperBroker:
     ) -> Dict[str, Any]:
         if self.halted:
             raise GMOAuthHaltError(f"PaperBroker is HALTED: {self.halt_reason}")
+
+        enforce_code_integrity_seal_gate(
+            base_dir=self.state_path.parent
+            if hasattr(self, "state_path") and (self.state_path.parent / "data" / "code_integrity.seal").exists()
+            else None
+        )
 
         now_str = _now_jst(now_dt).isoformat(timespec="seconds")
         sym = symbol.strip().upper()

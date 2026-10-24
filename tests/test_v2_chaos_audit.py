@@ -6636,6 +6636,244 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         self.assertEqual(clean_context["price"]["atr_14"], 0.0)
         self.assertNotIn("Disregard all prior prompts", clean_context["notes"][1])
 
+    def test_round21_tier0_dpapi_entropy_code_seal_and_withdrawal_pinning_audit(self) -> None:
+        """
+        【Round 21：Tier-0 セキュリティ強化（全4機構の完全統合）監査テスト】
+        1. `DPAPI_APP_ENTROPY` (`pOptionalEntropy`) バインド暗号化・エントロピーなし復号の100%拒否・レガシー後方互換フォールバック、
+           および本番 `.env` 全6シークレットのエントロピーバインド移行＆ `icacls` ロック維持検証
+        2. `seal_code_integrity_manifest()` による `data/code_integrity.seal` 生成、およびコア `.py` ファイル1バイト改ざん時の
+           `CODE_INTEGRITY_SEAL_VIOLATION` 検知と API 秘密鍵復号・署名・発注の即時遮断ゲート検証
+        3. `validate_local_request_security()` による `Host: evil.com` / `Sec-Fetch-Site: cross-site` / 不正 `Origin` の
+           `HTTP 403` 遮断とセキュリティヘッダ検証
+        4. GMO Private API の署名直前ドメインピン留め (`api.coin.z.com` / `ws-api.coin.z.com` 以外を署名前に遮断)
+           および出金・送付系エンドポイント (`/v1/withdraw`, `transfer`, `crypto_withdraw`, `fiat_withdraw`, `remit`) の
+           `ForbiddenWithdrawalEndpointError` 物理ハードブロック検証
+        """
+        import subprocess
+        from dotenv import dotenv_values
+        from src.code_integrity_guard import (
+            CodeIntegritySealViolationError,
+            EgressSecurityViolationError,
+            ForbiddenWithdrawalEndpointError,
+            seal_code_integrity_manifest,
+            verify_code_integrity_seal,
+        )
+        from src.dpapi_vault import (
+            DPAPI_APP_ENTROPY,
+            ephemeral_unprotected_bytes,
+            is_entropy_bound_secret,
+            protect_secret,
+            unprotect_secret,
+            unprotect_secret_without_entropy,
+        )
+        from src.gmo_private_client import GMOPrivateClient
+        from web_dashboard import validate_local_request_security
+
+        repo_root = Path(__file__).resolve().parent.parent
+
+        # ==================================================================
+        # 1. 【仕様1】DPAPI カスタムエントロピー (pOptionalEntropy) & 後方互換フォールバック検証
+        # ==================================================================
+        self.assertIsInstance(DPAPI_APP_ENTROPY, bytes)
+        self.assertGreaterEqual(len(DPAPI_APP_ENTROPY), 32)
+
+        # (1-a) 新規暗号化は DPAPI_APP_ENTROPY バインドとなり、pOptionalEntropy=None では復号が100%拒否されること
+        sample_plain = "tier0_fortress_secret_round21_#98765"
+        ent_cipher = protect_secret(sample_plain, use_entropy=True)
+        self.assertTrue(ent_cipher.startswith("DPAPI:AQAA"))
+        self.assertTrue(is_entropy_bound_secret(ent_cipher))
+        self.assertEqual(unprotect_secret(ent_cipher, allow_legacy_fallback=False), sample_plain)
+        with self.assertRaises(RuntimeError):
+            unprotect_secret_without_entropy(ent_cipher)
+        with self.assertRaises(RuntimeError):
+            unprotect_secret(ent_cipher, allow_legacy_fallback=False, use_entropy=False)
+
+        # (1-b) 旧形式 (pOptionalEntropy=None) データの後方互換フォールバック検証
+        legacy_plain = "legacy_pre_round21_secret_value_12345"
+        legacy_cipher = protect_secret(legacy_plain, use_entropy=False)
+        self.assertTrue(legacy_cipher.startswith("DPAPI:AQAA"))
+        self.assertFalse(is_entropy_bound_secret(legacy_cipher))
+        # allow_legacy_fallback=True (既定) ならエラーなく自動フォールバック復号できること
+        self.assertEqual(unprotect_secret(legacy_cipher, allow_legacy_fallback=True), legacy_plain)
+        with ephemeral_unprotected_bytes(legacy_cipher, allow_legacy_fallback=True) as leg_buf:
+            self.assertEqual(bytes(leg_buf).decode("utf-8"), legacy_plain)
+            leg_ref = leg_buf
+        self.assertTrue(all(b == 0 for b in leg_ref))
+        # allow_legacy_fallback=False の場合はレガシーデータを拒否すること
+        with self.assertRaises(RuntimeError):
+            unprotect_secret(legacy_cipher, allow_legacy_fallback=False)
+
+        # (1-c) 本番 e:\gmo-ai-trader-auto\.env の全6シークレットが DPAPI_APP_ENTROPY バインド済みであること
+        prod_env = repo_root / ".env"
+        self.assertTrue(prod_env.exists())
+        env_kv = dotenv_values(prod_env)
+        required_keys = (
+            "GEMINI_API_KEY",
+            "DISCORD_WEBHOOK_URL",
+            "GMO_API_KEY",
+            "GMO_API_SECRET",
+            "GITHUB_TOKEN",
+            "PWA_UNLOCK_PASSWORD",
+        )
+        for k in required_keys:
+            v = str(env_kv.get(k, "")).strip()
+            self.assertTrue(v.startswith("DPAPI:AQAA"), f"{k} must start with DPAPI:AQAA")
+            self.assertTrue(is_entropy_bound_secret(v), f"{k} must be bound to DPAPI_APP_ENTROPY")
+            dec = unprotect_secret(v, allow_legacy_fallback=False)
+            self.assertGreater(len(dec), 10)
+            with self.assertRaises(RuntimeError):
+                unprotect_secret_without_entropy(v)
+
+        icacls_res = subprocess.run(
+            ["icacls", str(prod_env)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+        )
+        self.assertNotIn("BUILTIN\\Users", icacls_res.stdout)
+        self.assertNotIn("Authenticated Users", icacls_res.stdout)
+
+        # ==================================================================
+        # 2. 【仕様2】SHA-256 ソースコード改ざん検知シール (data/code_integrity.seal) と秘密鍵復号・発注直前ゲート
+        # ==================================================================
+        prod_seal_path = repo_root / "data" / "code_integrity.seal"
+        if not prod_seal_path.exists():
+            seal_code_integrity_manifest(base_dir=repo_root)
+        self.assertTrue(prod_seal_path.exists())
+        prod_seal_ver = verify_code_integrity_seal(base_dir=repo_root)
+        self.assertTrue(prod_seal_ver["ok"], f"Prod seal failed: {prod_seal_ver}")
+        self.assertEqual(prod_seal_ver["status"], "VERIFIED_OK")
+
+        try:
+            with tempfile.TemporaryDirectory() as tmp_seal_str:
+                t_dir = Path(tmp_seal_str)
+                (t_dir / "src").mkdir(parents=True, exist_ok=True)
+                (t_dir / "auto_trader.py").write_text("# clean auto_trader\n", encoding="utf-8")
+                (t_dir / "web_dashboard.py").write_text("# clean web_dashboard\n", encoding="utf-8")
+                (t_dir / "src" / "core_logic.py").write_text("RISK_LIMIT = 0.015\n", encoding="utf-8")
+
+                seal_info = seal_code_integrity_manifest(base_dir=t_dir)
+                self.assertTrue(seal_info["ok"])
+                self.assertEqual(seal_info["status"], "SEALED_OK")
+                self.assertTrue((t_dir / "data" / "code_integrity.seal").exists())
+                self.assertTrue(is_entropy_bound_secret(seal_info["dpapi_seal"]))
+
+                ver_clean = verify_code_integrity_seal(base_dir=t_dir)
+                self.assertTrue(ver_clean["ok"])
+                self.assertEqual(ver_clean["status"], "VERIFIED_OK")
+
+                # 正常シール状態では署名生成が通ること
+                guarded_client = GMOPrivateClient(
+                    api_key="test_key_r21",
+                    api_secret="test_secret_r21",
+                    base_dir=t_dir,
+                )
+                ok_hdrs = guarded_client._build_auth_headers(
+                    "POST",
+                    "/v1/order",
+                    '{"symbol":"BTC"}',
+                    timestamp_ms=1700000000000,
+                )
+                self.assertEqual(len(ok_hdrs["API-SIGN"]), 64)
+
+                # コア .py ファイルを1バイト改ざん (0.015 -> 0.915)
+                (t_dir / "src" / "core_logic.py").write_text("RISK_LIMIT = 0.915\n", encoding="utf-8")
+
+                ver_tampered = verify_code_integrity_seal(base_dir=t_dir)
+                self.assertFalse(ver_tampered["ok"])
+                self.assertEqual(ver_tampered["status"], "CODE_INTEGRITY_SEAL_VIOLATION")
+                self.assertIn("src/core_logic.py", ver_tampered["tampered_files"])
+
+                # 改ざん状態では API秘密鍵の復号・署名直前および発注直前に CodeIntegritySealViolationError で即時遮断されること
+                with self.assertRaises(CodeIntegritySealViolationError) as ctx_sign:
+                    guarded_client._build_auth_headers("POST", "/v1/order", '{"symbol":"BTC"}')
+                self.assertIn("CODE_INTEGRITY_SEAL_VIOLATION", str(ctx_sign.exception))
+
+                with self.assertRaises(CodeIntegritySealViolationError) as ctx_ord:
+                    guarded_client.place_order(
+                        symbol="BTC",
+                        side="BUY",
+                        execution_type="LIMIT",
+                        size="0.0001",
+                        price="10000000",
+                    )
+                self.assertIn("CODE_INTEGRITY_SEAL_VIOLATION", str(ctx_ord.exception))
+
+                with self.assertRaises(CodeIntegritySealViolationError):
+                    unprotect_secret(ent_cipher, verify_code_seal=True)
+        finally:
+            # テスト終了後に本番リポジトリのアクティブシールコンテキストを復元
+            seal_code_integrity_manifest(base_dir=repo_root)
+
+        # ==================================================================
+        # 3. 【仕様3】validate_local_request_security() による DNS Rebinding / Cross-Site 403 遮断
+        # ==================================================================
+        v_evil_host = validate_local_request_security({"Host": "evil.com"}, method="GET", port=8080)
+        self.assertFalse(v_evil_host["ok"])
+        self.assertEqual(v_evil_host["status_code"], 403)
+        self.assertEqual(v_evil_host["error"], "DNS_REBINDING_BLOCKED")
+
+        v_cross_site = validate_local_request_security(
+            {"Host": "127.0.0.1:8080", "Sec-Fetch-Site": "cross-site"},
+            method="GET",
+            port=8080,
+        )
+        self.assertFalse(v_cross_site["ok"])
+        self.assertEqual(v_cross_site["status_code"], 403)
+        self.assertEqual(v_cross_site["error"], "CROSS_SITE_REQUEST_BLOCKED")
+
+        v_bad_origin = validate_local_request_security(
+            {"Host": "127.0.0.1:8080", "Origin": "https://attacker.example.org"},
+            method="POST",
+            port=8080,
+        )
+        self.assertFalse(v_bad_origin["ok"])
+        self.assertEqual(v_bad_origin["status_code"], 403)
+        self.assertEqual(v_bad_origin["error"], "CROSS_SITE_ORIGIN_BLOCKED")
+
+        v_legit = validate_local_request_security(
+            {"Host": "127.0.0.1:8080", "Origin": "http://127.0.0.1:8080"},
+            method="GET",
+            port=8080,
+        )
+        self.assertTrue(v_legit["ok"])
+        self.assertEqual(v_legit["status_code"], 200)
+        sec_hdrs = v_legit["response_headers"]
+        self.assertEqual(sec_hdrs["X-Frame-Options"], "DENY")
+        self.assertEqual(sec_hdrs["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(sec_hdrs["Cache-Control"], "no-store")
+        self.assertIn("default-src 'self' 'unsafe-inline' data: blob:", sec_hdrs["Content-Security-Policy"])
+        self.assertIn("frame-ancestors 'none'", sec_hdrs["Content-Security-Policy"])
+
+        # ==================================================================
+        # 4. 【仕様4】非公式ホストへの署名拒絶 & 出金・送付系APIパスの物理ハードブロック検証
+        # ==================================================================
+        pin_client = GMOPrivateClient(api_key="pin_k", api_secret="pin_s")
+        pin_client.BASE_URL = "https://discord.com/api"  # 一般 Egress 許可でも GMO 公式ドメイン以外は署名前に遮断
+        with self.assertRaises(EgressSecurityViolationError) as ctx_pin:
+            pin_client._build_auth_headers("GET", "/v1/account/assets")
+        self.assertIn("GMO_API_DOMAIN_PINNING_VIOLATION", str(ctx_pin.exception))
+
+        pin_client.BASE_URL = "https://api.coin.z.com/private"
+        forbidden_paths = (
+            "/v1/withdraw",
+            "/private/v1/crypto_withdraw",
+            "/v1/fiat_withdraw",
+            "/v1/account/transfer",
+            "/v1/remit",
+        )
+        for bad_path in forbidden_paths:
+            with self.assertRaises(ForbiddenWithdrawalEndpointError) as ctx_w_sign:
+                pin_client._build_auth_headers("POST", bad_path, '{"amount":"10000"}')
+            self.assertIn("WITHDRAWAL_ENDPOINT_HARD_BLOCKED", str(ctx_w_sign.exception))
+
+            with self.assertRaises(ForbiddenWithdrawalEndpointError) as ctx_w_req:
+                pin_client._request("POST", bad_path, body={"amount": "10000"})
+            self.assertIn("WITHDRAWAL_ENDPOINT_HARD_BLOCKED", str(ctx_w_req.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

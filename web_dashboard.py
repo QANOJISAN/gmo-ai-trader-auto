@@ -3247,6 +3247,159 @@ setInterval(() => {
 """
 
 
+DEFAULT_LOCAL_SECURITY_HEADERS: Dict[str, str] = {
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+    "Cache-Control": "no-store",
+    "Content-Security-Policy": (
+        "default-src 'self' 'unsafe-inline' data: blob:; "
+        "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
+        "frame-ancestors 'none'"
+    ),
+}
+
+
+def validate_local_request_security(
+    headers: Any,
+    method: str = "GET",
+    port: int = 8080,
+    expected_csrf_token: Optional[str] = None,
+    require_csrf: bool = False,
+) -> Dict[str, Any]:
+    """
+    【Round 21：実装仕様 3】
+    ローカルWebダッシュボード (`127.0.0.1:8080`) のゼロトラスト・セキュリティ検証関数:
+    1. `Host` ヘッダが `127.0.0.1:8080`, `localhost:8080`, `127.0.0.1`, `localhost`, `[::1]`
+       （およびバインドポート `port`）以外の場合は即座に `HTTP 403 Forbidden` (`DNS_REBINDING_BLOCKED`) を返す。
+    2. `Origin` / `Referer` ヘッダが存在する場合にローカル以外を `HTTP 403` (`CROSS_SITE_ORIGIN_BLOCKED`) で拒否し、
+       `Sec-Fetch-Site: cross-site` のリクエストも `HTTP 403` (`CROSS_SITE_REQUEST_BLOCKED`) で遮断する。
+    3. 全レスポンスに付与すべきセキュリティヘッダ (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`,
+       `Cache-Control: no-store`, `Content-Security-Policy: default-src 'self' 'unsafe-inline' data: blob:; ...; frame-ancestors 'none'`)
+       を `response_headers` として返す。
+    """
+    sec_headers = dict(DEFAULT_LOCAL_SECURITY_HEADERS)
+
+    def _get_hdr(name: str) -> str:
+        if headers is None:
+            return ""
+        if isinstance(headers, dict):
+            target_l = name.lower()
+            for k, v in headers.items():
+                if str(k).lower() == target_l and v is not None:
+                    return str(v)
+            return ""
+        if hasattr(headers, "get"):
+            val = headers.get(name)
+            return str(val) if val is not None else ""
+        return ""
+
+    raw_host = _get_hdr("Host").strip().lower()
+    if not raw_host:
+        return {
+            "ok": False,
+            "allowed": False,
+            "status_code": int(HTTPStatus.FORBIDDEN),
+            "error": "DNS_REBINDING_BLOCKED",
+            "detail": "Missing Host header",
+            "response_headers": sec_headers,
+        }
+
+    if raw_host.startswith("["):
+        bracket_end = raw_host.find("]")
+        host_only = raw_host[1:bracket_end] if bracket_end > 1 else raw_host
+        port_part = (
+            raw_host[bracket_end + 2 :]
+            if (bracket_end > 1 and len(raw_host) > bracket_end + 1 and raw_host[bracket_end + 1] == ":")
+            else ""
+        )
+    elif ":" in raw_host:
+        host_only, port_part = raw_host.rsplit(":", 1)
+    else:
+        host_only, port_part = raw_host, ""
+
+    allowed_hosts = {"127.0.0.1", "localhost", "::1"}
+    allowed_ports = {8080, int(port)} if int(port or 0) > 0 else {8080}
+    port_invalid = bool(
+        port_part
+        and (
+            not port_part.isdigit()
+            or (int(port or 0) > 0 and int(port_part) not in allowed_ports)
+        )
+    )
+
+    if host_only not in allowed_hosts or port_invalid:
+        return {
+            "ok": False,
+            "allowed": False,
+            "status_code": int(HTTPStatus.FORBIDDEN),
+            "error": "DNS_REBINDING_BLOCKED",
+            "detail": f"Untrusted Host header: {raw_host}",
+            "response_headers": sec_headers,
+        }
+
+    sec_fetch_site = _get_hdr("Sec-Fetch-Site").strip().lower()
+    if sec_fetch_site == "cross-site":
+        return {
+            "ok": False,
+            "allowed": False,
+            "status_code": int(HTTPStatus.FORBIDDEN),
+            "error": "CROSS_SITE_REQUEST_BLOCKED",
+            "detail": "Sec-Fetch-Site: cross-site is forbidden",
+            "response_headers": sec_headers,
+        }
+
+    for hdr_name in ("Origin", "Referer"):
+        hdr_val = _get_hdr(hdr_name).strip()
+        if not hdr_val:
+            continue
+        if hdr_val.lower() == "null":
+            return {
+                "ok": False,
+                "allowed": False,
+                "status_code": int(HTTPStatus.FORBIDDEN),
+                "error": "CROSS_SITE_ORIGIN_BLOCKED",
+                "detail": f"Null {hdr_name} header is forbidden",
+                "response_headers": sec_headers,
+            }
+        parsed_hdr = urlparse(hdr_val)
+        hdr_host = (parsed_hdr.hostname or "").strip().lower()
+        if hdr_host not in allowed_hosts:
+            return {
+                "ok": False,
+                "allowed": False,
+                "status_code": int(HTTPStatus.FORBIDDEN),
+                "error": "CROSS_SITE_ORIGIN_BLOCKED",
+                "detail": f"Untrusted {hdr_name} host: {hdr_host}",
+                "response_headers": sec_headers,
+            }
+
+    method_up = str(method or "GET").strip().upper()
+    enforce_csrf = bool(
+        require_csrf or (expected_csrf_token is not None and method_up in ("POST", "PUT", "DELETE", "PATCH"))
+    )
+    if enforce_csrf:
+        client_token = _get_hdr("X-GMO-CSRF-Token").strip()
+        exp_token = str(expected_csrf_token or "").strip()
+        if not client_token or not exp_token or not hmac.compare_digest(client_token, exp_token):
+            return {
+                "ok": False,
+                "allowed": False,
+                "status_code": int(HTTPStatus.FORBIDDEN),
+                "error": "CSRF_TOKEN_INVALID_OR_MISSING",
+                "detail": "Valid X-GMO-CSRF-Token header is required for state-changing POST requests",
+                "response_headers": sec_headers,
+            }
+
+    return {
+        "ok": True,
+        "allowed": True,
+        "status_code": int(HTTPStatus.OK),
+        "error": "",
+        "detail": "OK",
+        "response_headers": sec_headers,
+    }
+
+
 def make_dashboard_handler(service: WebDashboardService):
     """`WebDashboardService` をバインドした HTTP リクエストハンドラクラスを生成する"""
 
@@ -3261,15 +3414,8 @@ def make_dashboard_handler(service: WebDashboardService):
             self.send_header("Access-Control-Allow-Private-Network", "true")
 
         def _send_security_headers(self, cache_control: str = "no-store") -> None:
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header(
-                "Content-Security-Policy",
-                "default-src 'self' 'unsafe-inline' data: blob:; "
-                "connect-src 'self' http://127.0.0.1:* http://localhost:*; "
-                "frame-ancestors 'none';",
-            )
+            for hdr_k, hdr_v in DEFAULT_LOCAL_SECURITY_HEADERS.items():
+                self.send_header(hdr_k, hdr_v)
 
         def _send_bytes(self, status_code: int, content_type: str, data: bytes, cache_control: str = "no-store") -> None:
             self.send_response(status_code)
@@ -3294,92 +3440,25 @@ def make_dashboard_handler(service: WebDashboardService):
         def _verify_zero_trust_request(self, require_csrf: bool = False) -> bool:
             """
             ローカルWebダッシュボード (`127.0.0.1:8080`) のゼロトラスト防御検証:
-            1. DNS Rebinding 遮断 (`Host` ヘッダーが `127.0.0.1` / `localhost` / `[::1]` 以外は 403)
-            2. Cross-Site リクエスト遮断 (`Sec-Fetch-Site: cross-site` または不正 `Origin` / `Referer` は 403)
-            3. `POST` リクエスト時の CSPRNG セッショントークン (`X-GMO-CSRF-Token`) 検証
+            `validate_local_request_security` を呼び出し、違反時は即座に HTTP 403 Forbidden を返す。
             """
-            raw_host = (self.headers.get("Host") or "").strip().lower()
-            if not raw_host:
+            verdict = validate_local_request_security(
+                headers=self.headers,
+                method=getattr(self, "command", "GET"),
+                port=int(getattr(service, "port", 8080) or 8080),
+                expected_csrf_token=str(getattr(service, "local_csrf_token", "") or "") if require_csrf else None,
+                require_csrf=require_csrf,
+            )
+            if not verdict.get("ok", False):
                 self._send_json(
-                    HTTPStatus.FORBIDDEN,
-                    {"ok": False, "error": "DNS_REBINDING_BLOCKED", "detail": "Missing Host header"},
-                )
-                return False
-
-            if raw_host.startswith("["):
-                bracket_end = raw_host.find("]")
-                host_only = raw_host[1:bracket_end] if bracket_end > 1 else raw_host
-                port_part = raw_host[bracket_end + 2 :] if (bracket_end > 1 and len(raw_host) > bracket_end + 1 and raw_host[bracket_end + 1] == ":") else ""
-            elif ":" in raw_host:
-                host_only, port_part = raw_host.rsplit(":", 1)
-            else:
-                host_only, port_part = raw_host, ""
-
-            allowed_hosts = {"127.0.0.1", "localhost", "::1"}
-            if host_only not in allowed_hosts or (port_part and not port_part.isdigit()):
-                self._send_json(
-                    HTTPStatus.FORBIDDEN,
+                    HTTPStatus(int(verdict.get("status_code", 403))),
                     {
                         "ok": False,
-                        "error": "DNS_REBINDING_BLOCKED",
-                        "detail": f"Untrusted Host header: {raw_host}",
+                        "error": str(verdict.get("error", "FORBIDDEN")),
+                        "detail": str(verdict.get("detail", "Forbidden")),
                     },
                 )
                 return False
-
-            sec_fetch_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
-            if sec_fetch_site == "cross-site":
-                self._send_json(
-                    HTTPStatus.FORBIDDEN,
-                    {
-                        "ok": False,
-                        "error": "CROSS_SITE_REQUEST_BLOCKED",
-                        "detail": "Sec-Fetch-Site: cross-site is forbidden",
-                    },
-                )
-                return False
-
-            for hdr_name in ("Origin", "Referer"):
-                hdr_val = (self.headers.get(hdr_name) or "").strip()
-                if not hdr_val:
-                    continue
-                if hdr_val.lower() == "null":
-                    self._send_json(
-                        HTTPStatus.FORBIDDEN,
-                        {
-                            "ok": False,
-                            "error": "CROSS_SITE_ORIGIN_BLOCKED",
-                            "detail": f"Null {hdr_name} header is forbidden",
-                        },
-                    )
-                    return False
-                parsed_hdr = urlparse(hdr_val)
-                hdr_host = (parsed_hdr.hostname or "").strip().lower()
-                if hdr_host not in allowed_hosts:
-                    self._send_json(
-                        HTTPStatus.FORBIDDEN,
-                        {
-                            "ok": False,
-                            "error": "CROSS_SITE_ORIGIN_BLOCKED",
-                            "detail": f"Untrusted {hdr_name} host: {hdr_host}",
-                        },
-                    )
-                    return False
-
-            if require_csrf:
-                client_token = (self.headers.get("X-GMO-CSRF-Token") or "").strip()
-                expected_token = str(getattr(service, "local_csrf_token", "") or "").strip()
-                if not client_token or not expected_token or not hmac.compare_digest(client_token, expected_token):
-                    self._send_json(
-                        HTTPStatus.FORBIDDEN,
-                        {
-                            "ok": False,
-                            "error": "CSRF_TOKEN_INVALID_OR_MISSING",
-                            "detail": "Valid X-GMO-CSRF-Token header is required for state-changing POST requests",
-                        },
-                    )
-                    return False
-
             return True
 
         def do_OPTIONS(self) -> None:
@@ -3536,6 +3615,7 @@ def create_dashboard_http_server(
     svc.port = int(port)
     handler_cls = make_dashboard_handler(svc)
     server = ThreadingHTTPServer((host, int(port)), handler_cls)
+    svc.port = int(server.server_address[1])
     return server, svc
 
 

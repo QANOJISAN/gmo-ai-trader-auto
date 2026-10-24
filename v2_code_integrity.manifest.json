@@ -1,9 +1,9 @@
 {
   "schema_version": "2.0-round20-dpapi-hmac",
   "algorithm": "HMAC-SHA256",
-  "updated_at": "2026-10-24T16:56:28+09:00",
+  "updated_at": "2026-10-24T17:22:51+09:00",
   "file_count": 33,
-  "dpapi_hmac_key": "DPAPI:AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAVQ4qzwF1/kqjb/UcvUcKiwAAAAAwAAAAZwBtAG8ALQBhAGkALQB0AHIAYQBkAGUAcgAtAHYAMgAtAHMAZQBjAHIAZQB0AAAAEGYAAAABAAAgAAAA3lfTtFFDklqXa9YLTQ89GdzbqXMGhGLOS4ZBYGAVx60AAAAADoAAAAACAAAgAAAAesxwxJC2HEtfJhzvQMJOPBm+PrYJEhNUy8QJtSkB2rxgAAAAl2uvYSgVXWH8m4zV9OtZjQyrF0AZWwYrbWAYHOZ/91xvcP46FOxD0lg+Q/cyDhl4Z2N/cb3CCxRCvt9+Yj0d/HA2ZKqNmRfgUVRpmnJ5OXGam4lXaOVvPTGgNSPUav/JQAAAAJrYyjtaytUdLJxagunHipJ/EykDvhZ74LFlJjpJ2fsDMaVZl1Zz+Ma9bZhkguNyDdRj62YrSGg481q4VERtwZc=",
+  "dpapi_hmac_key": "DPAPI:AQAAANCMnd8BFdERjHoAwE/Cl+sBAAAAVQ4qzwF1/kqjb/UcvUcKiwAAAAAwAAAAZwBtAG8ALQBhAGkALQB0AHIAYQBkAGUAcgAtAHYAMgAtAHMAZQBjAHIAZQB0AAAAEGYAAAABAAAgAAAAkYMCAbMupUHjwWHFasizZ9m3VLt2IHpIbUyQ3L3k7N8AAAAADoAAAAACAAAgAAAAvQaNPMktvobCU5pbQyQi7N7Mzu+bkJUU+Ad3hpFRf21gAAAAidQ44HVQd0q3VNWHfMa753ILTJG81BvFTrYs1ZDC448tk6ZK+ZhKfq5q1649OYlnWPB41SBSZ1hNxqJ89QldmAcLJme4MDf1w02YDdCuEKyLb5lKSbzMEGNJHBae4ZKdQAAAADp9jOp8dU32FpDj5eCcc3O0c3H+oTBPNrj31n8Df//GhyhmCRWbLWWv+Zim6YZJX/o3P+OYTtKd89LIUVMYAMQ=",
   "files": {
     "auto_trader.py": "a60435b0e4638c6008bb1fb4466e6fa5e70d5af6a1bd31b0f0c2476242d25dfc",
     "generate_report.py": "39a2b17a2a9b3bd10e3c92801d8542dc560200c2cc73474b6ece4eb9d8ccf942",
@@ -14,13 +14,13 @@
     "src/adverse_selection_guard.py": "c0288a4cca066dbee83d100ef51255e3320905bf162ec6a9f87f950c30a7b487",
     "src/ai_judge.py": "c47e1aeeb34962711cd00cd87987076ceb835c1e4b160a93087bfbb52f6e9d29",
     "src/circuit_breaker.py": "13c2797573122069acd303e6dc93de43d4f6044662bdf7b83d35a155dc4e3872",
-    "src/code_integrity_guard.py": "2f347f1674849942ed200f8d5854c9d6796c6302914f77f0cdf2308234c621bb",
+    "src/code_integrity_guard.py": "2b4cc658ee7dba2c36fa5093a6743452758d3b0c23cf3878a408e3a157477f7d",
     "src/database_wal.py": "f791b4ce59ec9b2aac3333c940e84e435f89fe4fa44524d996d3887e60d8286b",
-    "src/dpapi_vault.py": "50cd282990d212137e5586dede7db2d4274d911c2beec51986ebfec6cd4ebce7",
+    "src/dpapi_vault.py": "5c6732502c897cf35e9514cd027f8354dbbb37fcd685bd3875f1fde4aa5d0aee",
     "src/forensic_tax_auditor.py": "6249531b4583561d413e4e7ef7065fe96a7e1054f05150bc9ebccacfc8858932",
     "src/global_risk_bus.py": "216f10037bc2687932a059c3c35d8b4aeb548384c11af71b32e15d5a9b7df5d1",
     "src/gmo_client.py": "50d54be96a298ec9330924eca9f631e098048ada73150d3aaa17b36e8f0e5ed6",
-    "src/gmo_private_client.py": "1f497745ed9f4418669bb1a2d163cd5c641703d28cb7919124a04d974b60a77b",
+    "src/gmo_private_client.py": "0ef9e06cf4bb9c888d7f66a9a77f9919dc67c85ea19cd1765b7d2c792bc04d74",
     "src/indicators.py": "c021059f740d426bbc1a5fc82f59dafab0d2e328bda3d7841d07da16b0c40455",
     "src/json_utils.py": "a42bec38453d0a661fc64be1f1689f44daf6fe2e2c04a6f9e2b5894a2fa56def",
     "src/live_probe.py": "a00e00276066df215ce803c2e1d936e9f99a016d9bac511874fc5eef284d0245",
@@ -37,7 +37,7 @@
     "src/validator.py": "66c47def8a015a0449cbb45960387acd23e54351b0a6547e48b380c9836d3ab3",
     "src/wfa_backtester.py": "af1739fc95578b5e51d1e0befa026687ad590d0a5d61fa54c0f147c05b2fdc6c",
     "src/ws_hybrid_engine.py": "364ee2fba7f0252d007782d7ef18e2ade212b9753e0bbd7a0c5f31aa3884714c",
-    "web_dashboard.py": "0a94950e5cedb24eac923db7feef84c4283f195338c3cfba07e289e9d95517d5"
+    "web_dashboard.py": "ab22f2d03bfdb2b5d7cf9b77bae0c76068d5af80bffd1b827f3c26f0e7b1fd4f"
   },
-  "hmac_sha256": "2fbe5c1a1f3f06e48db46d0f0754cedc3e0f56cd6f3d807f9dab817f65094ceb"
+  "hmac_sha256": "8e18956b34d5e49ce97c1ef78ee61bb6f2d06526dd2fa4fa38b0021c620c5bab"
 }

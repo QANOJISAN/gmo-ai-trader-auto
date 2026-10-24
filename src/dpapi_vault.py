@@ -14,12 +14,18 @@ import ctypes
 from ctypes import wintypes
 import os
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, Optional, Union
+from typing import Any, Dict, Iterable, Iterator, Optional, Tuple, Union
 
 from dotenv import dotenv_values, load_dotenv
 
 DPAPI_PREFIX = "DPAPI:"
 CRYPTPROTECT_UI_FORBIDDEN = 0x01
+
+# 【Round 21：Tier-0 セキュリティ強化】
+# 同一Windowsユーザー権限で動作するブラウザや汎用Infostealerが単体で
+# CryptUnprotectData(..., None, ...) を呼び出しても復号できないよう、
+# プロジェクト固有のカスタムエントロピー (pOptionalEntropy) をバインドする。
+DPAPI_APP_ENTROPY: bytes = b"gmo-ai-trader-v2::tier0-entropy-salt::2026-fortress-v21"
 
 DEFAULT_SECRET_KEYS = (
     "GEMINI_API_KEY",
@@ -82,11 +88,99 @@ def is_dpapi_protected(value: Optional[str]) -> bool:
     return value.strip().startswith(DPAPI_PREFIX)
 
 
-def protect_secret(plaintext: str) -> str:
+def _build_entropy_blob(
+    entropy_bytes: Optional[bytes] = DPAPI_APP_ENTROPY,
+) -> Tuple[Optional[DATA_BLOB], Any]:
     """
-    平文シークレットを現在の Windows ユーザーコンテキスト (DPAPI) で暗号化し、
+    `CryptProtectData` / `CryptUnprotectData` の第3引数 `pOptionalEntropy` に渡す
+    `DATA_BLOB` と基底バッファのタプルを生成する。
+    """
+    if not entropy_bytes:
+        return None, None
+    raw_ent = bytes(entropy_bytes)
+    ent_buf = ctypes.create_string_buffer(raw_ent, len(raw_ent))
+    ent_blob = DATA_BLOB(len(raw_ent), ctypes.cast(ent_buf, ctypes.POINTER(ctypes.c_char)))
+    return ent_blob, ent_buf
+
+
+def _crypt_unprotect_raw(
+    encrypted_bytes: bytes,
+    entropy_bytes: Optional[bytes] = DPAPI_APP_ENTROPY,
+) -> Tuple[bool, bytes, int]:
+    """
+    指定された `entropy_bytes` (`None` または `DPAPI_APP_ENTROPY`) を `pOptionalEntropy` に指定して
+    `CryptUnprotectData` を1回呼び出し、`(ok, decrypted_bytes, win_error_code)` を返す。
+    OS が割り当てた `blob_out.pbData` はコピー直後に `0x00` 上書き消去（Zeroize）してから `LocalFree` する。
+    """
+    in_buf = ctypes.create_string_buffer(encrypted_bytes, len(encrypted_bytes))
+    blob_in = DATA_BLOB(len(encrypted_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = DATA_BLOB()
+    ent_blob, _ent_buf = _build_entropy_blob(entropy_bytes)
+    ent_ptr = ctypes.byref(ent_blob) if ent_blob is not None else None
+
+    ok = _crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in),
+        None,
+        ent_ptr,
+        None,
+        None,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        ctypes.byref(blob_out),
+    )
+    if not ok:
+        err_code = int(ctypes.GetLastError())
+        return False, b"", err_code
+
+    try:
+        decrypted_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        if blob_out.pbData:
+            try:
+                if blob_out.cbData > 0:
+                    ctypes.memset(ctypes.cast(blob_out.pbData, ctypes.c_void_p), 0, int(blob_out.cbData))
+            except Exception:
+                pass
+            _kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+
+    return True, decrypted_bytes, 0
+
+
+def is_entropy_bound_secret(value: Optional[str]) -> bool:
+    """
+    `DPAPI:<base64>` 文字列が `DPAPI_APP_ENTROPY` (`pOptionalEntropy`) 付きで暗号化されており、
+    かつエントロピーなし (`pOptionalEntropy=None`) では復号が拒否されるかどうかを判定する。
+    """
+    if not is_dpapi_protected(value):
+        return False
+    b64_payload = str(value).strip()[len(DPAPI_PREFIX) :].strip()
+    if not b64_payload:
+        return False
+    try:
+        encrypted_bytes = base64.b64decode(b64_payload)
+    except Exception:
+        return False
+    ok_ent, dec_ent, _ = _crypt_unprotect_raw(encrypted_bytes, DPAPI_APP_ENTROPY)
+    if not ok_ent:
+        return False
+    # 復号テストで得た一時 bytes は参照を破棄し、エントロピーなし(None)で失敗することを確認
+    del dec_ent
+    ok_none, dec_none, _ = _crypt_unprotect_raw(encrypted_bytes, None)
+    del dec_none
+    return bool(ok_ent and not ok_none)
+
+
+def protect_secret(
+    plaintext: str,
+    use_entropy: bool = True,
+    force_reencrypt: bool = False,
+) -> str:
+    """
+    平文シークレットを現在の Windows ユーザーコンテキスト ＋ `DPAPI_APP_ENTROPY` (`pOptionalEntropy`) で暗号化し、
     `DPAPI:<base64>` 形式の文字列を返す。
-    既に `DPAPI:` で始まっている場合は二重暗号化せずそのまま返す。
+    - 既に `DPAPI:` で始まっている場合:
+      * `force_reencrypt=False` (既定) の場合は二重暗号化せずそのまま返す。
+      * `force_reencrypt=True` の場合は一旦復号（レガシーフォールバック可）した上で、
+        指定された `use_entropy` 条件で新しい `DPAPI:AQAA...` に再暗号化する。
     """
     if plaintext is None:
         return ""
@@ -94,17 +188,23 @@ def protect_secret(plaintext: str) -> str:
     if not cleaned:
         return ""
     if cleaned.startswith(DPAPI_PREFIX):
-        return cleaned
+        if not force_reencrypt:
+            return cleaned
+        cleaned = unprotect_secret(cleaned, allow_legacy_fallback=True, use_entropy=True)
+        if not cleaned:
+            return ""
 
     raw_bytes = cleaned.encode("utf-8")
     in_buf = ctypes.create_string_buffer(raw_bytes, len(raw_bytes))
     blob_in = DATA_BLOB(len(raw_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
     blob_out = DATA_BLOB()
+    ent_blob, _ent_buf = _build_entropy_blob(DPAPI_APP_ENTROPY if use_entropy else None)
+    ent_ptr = ctypes.byref(ent_blob) if ent_blob is not None else None
 
     ok = _crypt32.CryptProtectData(
         ctypes.byref(blob_in),
         "gmo-ai-trader-v2-secret",
-        None,
+        ent_ptr,
         None,
         None,
         CRYPTPROTECT_UI_FORBIDDEN,
@@ -124,11 +224,28 @@ def protect_secret(plaintext: str) -> str:
     return f"{DPAPI_PREFIX}{b64_str}"
 
 
-def unprotect_secret(value: Optional[str]) -> str:
+def unprotect_secret(
+    value: Optional[str],
+    allow_legacy_fallback: bool = True,
+    use_entropy: bool = True,
+    verify_code_seal: bool = False,
+) -> str:
     """
     `DPAPI:<base64>` 形式の文字列を Windows DPAPI でオンメモリ復号して平文を返す。
-    `DPAPI:` で始まらない通常の平文が渡された場合は後方互換としてそのまま返す。
+    - `use_entropy=True` (既定):
+      1. まず `pOptionalEntropy=DPAPI_APP_ENTROPY` 付きで復号を試行する。
+      2. もし旧形式（`pOptionalEntropy=None` で暗号化されたレガシーデータ）であり、
+         かつ `allow_legacy_fallback=True` の場合は自動的に `pOptionalEntropy=None` へフォールバックして復号する。
+      3. `allow_legacy_fallback=False` の場合はフォールバックを行わず、エントロピー不一致なら即例外を送出する。
+    - `use_entropy=False`:
+      * エントロピーなし (`pOptionalEntropy=None`) での直接復号のみを試行する
+        （汎用Infostealerによる `CryptUnprotectData(..., None, ...)` 呼び出しが拒否されることの検証用）。
     """
+    if verify_code_seal:
+        from src.code_integrity_guard import enforce_code_integrity_seal_gate
+
+        enforce_code_integrity_seal_gate()
+
     if value is None:
         return ""
     cleaned = str(value).strip()
@@ -137,40 +254,41 @@ def unprotect_secret(value: Optional[str]) -> str:
     if not cleaned.startswith(DPAPI_PREFIX):
         return cleaned
 
-    b64_payload = cleaned[len(DPAPI_PREFIX):].strip()
+    b64_payload = cleaned[len(DPAPI_PREFIX) :].strip()
     if not b64_payload:
         return ""
 
     encrypted_bytes = base64.b64decode(b64_payload)
-    in_buf = ctypes.create_string_buffer(encrypted_bytes, len(encrypted_bytes))
-    blob_in = DATA_BLOB(len(encrypted_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
-    blob_out = DATA_BLOB()
 
-    ok = _crypt32.CryptUnprotectData(
-        ctypes.byref(blob_in),
-        None,
-        None,
-        None,
-        None,
-        CRYPTPROTECT_UI_FORBIDDEN,
-        ctypes.byref(blob_out),
-    )
-    if not ok:
-        err_code = ctypes.GetLastError()
-        raise RuntimeError(f"CryptUnprotectData failed with Windows error code: {err_code}")
+    if use_entropy:
+        ok, dec_bytes, err_code = _crypt_unprotect_raw(encrypted_bytes, DPAPI_APP_ENTROPY)
+        if ok:
+            return dec_bytes.decode("utf-8")
+        if allow_legacy_fallback:
+            ok_leg, dec_leg, err_leg = _crypt_unprotect_raw(encrypted_bytes, None)
+            if ok_leg:
+                return dec_leg.decode("utf-8")
+            err_code = err_leg
+        raise RuntimeError(
+            f"CryptUnprotectData failed with Windows error code: {err_code} "
+            f"(use_entropy={use_entropy}, allow_legacy_fallback={allow_legacy_fallback})"
+        )
+    else:
+        ok_none, dec_none, err_none = _crypt_unprotect_raw(encrypted_bytes, None)
+        if not ok_none:
+            raise RuntimeError(
+                f"CryptUnprotectData without entropy rejected (Windows error code: {err_none})"
+            )
+        return dec_none.decode("utf-8")
 
-    try:
-        decrypted_bytes = ctypes.string_at(blob_out.pbData, blob_out.cbData)
-    finally:
-        if blob_out.pbData:
-            try:
-                if blob_out.cbData > 0:
-                    ctypes.memset(ctypes.cast(blob_out.pbData, ctypes.c_void_p), 0, int(blob_out.cbData))
-            except Exception:
-                pass
-            _kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
 
-    return decrypted_bytes.decode("utf-8")
+def unprotect_secret_without_entropy(value: Optional[str]) -> str:
+    """
+    検証用ヘルパー：エントロピーなし (`pOptionalEntropy=None`, `allow_legacy_fallback=False`) で
+    直接 `CryptUnprotectData` を呼び出す。
+    `DPAPI_APP_ENTROPY` で保護されたシークレットに対して呼び出すと100%復号が拒否され `RuntimeError` となる。
+    """
+    return unprotect_secret(value, allow_legacy_fallback=False, use_entropy=False)
 
 
 def zeroize_bytearray(buf: Optional[bytearray]) -> int:
@@ -187,13 +305,24 @@ def zeroize_bytearray(buf: Optional[bytearray]) -> int:
 
 
 @contextlib.contextmanager
-def ephemeral_unprotected_bytes(value: Optional[str]) -> Iterator[bytearray]:
+def ephemeral_unprotected_bytes(
+    value: Optional[str],
+    allow_legacy_fallback: bool = True,
+    use_entropy: bool = True,
+    verify_code_seal: bool = False,
+) -> Iterator[bytearray]:
     """
     Just-In-Time (JIT) 復号コンテキストマネージャ：
-    Windows `Crypt32.dll` (`CryptUnprotectData`) で復号した秘密鍵をミュータブルな `bytearray` として一時生成し、
+    Windows `Crypt32.dll` (`CryptUnprotectData` + `DPAPI_APP_ENTROPY`、レガシー自動フォールバック対応) で
+    復号した秘密鍵をミュータブルな `bytearray` として一時生成し、
     `with ephemeral_unprotected_bytes(...) as secret_buf:` ブロックを抜けた瞬間に
     `ctypes.memset` でメモリ上のバッファを `0x00` で完全に上書き消去（Zeroize）する。
     """
+    if verify_code_seal:
+        from src.code_integrity_guard import enforce_code_integrity_seal_gate
+
+        enforce_code_integrity_seal_gate()
+
     secret_buf = bytearray()
     if value is not None:
         cleaned = str(value).strip()
@@ -201,39 +330,28 @@ def ephemeral_unprotected_bytes(value: Optional[str]) -> Iterator[bytearray]:
             if not cleaned.startswith(DPAPI_PREFIX):
                 secret_buf = bytearray(cleaned.encode("utf-8"))
             else:
-                b64_payload = cleaned[len(DPAPI_PREFIX):].strip()
+                b64_payload = cleaned[len(DPAPI_PREFIX) :].strip()
                 if b64_payload:
                     encrypted_bytes = base64.b64decode(b64_payload)
-                    in_buf = ctypes.create_string_buffer(encrypted_bytes, len(encrypted_bytes))
-                    blob_in = DATA_BLOB(len(encrypted_bytes), ctypes.cast(in_buf, ctypes.POINTER(ctypes.c_char)))
-                    blob_out = DATA_BLOB()
-                    ok = _crypt32.CryptUnprotectData(
-                        ctypes.byref(blob_in),
-                        None,
-                        None,
-                        None,
-                        None,
-                        CRYPTPROTECT_UI_FORBIDDEN,
-                        ctypes.byref(blob_out),
-                    )
-                    if not ok:
-                        err_code = ctypes.GetLastError()
-                        raise RuntimeError(f"CryptUnprotectData failed with Windows error code: {err_code}")
-                    try:
-                        raw_dec = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+                    if use_entropy:
+                        ok, raw_dec, err_code = _crypt_unprotect_raw(encrypted_bytes, DPAPI_APP_ENTROPY)
+                        if not ok and allow_legacy_fallback:
+                            ok, raw_dec, err_code = _crypt_unprotect_raw(encrypted_bytes, None)
+                        if not ok:
+                            raise RuntimeError(
+                                f"CryptUnprotectData failed with Windows error code: {err_code} "
+                                f"(use_entropy={use_entropy}, allow_legacy_fallback={allow_legacy_fallback})"
+                            )
                         secret_buf = bytearray(raw_dec)
-                    finally:
-                        if blob_out.pbData:
-                            try:
-                                if blob_out.cbData > 0:
-                                    ctypes.memset(
-                                        ctypes.cast(blob_out.pbData, ctypes.c_void_p),
-                                        0,
-                                        int(blob_out.cbData),
-                                    )
-                            except Exception:
-                                pass
-                            _kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+                        del raw_dec
+                    else:
+                        ok_none, raw_dec_none, err_none = _crypt_unprotect_raw(encrypted_bytes, None)
+                        if not ok_none:
+                            raise RuntimeError(
+                                f"CryptUnprotectData without entropy rejected (Windows error code: {err_none})"
+                            )
+                        secret_buf = bytearray(raw_dec_none)
+                        del raw_dec_none
     try:
         yield secret_buf
     finally:
@@ -311,10 +429,13 @@ def encrypt_dotenv_secrets_inplace(
     dotenv_path: Union[str, Path],
     secret_keys: Iterable[str] = DEFAULT_SECRET_KEYS,
     extra_secrets: Optional[Dict[str, str]] = None,
+    force_entropy_migration: bool = True,
 ) -> Dict[str, str]:
     """
-    指定された `.env` ファイル内の対象シークレットキーの値をインプレースで `DPAPI:AQAA...` 形式へ暗号化する。
-    `extra_secrets` が指定された場合は新規キーまたは更新キーとして DPAPI 暗号化して保存する。
+    指定された `.env` ファイル内の対象シークレットキーの値をインプレースで
+    `DPAPI_APP_ENTROPY` バインド済みの `DPAPI:AQAA...` 形式へ暗号化（またはレガシー形式から移行）する。
+    既存の `.env` ファイルが存在する場合は Windows NTFS ACL (`icacls` ロック) を破壊しないよう
+    既存ファイルディスクリプタに対して直接インプレース書き込みを行う。
     """
     target_path = Path(dotenv_path)
     key_set = {str(k).strip() for k in secret_keys}
@@ -337,10 +458,18 @@ def encrypt_dotenv_secrets_inplace(
         if k_clean in extras:
             v_clean = extras[k_clean]
         if k_clean in key_set and v_clean and not v_clean.startswith("your_"):
-            enc_val = protect_secret(v_clean)
+            if is_dpapi_protected(v_clean):
+                if force_entropy_migration and not is_entropy_bound_secret(v_clean):
+                    enc_val = protect_secret(v_clean, use_entropy=True, force_reencrypt=True)
+                    status_map[k_clean] = "DPAPI_ENTROPY_MIGRATED"
+                else:
+                    enc_val = v_clean
+                    status_map[k_clean] = "DPAPI_ENCRYPTED"
+            else:
+                enc_val = protect_secret(v_clean, use_entropy=True)
+                status_map[k_clean] = "DPAPI_ENCRYPTED"
             new_lines.append(f"{k_clean}={enc_val}\n")
             seen_keys.add(k_clean)
-            status_map[k_clean] = "DPAPI_ENCRYPTED"
         else:
             new_lines.append(line)
             seen_keys.add(k_clean)
@@ -350,11 +479,16 @@ def encrypt_dotenv_secrets_inplace(
 
     for ex_k, ex_v in extras.items():
         if ex_k not in seen_keys and ex_v:
-            enc_val = protect_secret(ex_v)
+            enc_val = protect_secret(ex_v, use_entropy=True, force_reencrypt=True)
             new_lines.append(f"{ex_k}={enc_val}\n")
             status_map[ex_k] = "DPAPI_ENCRYPTED"
 
-    tmp_path = target_path.with_suffix(".env.tmp")
-    tmp_path.write_text("".join(new_lines), encoding="utf-8")
-    os.replace(tmp_path, target_path)
+    content_out = "".join(new_lines)
+    if target_path.exists():
+        # NTFS の既存 DACL (icacls アクセス権) を100%維持するためインプレース書き込み
+        target_path.write_text(content_out, encoding="utf-8")
+    else:
+        tmp_path = target_path.with_suffix(".env.tmp")
+        tmp_path.write_text(content_out, encoding="utf-8")
+        os.replace(tmp_path, target_path)
     return status_map
