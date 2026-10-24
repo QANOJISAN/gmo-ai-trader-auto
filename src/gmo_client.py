@@ -25,9 +25,14 @@ JST = timezone(timedelta(hours=9))
 CORE_SPOT_SYMBOLS = ["BTC", "ETH", "SOL", "XRP"]
 DEFAULT_SPOT_SYMBOLS = ["BTC", "ETH", "XRP", "SOL", "DOGE"]
 
+# Deep Research #2: 全17銘柄の3ティア分類・5銘柄永久ブラックリスト
+TIER1_SYMBOLS = {"BTC", "ETH", "XRP", "SOL"}
+TIER2_SYMBOLS = {"DOGE", "SUI", "LTC", "BCH", "LINK", "ADA", "XLM", "DOT"}
+BLACKLISTED_SYMBOLS = {"FCR", "NAC", "WILD", "ASTR", "ATOM"}
+
 # 取扱廃止予定銘柄および超低流動性・特殊銘柄（スクリーニング対象から常時除外）
 DELISTING_SPOT_SYMBOLS = {"SAND", "CHZ", "FIL"}
-LOW_LIQUIDITY_OR_SPECIAL_SYMBOLS = {"FCR", "NAC", "WILD", "ASTR", "ZPG", "ZPGAG", "ZPGPT"}
+LOW_LIQUIDITY_OR_SPECIAL_SYMBOLS = BLACKLISTED_SYMBOLS | {"ZPG", "ZPGAG", "ZPGPT"}
 EXCLUDED_SPOT_SYMBOLS = DELISTING_SPOT_SYMBOLS | LOW_LIQUIDITY_OR_SPECIAL_SYMBOLS
 
 # 4時間足・日足など日付指定が YYYY（年単位）となるインターバル

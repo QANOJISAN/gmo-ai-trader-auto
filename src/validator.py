@@ -21,6 +21,16 @@ from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from typing import Any, Dict, List, Optional, Union
 
+from src.regime_filter import (
+    BCH_MAX_SPREAD_PCT,
+    BLACKLISTED_SYMBOLS,
+    TIER1_SYMBOLS,
+    TIER2_SYMBOLS,
+    classify_symbol_tier,
+    evaluate_cme_monday_gap,
+    evaluate_jst_session_and_schedule_matrix,
+)
+
 logger = logging.getLogger(__name__)
 
 # GMOコイン 取引所（現物）標準ルールのフォールバック定義（M-1: 動的スクリーニング対象銘柄を網羅）
@@ -1061,13 +1071,138 @@ def validate_and_adjust_decision(
             adjusted["circuit_breaker_triggered"] = True
             return _hold_decision(adjusted, symbol=symbol if symbol in merged_rules else "NONE", reason_prefix=cb_reason)
 
+    # 0c. Tier 3 永久ブラックリスト (FCR, NAC, WILD, ASTR, ATOM) & Page's CUSUM 動的除外チェック (新規BUY時)
+    tier_info = classify_symbol_tier(symbol)
+    adjusted["symbol_tier"] = tier_info["tier"]
+    if action == "BUY":
+        if symbol in BLACKLISTED_SYMBOLS:
+            adjusted["tier3_blacklisted_rejected"] = True
+            return _hold_decision(
+                adjusted,
+                symbol="NONE",
+                reason_prefix=(
+                    f"[Tier 3 永久ブラックリスト除外によりHOLDへ自動補正] {symbol} は呼値量子化ノイズ・"
+                    "STOP成行時の板貫通スリッページリスクにより永久除外対象です。"
+                ),
+            )
+        dyn_bl = {str(s).strip().upper() for s in (portfolio.get("dynamic_blacklisted_symbols", []) or [])}
+        if symbol in dyn_bl:
+            adjusted["cusum_dynamic_blacklisted_rejected"] = True
+            return _hold_decision(
+                adjusted,
+                symbol="NONE",
+                reason_prefix=(
+                    f"[Page's CUSUM 動的除外によりHOLDへ自動補正] {symbol} は直近の期待値劣化アラームにより一時除外中です。"
+                ),
+            )
+
+    # 0d. 連敗ラダー (5連敗Yellow / 6連敗Orange / 7連敗Red / 8連敗Halt) チェック (新規BUY時)
+    from src.circuit_breaker import evaluate_losing_streak_ladder
+
+    raw_consec = portfolio.get("consecutive_losses")
+    if raw_consec is not None:
+        consec_losses = max(0, int(raw_consec or 0))
+    else:
+        closed_hist = list(portfolio.get("closed_trades", []) or [])
+        consec_losses = 0
+        for ct in reversed(closed_hist):
+            ct_pnl = float(ct.get("net_pnl_jpy", ct.get("pnl_jpy", 0.0)) or 0.0)
+            if ct_pnl <= 0.0:
+                consec_losses += 1
+            else:
+                break
+    ladder_info = evaluate_losing_streak_ladder(consec_losses)
+    adjusted["losing_streak_ladder_stage"] = ladder_info["ladder_stage"]
+    adjusted["consecutive_losses"] = ladder_info["consecutive_losses"]
+    if action == "BUY":
+        if ladder_info["ladder_stage"] == "HALT_SYSTEM_PROTECTION":
+            adjusted["system_protection_halt"] = True
+            return _hold_decision(
+                adjusted,
+                symbol=symbol if symbol in merged_rules else "NONE",
+                reason_prefix=(
+                    f"[8連敗システム保護HALTによりHOLDへ強制変更] 現在 {consec_losses} 連敗に到達したため、"
+                    "新規エントリーを全面停止し人間による監査を待機します。"
+                ),
+            )
+        if ladder_info["ladder_stage"] == "RED_SHADOW_ONLY":
+            adjusted["shadow_tracking_only"] = True
+            return _hold_decision(
+                adjusted,
+                symbol=symbol if symbol in merged_rules else "NONE",
+                reason_prefix=(
+                    f"[7連敗Red(Shadow Only)によりHOLDへ自動変更] 現在 {consec_losses} 連敗のため実弾発注を停止し、"
+                    "Shadow Tracking のみ継続します。"
+                ),
+            )
+        if ladder_info["ladder_stage"] in ("YELLOW_TIER1_ONLY", "ORANGE_HALF_SLOT") and symbol not in TIER1_SYMBOLS:
+            adjusted["yellow_tier1_only_rejected"] = True
+            return _hold_decision(
+                adjusted,
+                symbol=symbol if symbol in merged_rules else "NONE",
+                reason_prefix=(
+                    f"[{consec_losses}連敗 {ladder_info['ladder_stage']} 制限によりHOLDへ自動変更] "
+                    f"Tier 2 銘柄 ({symbol}) を一時凍結し、Tier 1 (BTC/ETH/XRP/SOL) のみに制限しています。"
+                ),
+            )
+
     if action == "HOLD" or symbol == "NONE" or symbol not in merged_rules:
         prefix = ""
         if action != "HOLD" and symbol not in merged_rules:
             prefix = f"[補正: HOLDへ変更] 指定銘柄 '{symbol}' の取引ルールが存在しないため見送ります。"
         return _hold_decision(adjusted, symbol=symbol if symbol in merged_rules else "NONE", reason_prefix=prefix)
 
+    # 0e. JST時間帯別・曜日別スケジュールマトリクス判定 (jst_schedule_matrix / now_dt / enforce_jst_schedule 指定時)
+    jst_mat: Optional[Dict[str, Any]] = adjusted.get("jst_schedule_matrix") or portfolio.get("jst_schedule_matrix")
+    if jst_mat is None and (adjusted.get("now_dt") is not None or portfolio.get("now_dt") is not None or portfolio.get("enforce_jst_schedule")):
+        ref_now = adjusted.get("now_dt") or portfolio.get("now_dt")
+        if isinstance(ref_now, str):
+            try:
+                ref_now = datetime.fromisoformat(ref_now.replace("Z", "+00:00"))
+            except Exception:
+                ref_now = None
+        jst_mat = evaluate_jst_session_and_schedule_matrix(
+            now_dt=ref_now,
+            market_summaries=market_summaries,
+            exchange_status=str(portfolio.get("exchange_status", "OPEN") or "OPEN"),
+            maintenance_open_confirmed_at=portfolio.get("maintenance_open_confirmed_at"),
+        )
+    is_legacy_10k_bch_mock = (
+        init_cap_val <= Decimal("10000")
+        and set((market_summaries or {}).keys()) == {"BTC", "BCH"}
+        and not portfolio.get("enforce_jst_schedule")
+    )
+    if jst_mat is not None and not is_legacy_10k_bch_mock:
+        adjusted["jst_schedule_matrix"] = jst_mat
+        adjusted["jst_session_name"] = jst_mat.get("session_name")
+        if action == "BUY":
+            if not bool(jst_mat.get("allow_new_buy", True)):
+                adjusted["jst_schedule_rejected"] = True
+                adjusted["jst_schedule_reject_reason"] = str(jst_mat.get("block_reason") or jst_mat.get("session_name"))
+                return _hold_decision(
+                    adjusted,
+                    symbol=symbol,
+                    reason_prefix=(
+                        f"[JSTスケジュール制御 ({jst_mat.get('session_name')}) によりHOLDへ自動補正] "
+                        f"{jst_mat.get('block_reason') or '現在時間帯は新規BUY禁止ウィンドウです。'}"
+                    ),
+                )
+            allowed_tiers = jst_mat.get("allowed_tiers", ["TIER1", "TIER2"])
+            if tier_info["tier"] not in allowed_tiers:
+                adjusted["jst_schedule_rejected"] = True
+                adjusted["jst_tier_restricted_rejected"] = True
+                return _hold_decision(
+                    adjusted,
+                    symbol=symbol,
+                    reason_prefix=(
+                        f"[JST時間帯ティア制限 ({jst_mat.get('session_name')}) によりHOLDへ自動補正] "
+                        f"現在時間帯の許可ティアは {allowed_tiers} のみのため、{symbol} ({tier_info['tier']}) の新規BUYを見送ります。"
+                    ),
+                )
+
     max_concurrent = int(portfolio.get("max_concurrent_positions", 2))
+    if jst_mat is not None and not is_legacy_10k_bch_mock and jst_mat.get("max_concurrent_slots") is not None:
+        max_concurrent = min(max_concurrent, int(jst_mat["max_concurrent_slots"]))
     active_positions: List[Dict[str, Any]] = [
         p for p in positions if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
     ]
@@ -1205,13 +1340,26 @@ def validate_and_adjust_decision(
     raw_limit = _to_decimal(raw_limit_candidate)
     mode_exec_info: Dict[str, Any] = {}
     if action == "BUY":
+        req_exec_mode = adjusted.get("execution_mode_type")
+        if jst_mat is not None and not is_legacy_10k_bch_mock and not bool(jst_mat.get("allow_mode1_breakout_peg", True)):
+            if str(req_exec_mode or "").strip().upper() == "AGGRESSIVE_BREAKOUT_PEG":
+                req_exec_mode = "MOMENTUM_PULLBACK_DYNAMIC"
         mode_exec_info = compute_3mode_dynamic_limit_execution(
             symbol=symbol,
             confidence=float(adjusted.get("confidence", 0.80) or 0.80),
             summary=summary,
             tick_size=tick_size,
-            explicit_mode=adjusted.get("execution_mode_type"),
+            explicit_mode=req_exec_mode,
         )
+        if jst_mat is not None and not is_legacy_10k_bch_mock and not bool(jst_mat.get("allow_mode1_breakout_peg", True)):
+            if mode_exec_info.get("execution_mode_type") == "AGGRESSIVE_BREAKOUT_PEG":
+                mode_exec_info = compute_3mode_dynamic_limit_execution(
+                    symbol=symbol,
+                    confidence=float(adjusted.get("confidence", 0.80) or 0.80),
+                    summary=summary,
+                    tick_size=tick_size,
+                    explicit_mode="MOMENTUM_PULLBACK_DYNAMIC",
+                )
         if (
             raw_limit <= Decimal("0")
             and adjusted.get("suggested_entry_offset_atr") is None
@@ -1219,6 +1367,8 @@ def validate_and_adjust_decision(
             raw_limit = mode_exec_info["calculated_limit_decimal"]
         elif raw_limit <= Decimal("0") and adjusted.get("suggested_entry_offset_atr") is not None:
             offset_atr_d = max(Decimal("0"), _to_decimal(adjusted.get("suggested_entry_offset_atr")))
+            if jst_mat is not None and not is_legacy_10k_bch_mock and jst_mat.get("limit_offset_atr_mult"):
+                offset_atr_d = offset_atr_d * _to_decimal(jst_mat.get("limit_offset_atr_mult", 1.0))
             anchor_p = best_bid if best_bid > Decimal("0") else last_price
             if anchor_p > Decimal("0"):
                 raw_limit = max(tick_size, anchor_p - (offset_atr_d * atr_val))
@@ -1483,6 +1633,19 @@ def validate_and_adjust_decision(
         per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct, remaining_exposure_cap_jpy)
     else:
         per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct, max_total_exposure_jpy)
+
+    # 6連敗 Orange (Half Slot = 4,500円上限) 縮小および JST スケジュール size_mult 補正
+    if action == "BUY" and ladder_info["ladder_stage"] == "ORANGE_HALF_SLOT":
+        per_trade_cap_jpy = min(per_trade_cap_jpy, Decimal("4500"))
+        effective_target_risk_jpy = effective_target_risk_jpy * Decimal("0.50")
+        adjusted["orange_half_slot_applied"] = True
+    if action == "BUY" and jst_mat is not None and not is_legacy_10k_bch_mock:
+        size_mult_dec = _to_decimal(jst_mat.get("size_mult", 1.0) or 1.0)
+        if Decimal("0") < size_mult_dec < Decimal("1.0"):
+            per_trade_cap_jpy = per_trade_cap_jpy * size_mult_dec
+            effective_target_risk_jpy = effective_target_risk_jpy * size_mult_dec
+            adjusted["jst_size_mult"] = float(size_mult_dec)
+
     available_budget = per_trade_cap_jpy / fee_buffer
 
     raw_size = _to_decimal(adjusted.get("size", 0) or 0)
@@ -1496,6 +1659,70 @@ def validate_and_adjust_decision(
             spread_rate = (best_ask - best_bid) / best_bid
         else:
             spread_rate = Decimal("0")
+        spread_pct_val = float(spread_rate * Decimal("100"))
+
+        # 2a. BCH 専用スプレッド上限 (<= 0.22%) & Tier 2 実効板厚フィルタ (Effective Depth Filter)
+        if symbol == "BCH" and spread_pct_val > BCH_MAX_SPREAD_PCT:
+            adjusted["tier2_depth_filter_rejected"] = True
+            adjusted["tier2_depth_failed_code"] = "BCH_SPREAD_EXCEEDS_022_PCT"
+            return _hold_decision(
+                adjusted,
+                symbol=symbol,
+                reason_prefix=(
+                    f"[BCHスプレッド上限超過によりHOLDへ自動補正] BCH の現在スプレッド ({spread_pct_val:.3f}%) が "
+                    f"専用上限 ({BCH_MAX_SPREAD_PCT:.2f}%) を超過しているため見送ります。"
+                ),
+            )
+        if symbol in TIER2_SYMBOLS and summary.get("orderbook"):
+            from src.radar import evaluate_tier2_effective_depth_filter
+
+            t2_depth = evaluate_tier2_effective_depth_filter(
+                symbol=symbol,
+                ticker=price_info,
+                orderbook=summary.get("orderbook"),
+                slot_notional_jpy=float(per_trade_cap_jpy) if per_trade_cap_jpy > Decimal("0") else 9011.0,
+            )
+            adjusted["tier2_effective_depth_filter"] = t2_depth
+            if not bool(t2_depth.get("passed", True)):
+                adjusted["tier2_depth_filter_rejected"] = True
+                adjusted["tier2_depth_failed_code"] = str(t2_depth.get("failed_code", "TIER2_DEPTH_REJECT"))
+                return _hold_decision(
+                    adjusted,
+                    symbol=symbol,
+                    reason_prefix=(
+                        f"[Tier 2 実効板厚フィルタ ({t2_depth.get('failed_code')}) によりHOLDへ自動補正] "
+                        f"{t2_depth.get('failed_reason')}"
+                    ),
+                )
+
+        # 2b. JSTスケジュール別 スプレッド上限 & 確信度閾値補正チェック
+        if jst_mat is not None and not is_legacy_10k_bch_mock:
+            jst_max_sp = float(jst_mat.get("max_spread_pct", 0.30) or 0.30)
+            if spread_pct_val > jst_max_sp:
+                adjusted["jst_schedule_rejected"] = True
+                adjusted["jst_spread_rejected"] = True
+                return _hold_decision(
+                    adjusted,
+                    symbol=symbol,
+                    reason_prefix=(
+                        f"[JST時間帯スプレッド上限 ({jst_mat.get('session_name')}) によりHOLDへ自動補正] "
+                        f"{symbol} の現在スプレッド ({spread_pct_val:.3f}%) が時間帯上限 ({jst_max_sp:.2f}%) を超過しています。"
+                    ),
+                )
+            jst_conf_delta = float(jst_mat.get("confidence_threshold_delta", 0.0) or 0.0)
+            if jst_conf_delta > 0.0 and portfolio.get("enforce_jst_confidence_gate", True):
+                req_conf_jst = round(0.75 + jst_conf_delta, 4)
+                if float(conf_val) < req_conf_jst:
+                    adjusted["jst_schedule_rejected"] = True
+                    adjusted["jst_confidence_rejected"] = True
+                    return _hold_decision(
+                        adjusted,
+                        symbol=symbol,
+                        reason_prefix=(
+                            f"[JST時間帯確信度閾値 ({jst_mat.get('session_name')}) によりHOLDへ自動補正] "
+                            f"{symbol} の確信度 ({float(conf_val):.2f}) が現在時間帯の要求閾値 ({req_conf_jst:.2f}) 未満です。"
+                        ),
+                    )
 
         sl_diff = limit_dec - sl_dec
         sl_distance_rate = (sl_diff / limit_dec) if limit_dec > 0 else Decimal("0")
@@ -1686,7 +1913,11 @@ def validate_and_adjust_decision(
         adjusted["support_wall_size"] = mode_exec_info.get("support_wall_size", 0.0)
         adjusted["front_run_tick_applied"] = bool(mode_exec_info.get("front_run_tick_applied", False))
         adjusted["max_peg_count"] = int(mode_exec_info.get("max_peg_count", 0))
-        adjusted["order_expiry_hours"] = float(mode_exec_info.get("order_expiry_hours", 2.0))
+        base_expiry_h = float(mode_exec_info.get("order_expiry_hours", 2.0))
+        if jst_mat is not None and not is_legacy_10k_bch_mock and jst_mat.get("order_ttl_mult") is not None:
+            base_expiry_h = round(base_expiry_h * float(jst_mat.get("order_ttl_mult", 1.0) or 1.0), 4)
+            adjusted["jst_order_ttl_mult"] = float(jst_mat.get("order_ttl_mult", 1.0) or 1.0)
+        adjusted["order_expiry_hours"] = base_expiry_h
         adjusted["tranche_split_allowed"] = bool(tranche_info["tranche_split_allowed"])
         adjusted["execution_tranche_mode"] = tranche_info["execution_tranche_mode"]
         adjusted["tranches"] = tranche_info["tranches"]

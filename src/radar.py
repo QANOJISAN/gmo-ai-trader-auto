@@ -38,7 +38,19 @@ from src.indicators import (
     enrich_relative_strength_vs_btc,
     summarize_indicators,
 )
-from src.regime_filter import MarketRegimeFilter
+from src.regime_filter import (
+    BCH_MAX_SPREAD_PCT,
+    BLACKLISTED_SYMBOLS,
+    SOL_PRIORITY_SCORE_BONUS,
+    TIER1_SYMBOLS,
+    TIER2_MAX_SELL_SLIPPAGE_PCT,
+    TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+    TIER2_SYMBOLS,
+    MarketRegimeFilter,
+    classify_symbol_tier,
+    evaluate_cme_monday_gap,
+    evaluate_jst_session_and_schedule_matrix,
+)
 from src.validator import (
     DEFAULT_SYMBOL_RULES,
     _to_decimal,
@@ -52,13 +64,257 @@ logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
 
-# Gate 0 固定除外リスト（廃止予定・超低流動性・特殊・ステーブルコイン DAI）
-GATE0_EXCLUDED_SYMBOLS = set(EXCLUDED_SPOT_SYMBOLS) | {"DAI"}
+# Gate 0 固定除外リスト（廃止予定・超低流動性・特殊・Tier 3 永久ブラックリスト5銘柄・ステーブルコイン DAI）
+GATE0_EXCLUDED_SYMBOLS = set(EXCLUDED_SPOT_SYMBOLS) | BLACKLISTED_SYMBOLS | {"DAI"}
 
 # パターンA（自動複利スケール型）パラメータ
 MAX_POSITION_ALLOCATION_PCT = Decimal("0.45")
 DYNAMIC_MIN_RISK_PCT = Decimal("0.012")
 DYNAMIC_TARGET_RISK_PCT = Decimal("0.015")
+
+
+def evaluate_tier2_effective_depth_filter(
+    symbol: str,
+    ticker: Optional[Dict[str, Any]] = None,
+    orderbook: Optional[Dict[str, Any]] = None,
+    slot_notional_jpy: float = 9_011.0,
+) -> Dict[str, Any]:
+    """
+    Deep Research #2 【追加実装1】: Tier 2 銘柄（DOGE, SUI, LTC, BCH, LINK, ADA, XLM, DOT）の 2段階実効板厚フィルタ:
+      ① 9,011円分（1枠）を買い板（Bids）に成行売りぶつけシミュレーションした際の実効売却スリッページ期待値 `slip_sell <= 0.15%`
+      ② 最良買い気配（Best Bid）から `-0.5%` 以内の価格帯に存在する買い板の累積金額（Cumulative Bid Depth）が **`45,000円` 以上**（1枠の5倍以上）
+      ※また、`BCH` はスプレッド上限を `0.22%` に厳格化する。
+    """
+    sym_up = str(symbol or "").strip().upper()
+    tier_info = classify_symbol_tier(sym_up)
+    t_map = ticker or {}
+    ob_map = orderbook or t_map.get("orderbook") or {}
+
+    if sym_up in BLACKLISTED_SYMBOLS:
+        return {
+            "symbol": sym_up,
+            "tier": "TIER3_BLACKLISTED",
+            "passed": False,
+            "failed_code": "TIER3_BLACKLISTED",
+            "reason": f"Tier 3 永久ブラックリスト除外銘柄 ({sym_up})",
+            "spread_pct": 999.0,
+            "max_spread_pct": 0.0,
+            "slip_sell_pct": 999.0,
+            "max_slip_sell_pct": TIER2_MAX_SELL_SLIPPAGE_PCT,
+            "cumulative_bid_depth_05pct_jpy": 0.0,
+            "min_cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+            "has_orderbook_bids": False,
+        }
+
+    raw_bids = ob_map.get("bids") if isinstance(ob_map, dict) else None
+    raw_asks = ob_map.get("asks") if isinstance(ob_map, dict) else None
+    if raw_bids is None and isinstance(t_map, dict) and "bids" in t_map:
+        raw_bids = t_map.get("bids")
+    if raw_asks is None and isinstance(t_map, dict) and "asks" in t_map:
+        raw_asks = t_map.get("asks")
+
+    parsed_bids: List[tuple[float, float]] = []
+    for b in raw_bids or []:
+        try:
+            bp = float(b.get("price", 0) if isinstance(b, dict) else b[0])
+            bs = float(b.get("size", 0) if isinstance(b, dict) else b[1])
+            if bp > 0 and bs > 0:
+                parsed_bids.append((bp, bs))
+        except Exception:
+            continue
+    parsed_bids.sort(key=lambda x: x[0], reverse=True)
+
+    best_bid = float(
+        t_map.get("bid")
+        or t_map.get("best_bid")
+        or (parsed_bids[0][0] if parsed_bids else 0.0)
+        or t_map.get("last")
+        or 0.0
+    )
+    best_ask = float(
+        t_map.get("ask")
+        or t_map.get("best_ask")
+        or 0.0
+    )
+    if best_ask <= 0 and raw_asks:
+        try:
+            first_a = raw_asks[0]
+            best_ask = float(first_a.get("price", 0) if isinstance(first_a, dict) else first_a[0])
+        except Exception:
+            best_ask = best_bid
+
+    explicit_spread = t_map.get("spread_pct")
+    if explicit_spread is not None:
+        spread_pct = float(explicit_spread)
+    elif best_ask >= best_bid > 0:
+        spread_pct = (best_ask - best_bid) / best_bid * 100.0
+    else:
+        spread_pct = 0.0
+
+    max_sp = BCH_MAX_SPREAD_PCT if sym_up == "BCH" else 0.35
+    if sym_up == "BCH" and spread_pct > BCH_MAX_SPREAD_PCT:
+        return {
+            "symbol": sym_up,
+            "tier": tier_info["tier"],
+            "passed": False,
+            "failed_code": "BCH_SPREAD_EXCEEDED",
+            "reason": f"BCH スプレッド上限超過 ({spread_pct:.3f}% > {BCH_MAX_SPREAD_PCT:.2f}%)",
+            "spread_pct": round(spread_pct, 4),
+            "max_spread_pct": max_sp,
+            "slip_sell_pct": 0.0,
+            "max_slip_sell_pct": TIER2_MAX_SELL_SLIPPAGE_PCT,
+            "cumulative_bid_depth_05pct_jpy": 0.0,
+            "min_cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+            "has_orderbook_bids": len(parsed_bids) > 0,
+        }
+
+    # Tier 1 銘柄は 2段階実効板厚フィルタ対象外 (常時通過)
+    if sym_up in TIER1_SYMBOLS:
+        return {
+            "symbol": sym_up,
+            "tier": "TIER1",
+            "passed": True,
+            "failed_code": None,
+            "reason": "Tier 1 主力銘柄",
+            "spread_pct": round(spread_pct, 4),
+            "max_spread_pct": max_sp,
+            "slip_sell_pct": 0.0,
+            "max_slip_sell_pct": 0.45,
+            "cumulative_bid_depth_05pct_jpy": 9999999.0,
+            "min_cumulative_bid_depth_05pct_jpy": 0.0,
+            "has_orderbook_bids": len(parsed_bids) > 0,
+        }
+
+    explicit_slip = (
+        ob_map.get("slip_sell_pct")
+        if isinstance(ob_map, dict) and ob_map.get("slip_sell_pct") is not None
+        else t_map.get("slip_sell_pct")
+    )
+    explicit_cum_depth = (
+        ob_map.get("cumulative_bid_depth_05pct_jpy")
+        if isinstance(ob_map, dict) and ob_map.get("cumulative_bid_depth_05pct_jpy") is not None
+        else t_map.get("cumulative_bid_depth_05pct_jpy")
+    )
+    has_depth_inputs = bool(parsed_bids or explicit_slip is not None or explicit_cum_depth is not None)
+
+    if not has_depth_inputs:
+        return {
+            "symbol": sym_up,
+            "tier": tier_info["tier"],
+            "passed": True,
+            "failed_code": None,
+            "reason": "板データ未指定（フォールバック通過）",
+            "spread_pct": round(spread_pct, 4),
+            "max_spread_pct": max_sp,
+            "slip_sell_pct": 0.0,
+            "max_slip_sell_pct": TIER2_MAX_SELL_SLIPPAGE_PCT,
+            "cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+            "min_cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+            "has_orderbook_bids": False,
+        }
+
+    if parsed_bids and best_bid > 0:
+        target_notional = max(1000.0, float(slot_notional_jpy))
+        target_qty = target_notional / best_bid
+        rem_qty = target_qty
+        proceeds_jpy = 0.0
+        filled_qty = 0.0
+        floor_05pct = best_bid * 0.995
+        cum_depth_05_jpy = 0.0
+
+        for bp, bs in parsed_bids:
+            if bp >= floor_05pct - 1e-9:
+                cum_depth_05_jpy += bp * bs
+            if rem_qty > 0:
+                take_q = min(rem_qty, bs)
+                proceeds_jpy += take_q * bp
+                filled_qty += take_q
+                rem_qty -= take_q
+
+        if rem_qty > 1e-12:
+            # 板が薄すぎて1枠分すら埋まらない場合は最下段からさらに -1.5% ペナルティ価格で埋まったとみなす
+            worst_p = parsed_bids[-1][0] * 0.985
+            proceeds_jpy += rem_qty * worst_p
+            filled_qty += rem_qty
+
+        vwap_sell = proceeds_jpy / filled_qty if filled_qty > 0 else best_bid
+        slip_sell_pct = max(0.0, (best_bid - vwap_sell) / best_bid * 100.0)
+    else:
+        slip_sell_pct = float(explicit_slip or 0.0)
+        cum_depth_05_jpy = float(explicit_cum_depth if explicit_cum_depth is not None else TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY)
+
+    if explicit_slip is not None:
+        slip_sell_pct = float(explicit_slip)
+    if explicit_cum_depth is not None:
+        cum_depth_05_jpy = float(explicit_cum_depth)
+
+    if slip_sell_pct > TIER2_MAX_SELL_SLIPPAGE_PCT:
+        return {
+            "symbol": sym_up,
+            "tier": tier_info["tier"],
+            "passed": False,
+            "failed_code": "TIER2_SLIP_SELL_EXCEEDED",
+            "reason": (
+                f"Tier 2 実効板厚フィルタ①不合格: 1枠({slot_notional_jpy:,.0f}円)成行売却スリッページ "
+                f"{slip_sell_pct:.3f}% > 上限 {TIER2_MAX_SELL_SLIPPAGE_PCT:.2f}%"
+            ),
+            "failed_reason": (
+                f"Tier 2 実効板厚フィルタ①不合格: 1枠({slot_notional_jpy:,.0f}円)成行売却スリッページ "
+                f"{slip_sell_pct:.3f}% > 上限 {TIER2_MAX_SELL_SLIPPAGE_PCT:.2f}%"
+            ),
+            "spread_pct": round(spread_pct, 4),
+            "max_spread_pct": max_sp,
+            "slip_sell_pct": round(slip_sell_pct, 4),
+            "simulated_sell_slippage_pct": round(slip_sell_pct, 4),
+            "max_slip_sell_pct": TIER2_MAX_SELL_SLIPPAGE_PCT,
+            "cumulative_bid_depth_05pct_jpy": round(cum_depth_05_jpy, 2),
+            "cum_bid_depth_05pct_jpy": round(cum_depth_05_jpy, 2),
+            "min_cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+            "has_orderbook_bids": True,
+        }
+
+    if cum_depth_05_jpy < TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY:
+        return {
+            "symbol": sym_up,
+            "tier": tier_info["tier"],
+            "passed": False,
+            "failed_code": "TIER2_CUM_BID_DEPTH_INSUFFICIENT",
+            "reason": (
+                f"Tier 2 実効板厚フィルタ②不合格: Best Bidから-0.5%以内の累積買い板厚 "
+                f"{cum_depth_05_jpy:,.0f}円 < 下限 {TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY:,.0f}円 (1枠の5倍)"
+            ),
+            "failed_reason": (
+                f"Tier 2 実効板厚フィルタ②不合格: Best Bidから-0.5%以内の累積買い板厚 "
+                f"{cum_depth_05_jpy:,.0f}円 < 下限 {TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY:,.0f}円 (1枠の5倍)"
+            ),
+            "spread_pct": round(spread_pct, 4),
+            "max_spread_pct": max_sp,
+            "slip_sell_pct": round(slip_sell_pct, 4),
+            "simulated_sell_slippage_pct": round(slip_sell_pct, 4),
+            "max_slip_sell_pct": TIER2_MAX_SELL_SLIPPAGE_PCT,
+            "cumulative_bid_depth_05pct_jpy": round(cum_depth_05_jpy, 2),
+            "cum_bid_depth_05pct_jpy": round(cum_depth_05_jpy, 2),
+            "min_cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+            "has_orderbook_bids": True,
+        }
+
+    return {
+        "symbol": sym_up,
+        "tier": tier_info["tier"],
+        "passed": True,
+        "failed_code": None,
+        "reason": "Tier 2 2段階実効板厚フィルタ合格",
+        "failed_reason": None,
+        "spread_pct": round(spread_pct, 4),
+        "max_spread_pct": max_sp,
+        "slip_sell_pct": round(slip_sell_pct, 4),
+        "simulated_sell_slippage_pct": round(slip_sell_pct, 4),
+        "max_slip_sell_pct": TIER2_MAX_SELL_SLIPPAGE_PCT,
+        "cumulative_bid_depth_05pct_jpy": round(cum_depth_05_jpy, 2),
+        "cum_bid_depth_05pct_jpy": round(cum_depth_05_jpy, 2),
+        "min_cumulative_bid_depth_05pct_jpy": TIER2_MIN_CUM_BID_DEPTH_05PCT_JPY,
+        "has_orderbook_bids": True,
+    }
 
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
@@ -169,13 +425,15 @@ class TechnicalRadar:
             else 9_011.0
         )
 
-        # Gate 0: 固定除外リスト & レバレッジ銘柄 (`*_JPY`)
-        if not sym_up or sym_up.endswith("_JPY") or sym_up in GATE0_EXCLUDED_SYMBOLS:
+        # Gate 0: 固定除外リスト & Tier 3 永久ブラックリスト & レバレッジ銘柄 (`*_JPY`)
+        tier_info = classify_symbol_tier(sym_up)
+        if not sym_up or sym_up.endswith("_JPY") or sym_up in GATE0_EXCLUDED_SYMBOLS or sym_up in BLACKLISTED_SYMBOLS:
             return {
                 "symbol": sym_up,
+                "tier": tier_info["tier"],
                 "passed": False,
                 "failed_gate": "GATE_0_EXCLUDED",
-                "reason": f"Gate 0 除外銘柄 ({sym_up})",
+                "reason": f"Gate 0 除外銘柄 / Tier 3 永久ブラックリスト ({sym_up})",
             }
 
         # Gate 1: ルール整合性確認
@@ -185,12 +443,13 @@ class TechnicalRadar:
         if min_size_dec <= 0 or step_dec <= 0 or tick_dec <= 0:
             return {
                 "symbol": sym_up,
+                "tier": tier_info["tier"],
                 "passed": False,
                 "failed_gate": "GATE_1_INVALID_RULE",
                 "reason": f"Gate 1 取引ルール不正 (min={min_size_dec}, step={step_dec}, tick={tick_dec})",
             }
 
-        # Gate 2: 24h売買代金 = Decimal(volume) * Decimal(last) >= 30,000,000円 & スプレッド <= 0.35% & OBDR <= 0.45%
+        # Gate 2: 24h売買代金 = Decimal(volume) * Decimal(last) >= 30,000,000円 & スプレッド <= 0.35% (BCHは0.22%) & OBDR <= 0.45%
         last_dec = _to_decimal(ticker.get("last", 0))
         bid_dec = _to_decimal(ticker.get("bid", last_dec))
         ask_dec = _to_decimal(ticker.get("ask", last_dec))
@@ -198,6 +457,7 @@ class TechnicalRadar:
         if last_dec <= 0 or bid_dec <= 0:
             return {
                 "symbol": sym_up,
+                "tier": tier_info["tier"],
                 "passed": False,
                 "failed_gate": "GATE_2_NO_PRICE",
                 "reason": "Gate 2 価格データなし",
@@ -205,21 +465,24 @@ class TechnicalRadar:
 
         trading_val_24h = vol_dec * last_dec if vol_dec > 0 else _to_decimal(ticker.get("trading_value_24h", 0))
         spread_pct_dec = ((ask_dec - bid_dec) / bid_dec * Decimal("100")) if (ask_dec >= bid_dec > 0) else Decimal("999")
+        sym_max_spread = min(self.max_spread_pct, Decimal(str(BCH_MAX_SPREAD_PCT))) if sym_up == "BCH" else self.max_spread_pct
 
         if trading_val_24h < self.min_24h_trading_value_jpy:
             return {
                 "symbol": sym_up,
+                "tier": tier_info["tier"],
                 "passed": False,
                 "failed_gate": "GATE_2_LOW_VOLUME",
                 "reason": f"Gate 2 24h売買代金不足 ({int(trading_val_24h):,}円 < {int(self.min_24h_trading_value_jpy):,}円)",
                 "trading_value_24h_jpy": float(trading_val_24h),
             }
-        if spread_pct_dec > self.max_spread_pct:
+        if spread_pct_dec > sym_max_spread:
             return {
                 "symbol": sym_up,
+                "tier": tier_info["tier"],
                 "passed": False,
                 "failed_gate": "GATE_2_WIDE_SPREAD",
-                "reason": f"Gate 2 スプレッド超過 ({float(spread_pct_dec):.3f}% > {float(self.max_spread_pct):.2f}%)",
+                "reason": f"Gate 2 スプレッド超過 ({float(spread_pct_dec):.3f}% > {float(sym_max_spread):.2f}%)",
                 "spread_pct": float(spread_pct_dec),
             }
 
@@ -238,6 +501,7 @@ class TechnicalRadar:
             if obdr_res.get("has_orderbook") and obdr_res.get("is_hollow_book"):
                 return {
                     "symbol": sym_up,
+                    "tier": tier_info["tier"],
                     "passed": False,
                     "failed_gate": "GATE_2_HOLLOW_BOOK_OBDR",
                     "reason": (
@@ -248,11 +512,33 @@ class TechnicalRadar:
                     "obdr_slippage_pct": obdr_slippage_pct,
                 }
 
+        # Deep Research #2 【追加実装1】: Tier 2 銘柄の 2段階実効板厚フィルタ (slip_sell <= 0.15% & -0.5%累積買い板厚 >= 45,000円)
+        tier2_depth_res = evaluate_tier2_effective_depth_filter(
+            symbol=sym_up,
+            ticker=ticker,
+            orderbook=eff_ob if isinstance(eff_ob, dict) else None,
+            slot_notional_jpy=standard_slot_notional_jpy,
+        )
+        if not tier2_depth_res["passed"]:
+            return {
+                "symbol": sym_up,
+                "tier": tier_info["tier"],
+                "passed": False,
+                "failed_gate": "GATE_2_TIER2_EFFECTIVE_DEPTH",
+                "failed_code": tier2_depth_res.get("failed_code"),
+                "reason": tier2_depth_res.get("reason", "Tier 2 実効板厚フィルタ不合格"),
+                "spread_pct": float(spread_pct_dec),
+                "slip_sell_pct": tier2_depth_res.get("slip_sell_pct", 0.0),
+                "cumulative_bid_depth_05pct_jpy": tier2_depth_res.get("cumulative_bid_depth_05pct_jpy", 0.0),
+                "tier2_depth_filter": tier2_depth_res,
+            }
+
         # Gate 3: 最小注文額 minOrderSize * last <= effective_max_min_notional かつ effective_target_risk / minOrderSize >= 1.5 * ATR_1h
         min_notional_jpy = min_size_dec * last_dec
         if min_notional_jpy > effective_max_min_notional:
             return {
                 "symbol": sym_up,
+                "tier": tier_info["tier"],
                 "passed": False,
                 "failed_gate": "GATE_3_MIN_NOTIONAL_TOO_LARGE",
                 "reason": f"Gate 3 最小注文額超過 ({float(min_notional_jpy):,.0f}円 > {float(effective_max_min_notional):,.0f}円)",
@@ -267,6 +553,7 @@ class TechnicalRadar:
                 if max_allowable_sl_dist_at_min_lot < required_min_sl_dist:
                     return {
                         "symbol": sym_up,
+                        "tier": tier_info["tier"],
                         "passed": False,
                         "failed_gate": "GATE_3_SL_TOO_TIGHT_FOR_MIN_LOT",
                         "reason": (
@@ -279,12 +566,17 @@ class TechnicalRadar:
 
         return {
             "symbol": sym_up,
+            "tier": tier_info["tier"],
+            "priority_score_bonus": tier_info["priority_score_bonus"],
             "passed": True,
             "failed_gate": None,
             "trading_value_24h_jpy": float(trading_val_24h),
             "spread_pct": float(spread_pct_dec),
             "obdr_slippage_pct": round(obdr_slippage_pct, 4),
+            "slip_sell_pct": tier2_depth_res.get("slip_sell_pct", round(obdr_slippage_pct, 4)),
+            "cumulative_bid_depth_05pct_jpy": tier2_depth_res.get("cumulative_bid_depth_05pct_jpy", 0.0),
             "min_notional_jpy": float(min_notional_jpy),
+            "tier2_depth_filter": tier2_depth_res,
         }
 
     def screen_4tier_gates(
@@ -473,7 +765,27 @@ class TechnicalRadar:
         effective_target_risk = max(self.target_risk_jpy, total_equity * DYNAMIC_TARGET_RISK_PCT)
 
         cd_syms = {str(s).strip().upper() for s in (cooldown_symbols or set()) if s}
-        has_open_slot = (len(positions) + len(active_pending_buys)) < max_concurrent
+        dyn_blacklisted = {
+            str(s).strip().upper()
+            for s in (enriched_pf.get("dynamic_blacklisted_symbols", []) or [])
+            if s
+        }
+        jst_schedule = regime_info.get("jst_schedule_matrix") or evaluate_jst_session_and_schedule_matrix(
+            now_dt=now_jst,
+            market_summaries=market_summaries,
+        )
+        session_max_slots = int(jst_schedule.get("max_concurrent_slots", max_concurrent))
+        is_legacy_10k_bch_mock = (
+            init_cap_dec <= Decimal("10000")
+            and set(market_summaries.keys()) == {"BTC", "BCH"}
+            and not bool(enriched_pf.get("enforce_jst_schedule", False))
+        )
+        effective_max_concurrent = (
+            min(max_concurrent, session_max_slots)
+            if (not is_legacy_10k_bch_mock and session_max_slots >= 0)
+            else max_concurrent
+        )
+        has_open_slot = (len(positions) + len(active_pending_buys)) < effective_max_concurrent
         has_rotatable_slot = False
         if not has_open_slot and positions and not active_pending_buys:
             for p_chk in positions:
@@ -497,9 +809,23 @@ class TechnicalRadar:
                     break
         if (has_open_slot or has_rotatable_slot) and not kill_switch_active and not cb_triggered and regime_info["allow_new_buy"]:
             sym_filter_mode = str(regime_info.get("allowed_symbol_filter", "ALL"))
+            allowed_tiers_now = set(jst_schedule.get("allowed_tiers", ["TIER1", "TIER2"]))
+            session_max_spread = float(jst_schedule.get("max_spread_pct", 0.35) or 0.35)
+
             for sym, summary in market_summaries.items():
                 sym_up = sym.strip().upper()
-                if sym_up in held_or_pending_symbols or sym_up in GATE0_EXCLUDED_SYMBOLS or sym_up in cd_syms:
+                if (
+                    sym_up in held_or_pending_symbols
+                    or sym_up in GATE0_EXCLUDED_SYMBOLS
+                    or sym_up in BLACKLISTED_SYMBOLS
+                    or sym_up in dyn_blacklisted
+                    or sym_up in cd_syms
+                ):
+                    continue
+
+                tier_info = classify_symbol_tier(sym_up)
+                if not is_legacy_10k_bch_mock and allowed_tiers_now == {"TIER1"} and not tier_info["is_tier1"]:
+                    gate3_skipped_symbols.append(sym_up)
                     continue
 
                 daily = summary.get("daily_indicators", {}) or {}
@@ -509,10 +835,29 @@ class TechnicalRadar:
                 price_info = summary.get("price", {}) or {}
                 rule = rules.get(sym_up, {})
 
-                # テーマ2-(1)-⑤: OBDR 中抜き板 (>0.45%) は Tier 1 で即座に除外
+                # 時間帯別および BCH (0.22%) スプレッド上限チェック
+                sp_now = float(price_info.get("spread_pct", 0.0) or 0.0)
+                eff_sp_cap = min(session_max_spread, BCH_MAX_SPREAD_PCT if sym_up == "BCH" else session_max_spread)
+                if sp_now > eff_sp_cap > 0.0:
+                    gate3_skipped_symbols.append(sym_up)
+                    continue
+
+                # テーマ2-(1)-⑤: OBDR 中抜き板 (>0.45%) は即座に除外
                 if micro.get("has_orderbook") and micro.get("is_hollow_book"):
                     gate3_skipped_symbols.append(sym_up)
                     continue
+
+                # Deep Research #2: Tier 2 銘柄の 2段階実効板厚フィルタ (板情報または明示フィールドがある場合)
+                if tier_info["is_tier2"]:
+                    t2_chk = evaluate_tier2_effective_depth_filter(
+                        symbol=sym_up,
+                        ticker=price_info,
+                        orderbook=summary.get("orderbook") or micro,
+                        slot_notional_jpy=float(max(Decimal("9011"), total_equity * MAX_POSITION_ALLOCATION_PCT)),
+                    )
+                    if not t2_chk["passed"]:
+                        gate3_skipped_symbols.append(sym_up)
+                        continue
 
                 # テーマ2-(2): BTC_DOMINANCE_DRAIN 時は BTC / ETH または対BTC相対強度上位のみに限定
                 rel_7d = float(
@@ -575,6 +920,20 @@ class TechnicalRadar:
                     candidate_symbols.append(sym_up)
 
             if candidate_symbols:
+                # SOL (+8.0pt) 等の優先スコアボーナス＋7日対BTC相対強度順で候補を優先ソート
+                def _cand_priority_key(c_sym: str) -> float:
+                    t_inf = classify_symbol_tier(c_sym)
+                    c_sum = (market_summaries or {}).get(c_sym, {}) or {}
+                    rs_val = float(
+                        (c_sum.get("price") or {}).get(
+                            "relative_strength_vs_btc_7d_pct",
+                            (c_sum.get("daily_indicators") or {}).get("relative_strength_vs_btc_7d_pct", 0.0),
+                        )
+                        or 0.0
+                    )
+                    return float(t_inf["priority_score_bonus"]) + rs_val
+
+                candidate_symbols.sort(key=_cand_priority_key, reverse=True)
                 triggers.append("NEW_ENTRY_OPPORTUNITY")
                 reasons.append(
                     f"新規エントリー好機検知 ({', '.join(candidate_symbols)}: 上位足トレンド＋1時間足押し目反発が合致)"

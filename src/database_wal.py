@@ -1561,3 +1561,12 @@ class DatabaseWAL:
             stop_hit_first=(str(outcome_24h).upper() == "SL_HIT"),
             outcome_class=outcome_24h,
         )
+
+    def save_sprt_cusum_state(self, state: Dict[str, Any]) -> None:
+        """Wald's SPRT ＆ Page's Lower CUSUM（銘柄別CUSUM・動的ブラックリスト含む）の状態を account_meta へ永続化する"""
+        self.set_meta("sprt_cusum_state", state)
+
+    def load_sprt_cusum_state(self) -> Dict[str, Any]:
+        """永続化された Wald's SPRT ＆ Page's Lower CUSUM の状態を読み込む"""
+        val = self.get_meta("sprt_cusum_state", {})
+        return dict(val) if isinstance(val, dict) else {}

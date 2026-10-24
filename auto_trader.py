@@ -56,9 +56,17 @@ from src.live_probe import GMOCoinLiveProbe
 from src.llm_shadow_evaluator import LLMShadowEvaluator
 from src.notifier import Notifier, build_manual_order_guide
 from src.pseudo_oco_manager import PseudoOCOManager
-from src.radar import TechnicalRadar
+from src.radar import TechnicalRadar, evaluate_tier2_effective_depth_filter
 from src.reconciler import ThreeWayReconciler
-from src.regime_filter import MarketRegimeFilter
+from src.regime_filter import (
+    BLACKLISTED_SYMBOLS,
+    TIER1_SYMBOLS,
+    TIER2_SYMBOLS,
+    MarketRegimeFilter,
+    classify_symbol_tier,
+    evaluate_cme_monday_gap,
+    evaluate_jst_session_and_schedule_matrix,
+)
 from src.remote_control import RemoteControlManager, TieredNotificationDispatcher
 from src.validator import DEFAULT_SYMBOL_RULES, validate_and_adjust_decision
 from src.wfa_backtester import ConservativeSpotBacktester
@@ -312,6 +320,10 @@ class AutoTraderDaemon:
         # 内部状態
         self.in_maintenance_sleep: bool = False
         self.pre_maintenance_cleared: bool = False
+        self.saturday_0800_cleared: bool = False
+        self.saturday_0845_exited: bool = False
+        self.maintenance_open_confirmed_at: Optional[datetime] = None
+        self._last_rollover_clear_date: str = ""
         self.last_ai_call_at: Optional[datetime] = None
         self.last_radar_run_at: Optional[datetime] = None
         self.last_reconcile_run_at: Optional[datetime] = None
@@ -326,6 +338,10 @@ class AutoTraderDaemon:
         self._phase1_pre_freeze_cleared: bool = False
         self._phase2_pre_freeze_cleared: bool = False
         self.campaign_phase: str = "PHASE1_ACTIVE"
+        try:
+            self.circuit_breaker.load_sprt_cusum_from_wal(self.db_wal)
+        except Exception:
+            pass
 
     def absorb_daily_fee_fraction_settlement(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """
@@ -473,6 +489,67 @@ class AutoTraderDaemon:
         res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
         self.pre_maintenance_cleared = True
         return res
+
+    def execute_saturday_pre_maintenance_exit(
+        self,
+        now_dt: Optional[datetime] = None,
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        土曜 08:45 JST (Pre-Maintenance Exit) において、09:00〜11:00 JST の2時間ブラックアウト中の
+        ギャップダウン無防備リスクを回避するため、未約定 BUY 指値のキャンセルおよび
+        保有建玉の即時決済（Maker優先または成行エグジット）を実行する。
+        """
+        now_jst = _now_jst(now_dt)
+        if tickers and hasattr(self.broker, "update_market_tickers"):
+            try:
+                self.broker.update_market_tickers(tickers)
+            except Exception:
+                pass
+        cancel_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+        closed_positions: List[Dict[str, Any]] = []
+        pf_now = self.oco_manager.load_portfolio()
+        for pos in list(pf_now.get("positions", []) or []):
+            if str(pos.get("state", "PROTECTED")).strip().upper() == "DUST_QUARANTINED":
+                continue
+            if bool(pos.get("allow_saturday_carry", False)):
+                continue
+            sym = str(pos.get("symbol", "")).strip().upper()
+            min_sz = float(DEFAULT_SYMBOL_RULES.get(sym, {}).get("min_order_size", 0.0001) or 0.0001)
+            if float(pos.get("size", 0) or 0) < min_sz or not sym:
+                continue
+            try:
+                closed_tr = self.oco_manager.close_position_immediately(
+                    symbol=sym,
+                    reason="SATURDAY_PRE_MAINT_EXIT",
+                    now_dt=now_jst,
+                )
+                if closed_tr:
+                    closed_positions.append(closed_tr)
+            except Exception as exc:
+                logger.warning("土曜08:45メンテ前エグジット警告 (%s): %s", sym, exc)
+        self.saturday_0845_exited = True
+        return {
+            "status": "EXECUTED",
+            "canceled_order_ids": cancel_res.get("canceled_buy_order_ids", []) or cancel_res.get("canceled_order_ids", []),
+            "closed_positions": closed_positions,
+            "timestamp": now_jst.isoformat(timespec="seconds"),
+        }
+
+    def evaluate_jst_schedule_guard(
+        self,
+        now_dt: Optional[datetime] = None,
+        market_summaries: Optional[Dict[str, Dict[str, Any]]] = None,
+        exchange_status: str = "OPEN",
+    ) -> Dict[str, Any]:
+        """JST時間帯別・曜日別スケジュール＆土曜メンテ延長・月曜朝CME窓開けマトリクスを評価する"""
+        now_jst = _now_jst(now_dt)
+        return evaluate_jst_session_and_schedule_matrix(
+            now_dt=now_jst,
+            market_summaries=market_summaries,
+            exchange_status=exchange_status,
+            maintenance_open_confirmed_at=self.maintenance_open_confirmed_at,
+        )
 
     def reconcile_after_maintenance(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """
@@ -953,7 +1030,34 @@ class AutoTraderDaemon:
                 "events": campaign_res.get("events", []),
             }
 
-        # 0b. 土曜 08:50〜08:55 JST 未約定 BUY 事前クリア
+        # 0b. 日次ロールオーバー直前 (05:45〜05:59 JST) 未約定 BUY 自動クリア
+        mins_now = now_jst.hour * 60 + now_jst.minute
+        if (5 * 60 + 45) <= mins_now < (6 * 60):
+            roll_day = now_jst.strftime("%Y-%m-%d")
+            if self._last_rollover_clear_date != roll_day:
+                self._last_rollover_clear_date = roll_day
+                pf_roll = self.oco_manager.load_portfolio()
+                if pf_roll.get("pending_orders"):
+                    self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+
+        # 0c. 土曜 08:00 JST 待機注文クリア / 08:45〜08:49 JST メンテ前ポジションエグジット / 08:50〜08:55 JST 未約定 BUY 事前クリア
+        pre_maint_events: List[Dict[str, Any]] = []
+        if now_jst.weekday() == 5:
+            if (8 * 60) <= mins_now < (8 * 60 + 5) and not self.saturday_0800_cleared:
+                self.saturday_0800_cleared = True
+                if (self.oco_manager.load_portfolio().get("pending_orders") or []):
+                    self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+            if (8 * 60 + 45) <= mins_now < (8 * 60 + 50) and not self.saturday_0845_exited:
+                exit_res = self.execute_saturday_pre_maintenance_exit(now_dt=now_jst, tickers=tickers)
+                if exit_res.get("closed_positions") or exit_res.get("canceled_order_ids"):
+                    pre_maint_events.append(
+                        {
+                            "type": "SATURDAY_PRE_MAINT_EXIT",
+                            "closed_positions": exit_res.get("closed_positions", []),
+                            "canceled_order_ids": exit_res.get("canceled_order_ids", []),
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
         if is_in_saturday_pre_maintenance_clear_window(now_jst) and not self.pre_maintenance_cleared:
             self.clear_pending_buys_before_maintenance(now_dt=now_jst)
 
@@ -992,6 +1096,9 @@ class AutoTraderDaemon:
                 }
             self.in_maintenance_sleep = False
             self.pre_maintenance_cleared = False
+            self.saturday_0800_cleared = False
+            self.saturday_0845_exited = False
+            self.maintenance_open_confirmed_at = now_jst
             logger.info("🔧 メンテナンス枠が終了したため、資産・注文照合を実行して再開します。")
             reconcile_result = self.reconcile_after_maintenance(now_dt=now_jst)
 
@@ -1083,7 +1190,13 @@ class AutoTraderDaemon:
                 self.oco_manager.save_portfolio(pf_pre, now_dt=now_jst)
 
             step_events = self.oco_manager.step(tickers=current_tickers, now_dt=now_jst)
-            events = list(campaign_res.get("events", [])) + guardian_events + adverse_cancel_events + step_events
+            events = (
+                list(campaign_res.get("events", []))
+                + pre_maint_events
+                + guardian_events
+                + adverse_cancel_events
+                + step_events
+            )
 
             # 待機中BUY指値が逆選択ガードや期限切れでキャンセルされた場合は latest_decision.json の表示状態も同期
             for ev in adverse_cancel_events + step_events:
@@ -1101,17 +1214,35 @@ class AutoTraderDaemon:
                         now_dt=now_jst,
                     )
 
-            # SL 約定イベント発生時は該当銘柄に180分クールダウンを記録
+            # SL 約定イベント発生時は該当銘柄に180分クールダウンを記録 & 決済イベント発生時に SPRT / Page's Lower CUSUM 更新
             for ev in events:
-                if ev.get("type") in (
+                ev_type_s = str(ev.get("type", "")).upper()
+                ev_sym = str(ev.get("symbol", "")).upper()
+                if ev_type_s in (
                     "SL_EXECUTED",
                     "BOT_REDUNDANT_SL_EXECUTED",
                     "SL_PARTIAL_FAK_SWEPT",
                     "FAST_RECOVERY_MARKET_EXIT",
                 ):
-                    ev_sym = str(ev.get("symbol", "")).upper()
                     if ev_sym:
                         self.ai_judge.record_sl_hit_cooldown(ev_sym, now_dt=now_jst)
+                if ev_type_s in (
+                    "TP_EXECUTED",
+                    "SL_EXECUTED",
+                    "BOT_REDUNDANT_SL_EXECUTED",
+                    "SL_PARTIAL_FAK_SWEPT",
+                    "FAST_RECOVERY_MARKET_EXIT",
+                    "TIME_STOP_EXECUTED",
+                ) and ev_sym:
+                    try:
+                        self.circuit_breaker.record_closed_trade_sprt_and_cusum(
+                            symbol=ev_sym,
+                            net_pnl_jpy=float(ev.get("pnl_jpy", 0.0) or 0.0),
+                            is_shadow=False,
+                            db_wal=self.db_wal,
+                        )
+                    except Exception:
+                        pass
 
             # L5 ハード・キルスイッチ (Best Bid * (1 - Taker Fee) で3回連続 < max(17000, peak_equity * 0.85)) チェック
             pf_now = self.oco_manager.load_portfolio()
@@ -1186,6 +1317,7 @@ class AutoTraderDaemon:
         tickers: Optional[Dict[str, Dict[str, Any]]] = None,
         force_ai: bool = False,
         now_dt: Optional[datetime] = None,
+        exchange_status: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         15分間隔の中速レーダー＆AI判定＆自動発注サイクルを実行する。
@@ -1210,7 +1342,8 @@ class AutoTraderDaemon:
                 "events": campaign_res.get("events", []),
             }
 
-        if is_in_saturday_maintenance_window(now_jst):
+        ex_stat_clean = (exchange_status or "").strip().upper()
+        if is_in_saturday_maintenance_window(now_jst) or (not self.in_maintenance_sleep and ex_stat_clean in ("MAINTENANCE", "PREOPEN")):
             self.in_maintenance_sleep = True
             return {
                 "status": "MAINTENANCE_SLEEP",
@@ -1219,7 +1352,14 @@ class AutoTraderDaemon:
             }
 
         if self.in_maintenance_sleep:
+            if ex_stat_clean in ("MAINTENANCE", "PREOPEN"):
+                return {
+                    "status": f"WAITING_EXCHANGE_OPEN_{ex_stat_clean}",
+                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                    "ai_called": False,
+                }
             self.in_maintenance_sleep = False
+            self.maintenance_open_confirmed_at = now_jst
             self.reconcile_after_maintenance(now_dt=now_jst)
 
         if self.circuit_breaker_paused_until and now_jst < self.circuit_breaker_paused_until:
@@ -1283,6 +1423,21 @@ class AutoTraderDaemon:
                 if self.ai_judge.is_symbol_on_ai_cooldown(s, now_dt=now_jst)[0]
                 or self.ai_judge.is_symbol_on_sl_cooldown(s, now_dt=now_jst)[0]
             }
+            if self.maintenance_open_confirmed_at is not None:
+                pf["maintenance_open_confirmed_at"] = self.maintenance_open_confirmed_at.isoformat(timespec="seconds")
+            if self.circuit_breaker._dynamic_blacklisted_symbols:
+                pf["dynamic_blacklisted_symbols"] = sorted(
+                    set(pf.get("dynamic_blacklisted_symbols", []) or [])
+                    | set(self.circuit_breaker._dynamic_blacklisted_symbols)
+                )
+            jst_mat = self.evaluate_jst_schedule_guard(
+                now_dt=now_jst,
+                market_summaries=market_summaries,
+                exchange_status=ex_stat_clean or "OPEN",
+            )
+            if jst_mat.get("should_clear_pending_buys") and (pf.get("pending_orders") or []):
+                self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                pf = self.oco_manager.load_portfolio()
             radar_eval = self.radar.evaluate_triggers(
                 market_summaries=market_summaries,
                 portfolio=pf,
@@ -1371,6 +1526,12 @@ class AutoTraderDaemon:
                 block_reason = ""
                 if not campaign_res.get("allow_new_buy", True):
                     block_reason = f"[{campaign_res['phase']}: 運用期限2時間前エントリー凍結中によりHOLDへ自動補正] "
+                elif not bool(jst_mat.get("allow_new_buy", True)):
+                    block_reason = f"[JSTスケジュール制御 ({jst_mat.get('session_name')} / {jst_mat.get('block_reason')}) によりHOLDへ自動補正] "
+                    validated["jst_schedule_rejected"] = True
+                elif self.circuit_breaker.sprt_alarm_latched:
+                    block_reason = f"[Wald's SPRT 劣化アラーム発動中 (LLR={self.circuit_breaker._sprt_llr:.4f}) によりHOLDへ自動補正] "
+                    validated["sprt_alarm_rejected"] = True
                 elif is_in_daily_fee_settlement_freeze_window(now_jst):
                     block_reason = "[05:59:30〜06:00:30 JST 手数料端数精算ウィンドウ保護によりHOLDへ自動補正] "
                     validated["deferred_by_fee_settlement_window"] = True

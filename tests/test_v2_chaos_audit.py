@@ -4373,6 +4373,306 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         self.assertTrue(am_cushion["asymmetric_cushion_applied"])
         self.assertEqual(am_cushion["risk_pct_decimal"], Decimal("0.0185"))
 
+    def test_round15_deep_research2_tier_matrix_jst_schedule_and_sprt_cusum_audit(self) -> None:
+        """
+        Round 15 (Deep Research Report #2 統合監査テスト):
+        1. 全17銘柄の3ティア分類・5銘柄永久ブラックリスト (FCR, NAC, WILD, ASTR, ATOM)・SOL優先ボーナス・Tier 2 実効板厚フィルタ・BCH 0.22% スプレッド上限
+        2. JST時間帯別・曜日別7区分パラメータマトリクス・土曜メンテ前後制御 (08:00停止, 08:45エグジット, 12:10延長メンテ+15分安定化待機)・月曜朝CME窓開け制御
+        3. 少サンプル統計管理 (100件凍結ゲート, 連敗ラダー5〜8連敗, Wald's SPRT, Page's Lower CUSUM, Shadow 25%重み, SQLite WAL永続化)
+        """
+        from decimal import Decimal
+        from src.circuit_breaker import (
+            MultiTierCircuitBreaker,
+            compute_pages_lower_cusum_step,
+            compute_wald_sprt_step,
+            evaluate_losing_streak_ladder,
+        )
+        from src.database_wal import DatabaseWAL
+        from src.llm_shadow_evaluator import (
+            LLMShadowEvaluator,
+            SHADOW_DISCOUNT_WEIGHT,
+            evaluate_mintrl_freeze_stage,
+        )
+        from src.radar import TechnicalRadar, evaluate_tier2_effective_depth_filter
+        from src.regime_filter import (
+            BCH_MAX_SPREAD_PCT,
+            BLACKLISTED_SYMBOLS,
+            SOL_PRIORITY_SCORE_BONUS,
+            TIER1_SYMBOLS,
+            TIER2_SYMBOLS,
+            classify_symbol_tier,
+            evaluate_cme_monday_gap,
+            evaluate_jst_session_and_schedule_matrix,
+        )
+        from src.validator import DEFAULT_SYMBOL_RULES, validate_and_adjust_decision
+
+        # ------------------------------------------------------------------
+        # ① 全17銘柄の3ティア分類・5銘柄永久ブラックリスト・Tier 2 実効板厚フィルタ・BCH 0.22% 上限
+        # ------------------------------------------------------------------
+        self.assertEqual(BLACKLISTED_SYMBOLS, {"FCR", "NAC", "WILD", "ASTR", "ATOM"})
+        self.assertEqual(TIER1_SYMBOLS, {"BTC", "ETH", "XRP", "SOL"})
+        self.assertEqual(TIER2_SYMBOLS, {"DOGE", "SUI", "LTC", "BCH", "LINK", "ADA", "XLM", "DOT"})
+
+        sol_tier = classify_symbol_tier("SOL")
+        self.assertEqual(sol_tier["tier"], "TIER1")
+        self.assertEqual(sol_tier["priority_score_bonus"], SOL_PRIORITY_SCORE_BONUS)
+
+        for bl_sym in BLACKLISTED_SYMBOLS:
+            bl_info = classify_symbol_tier(bl_sym)
+            self.assertEqual(bl_info["tier"], "TIER3_BLACKLISTED")
+            self.assertTrue(bl_info["is_blacklisted"])
+            res_bl = validate_and_adjust_decision(
+                decision={
+                    "action": "BUY",
+                    "symbol": bl_sym,
+                    "confidence": 0.90,
+                    "limit_price": 100.0,
+                    "take_profit_price": 108.0,
+                    "stop_loss_price": 97.0,
+                },
+                portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+                symbol_rules=DEFAULT_SYMBOL_RULES,
+                market_summaries={bl_sym: {"price": {"last": 100.0, "best_bid": 100.0, "best_ask": 100.1}}},
+            )
+            self.assertEqual(res_bl["action"], "HOLD")
+            self.assertTrue(res_bl.get("tier3_blacklisted_rejected"))
+
+        # Tier 2 実効板厚フィルタ: ① 9,011円成行売り想定スリッページ <= 0.15% & ② -0.5%以内累積買い板厚 >= 45,000円
+        thin_ob = {
+            "bids": [
+                {"price": "100.0", "size": "20.0"},  # 2,000円
+                {"price": "99.0", "size": "100.0"},  # 9,900円 (1.0%下 -> スリッページ大 & -0.5%板厚不足)
+            ],
+            "asks": [{"price": "100.1", "size": "100.0"}],
+        }
+        t2_thin = evaluate_tier2_effective_depth_filter(
+            symbol="ADA",
+            ticker={"bid": 100.0, "ask": 100.1, "last": 100.0},
+            orderbook=thin_ob,
+            slot_notional_jpy=9011.0,
+        )
+        self.assertFalse(t2_thin["passed"])
+
+        deep_ob = {
+            "bids": [
+                {"price": "100.00", "size": "300.0"},  # 30,000円 (slippage=0%)
+                {"price": "99.95", "size": "250.0"},   # 24,987.5円 (合計 54,987.5円 >= 45,000円)
+            ],
+            "asks": [{"price": "100.10", "size": "300.0"}],
+        }
+        t2_deep = evaluate_tier2_effective_depth_filter(
+            symbol="ADA",
+            ticker={"bid": 100.00, "ask": 100.10, "last": 100.00},
+            orderbook=deep_ob,
+            slot_notional_jpy=9011.0,
+        )
+        self.assertTrue(t2_deep["passed"])
+        self.assertLessEqual(t2_deep["simulated_sell_slippage_pct"], 0.15)
+        self.assertGreaterEqual(t2_deep["cum_bid_depth_05pct_jpy"], 45000.0)
+
+        # BCH 専用スプレッド上限 (0.22%) チェック
+        bch_wide_val = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "BCH",
+                "confidence": 0.85,
+                "limit_price": 70000.0,
+                "take_profit_price": 74000.0,
+                "stop_loss_price": 68000.0,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries={
+                "BCH": {
+                    "price": {"last": 70000.0, "best_bid": 70000.0, "best_ask": 70180.0, "spread_pct": 0.257},
+                    "daily_indicators": {"atr_14": 2000.0},
+                }
+            },
+        )
+        self.assertEqual(bch_wide_val["action"], "HOLD")
+        self.assertTrue(bch_wide_val.get("tier2_depth_filter_rejected"))
+        self.assertEqual(bch_wide_val.get("tier2_depth_failed_code"), "BCH_SPREAD_EXCEEDS_022_PCT")
+
+        # ------------------------------------------------------------------
+        # ② JST時間帯別・曜日別7区分パラメータマトリクス・土曜メンテ延長・月曜朝CME窓開け制御
+        # ------------------------------------------------------------------
+        # 1) 日次ロールオーバー (05:45〜06:15 JST)
+        dt_roll = datetime(2026, 10, 21, 5, 50, 0, tzinfo=JST)
+        m_roll = evaluate_jst_session_and_schedule_matrix(now_dt=dt_roll)
+        self.assertEqual(m_roll["session_name"], "DAILY_ROLLOVER_BLACKOUT")
+        self.assertFalse(m_roll["allow_new_buy"])
+        self.assertTrue(m_roll["should_clear_pending_buys"])
+
+        # 2) 早朝閑散帯 (平日 03:00〜05:45 JST)
+        dt_early = datetime(2026, 10, 21, 4, 0, 0, tzinfo=JST)
+        m_early = evaluate_jst_session_and_schedule_matrix(now_dt=dt_early)
+        self.assertEqual(m_early["session_name"], "EARLY_MORNING_ILLIQUID")
+        self.assertEqual(m_early["allowed_tiers"], ["TIER1"])
+        self.assertAlmostEqual(m_early["max_spread_pct"], 0.20, places=2)
+        self.assertAlmostEqual(m_early["confidence_threshold_delta"], 0.08, places=2)
+        self.assertAlmostEqual(m_early["limit_offset_atr_mult"], 1.30, places=2)
+        self.assertAlmostEqual(m_early["size_mult"], 0.70, places=2)
+        self.assertEqual(m_early["max_concurrent_slots"], 1)
+        self.assertFalse(m_early["allow_mode1_breakout_peg"])
+
+        # 3) 東京昼休み (平日 12:00〜15:00 JST)
+        dt_lunch = datetime(2026, 10, 21, 12, 30, 0, tzinfo=JST)
+        m_lunch = evaluate_jst_session_and_schedule_matrix(now_dt=dt_lunch)
+        self.assertEqual(m_lunch["session_name"], "TOKYO_LUNCH_LULL")
+        self.assertEqual(m_lunch["allowed_tiers"], ["TIER1"])
+        self.assertAlmostEqual(m_lunch["order_ttl_mult"], 0.50, places=2)
+
+        # 4) 欧米重複ゴールデンタイム (21:00〜03:00 JST)
+        dt_golden = datetime(2026, 10, 21, 22, 30, 0, tzinfo=JST)
+        m_golden = evaluate_jst_session_and_schedule_matrix(now_dt=dt_golden)
+        self.assertEqual(m_golden["session_name"], "EU_US_OVERLAP_GOLDEN")
+        self.assertEqual(m_golden["allowed_tiers"], ["TIER1", "TIER2"])
+        self.assertAlmostEqual(m_golden["confidence_threshold_delta"], -0.02, places=2)
+        self.assertAlmostEqual(m_golden["limit_offset_atr_mult"], 0.90, places=2)
+
+        # 5) 土曜メンテナンス前後制御 (08:00停止, 08:45エグジット, 12:10延長メンテ+15分安定化待機)
+        m_sat_0810 = evaluate_jst_session_and_schedule_matrix(now_dt=datetime(2026, 10, 24, 8, 10, 0, tzinfo=JST))
+        self.assertEqual(m_sat_0810["session_name"], "SATURDAY_MAINTENANCE_GUARD")
+        self.assertFalse(m_sat_0810["allow_new_buy"])
+        self.assertTrue(m_sat_0810["should_clear_pending_buys"])
+
+        m_sat_0846 = evaluate_jst_session_and_schedule_matrix(now_dt=datetime(2026, 10, 24, 8, 46, 0, tzinfo=JST))
+        self.assertTrue(m_sat_0846["should_exit_positions_pre_maint"])
+
+        # 延長メンテが 12:10 JST に OPEN 確認された場合、12:20 JST はまだ安定化待機中 (+15m = 12:25 まで)
+        open_1210 = datetime(2026, 10, 24, 12, 10, 0, tzinfo=JST)
+        m_sat_1220 = evaluate_jst_session_and_schedule_matrix(
+            now_dt=datetime(2026, 10, 24, 12, 20, 0, tzinfo=JST),
+            exchange_status="OPEN",
+            maintenance_open_confirmed_at=open_1210,
+        )
+        self.assertEqual(m_sat_1220["session_name"], "SATURDAY_MAINTENANCE_GUARD")
+        self.assertFalse(m_sat_1220["allow_new_buy"])
+        self.assertEqual(m_sat_1220["block_reason"], "POST_MAINTENANCE_STABILIZATION_WAIT")
+
+        # 6) 月曜朝 CME 窓開け (06:30〜09:30 JST): 小幅ギャップアップ (< 1.0*ATR) は飛びつきロング禁止
+        dt_mon = datetime(2026, 10, 26, 7, 15, 0, tzinfo=JST)
+        m_mon_small_gap = evaluate_jst_session_and_schedule_matrix(
+            now_dt=dt_mon,
+            market_summaries={
+                "BTC": {
+                    "price": {"last": 14100000.0},
+                    "daily_indicators": {"atr_14": 300000.0, "cme_friday_close": 13950000.0},  # +0.50 ATR gap up
+                }
+            },
+        )
+        self.assertEqual(m_mon_small_gap["session_name"], "MONDAY_MORNING_CME_OPEN")
+        self.assertFalse(m_mon_small_gap["allow_new_buy"])
+        self.assertEqual(m_mon_small_gap["cme_gap_info"]["gap_regime"], "SMALL_GAP_MEAN_REVERSION_ONLY")
+
+        # 大幅窓開け (> 1.2*ATR) はトレンドフォロー許可
+        cme_large = evaluate_cme_monday_gap(
+            current_price=14400000.0,
+            cme_friday_close=13950000.0,
+            atr=300000.0,
+        )
+        self.assertEqual(cme_large["gap_regime"], "LARGE_GAP_TREND_FOLLOW_ALLOWED")
+        self.assertTrue(cme_large["allow_trend_follow"])
+
+        # ------------------------------------------------------------------
+        # ③ 少サンプル統計管理 (MinTRL 100件凍結, 連敗ラダー, Wald's SPRT, Page's Lower CUSUM, Shadow 25%重み)
+        # ------------------------------------------------------------------
+        self.assertEqual(evaluate_mintrl_freeze_stage(35)["mintrl_stage"], "STAGE0_HARD_FREEZE")
+        self.assertTrue(evaluate_mintrl_freeze_stage(35)["parameters_frozen"])
+        self.assertEqual(evaluate_mintrl_freeze_stage(150)["mintrl_stage"], "STAGE1_BOUNDARY_AUDIT")
+        self.assertEqual(evaluate_mintrl_freeze_stage(260)["mintrl_stage"], "STAGE2_MINTRL_UNLOCKED")
+        self.assertFalse(evaluate_mintrl_freeze_stage(260)["parameters_frozen"])
+
+        # 連敗ラダー (5連敗Yellow / 6連敗Orange / 7連敗Red / 8連敗Halt)
+        self.assertEqual(evaluate_losing_streak_ladder(4)["ladder_stage"], "GREEN_NORMAL")
+        self.assertEqual(evaluate_losing_streak_ladder(5)["ladder_stage"], "YELLOW_TIER1_ONLY")
+        self.assertEqual(evaluate_losing_streak_ladder(6)["ladder_stage"], "ORANGE_HALF_SLOT")
+        self.assertAlmostEqual(evaluate_losing_streak_ladder(6)["max_slot_jpy"], 4500.0, places=1)
+        self.assertEqual(evaluate_losing_streak_ladder(7)["ladder_stage"], "RED_SHADOW_ONLY")
+        self.assertEqual(evaluate_losing_streak_ladder(8)["ladder_stage"], "HALT_SYSTEM_PROTECTION")
+
+        # 6連敗時に Validator で Tier 2 が拒否され、Tier 1 (SOL) は 4,500円上限に半減されること
+        val_6loss_t2 = validate_and_adjust_decision(
+            decision={"action": "BUY", "symbol": "DOGE", "confidence": 0.85, "limit_price": 20.0},
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "consecutive_losses": 6, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries={"DOGE": {"price": {"last": 20.0, "best_bid": 20.0, "best_ask": 20.01}}},
+        )
+        self.assertEqual(val_6loss_t2["action"], "HOLD")
+        self.assertTrue(val_6loss_t2.get("yellow_tier1_only_rejected"))
+
+        val_6loss_t1 = validate_and_adjust_decision(
+            decision={
+                "action": "BUY",
+                "symbol": "SOL",
+                "confidence": 0.85,
+                "limit_price": 20000.0,
+                "take_profit_price": 21200.0,
+                "stop_loss_price": 19400.0,
+            },
+            portfolio={"jpy_balance": 20025, "initial_capital_jpy": 20000, "consecutive_losses": 6, "positions": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+            market_summaries={
+                "SOL": {
+                    "price": {"last": 20000.0, "best_bid": 20000.0, "best_ask": 20010.0, "spread_pct": 0.05},
+                    "daily_indicators": {"atr_14": 600.0},
+                }
+            },
+        )
+        self.assertEqual(val_6loss_t1["action"], "BUY")
+        self.assertTrue(val_6loss_t1.get("orange_half_slot_applied"))
+        self.assertLessEqual(val_6loss_t1["expected_cost_jpy"], 4500)
+
+        # Wald's SPRT: 下限 B = -2.2513 で 0 リセット、上限 A = +2.8904 で DEGRADATION_ALARM
+        llr = 0.0
+        for _ in range(8):
+            s_win = compute_wald_sprt_step(llr, is_win=True, weight=1.0)
+            llr = s_win["llr"]
+        self.assertEqual(s_win["status"], "HEALTHY_RESET_ZERO")
+        self.assertEqual(llr, 0.0)
+
+        for _ in range(11):
+            s_loss = compute_wald_sprt_step(llr, is_win=False, weight=1.0)
+            llr = s_loss["llr"]
+        self.assertEqual(s_loss["status"], "DEGRADATION_ALARM")
+        self.assertTrue(s_loss["alarm_triggered"])
+
+        # Page's Lower CUSUM & SQLite WAL 永続化
+        with tempfile.TemporaryDirectory() as tmp_dir_str:
+            tmp_path = Path(tmp_dir_str)
+            wal = DatabaseWAL(tmp_path / "sprt_cusum_test.db")
+            cb = MultiTierCircuitBreaker(symbol_rules=DEFAULT_SYMBOL_RULES)
+            for _ in range(6):
+                res_sc = cb.record_closed_trade_sprt_and_cusum(
+                    symbol="LINK",
+                    net_pnl_jpy=-360.0,  # -1.2R (1回あたり +0.7857 -> 6回で S_i^- = 4.714 > 4.0)
+                    r_multiple=-1.2,
+                    is_shadow=False,
+                    db_wal=wal,
+                )
+            self.assertTrue(res_sc["symbol_cusum"]["alarm_triggered"])
+            self.assertIn("LINK", cb._dynamic_blacklisted_symbols)
+
+            # 再起動後も SQLite WAL から SPRT / CUSUM 状態と動的ブラックリストが復元されること
+            cb_reloaded = MultiTierCircuitBreaker(symbol_rules=DEFAULT_SYMBOL_RULES)
+            loaded_state = cb_reloaded.load_sprt_cusum_from_wal(wal)
+            self.assertIn("LINK", loaded_state["dynamic_blacklisted_symbols"])
+            self.assertIn("LINK", cb_reloaded._dynamic_blacklisted_symbols)
+
+            # Shadow Trade 25%重み割引 (w_shadow = 0.25) の検証
+            shadow_ev = LLMShadowEvaluator(db_wal=wal)
+            self.assertEqual(SHADOW_DISCOUNT_WEIGHT, 0.25)
+            cal_res = shadow_ev.calibrate_confidence_and_threshold(
+                raw_confidence=0.80,
+                live_trade_count=20,
+                live_wins=10,
+                live_losses=10,
+            )
+            self.assertEqual(cal_res["mintrl_stage"], "STAGE0_HARD_FREEZE")
+            self.assertTrue(cal_res["parameters_frozen"])
+            self.assertEqual(cal_res["shadow_weight"], 0.25)
+            wal.close()
+
 
 if __name__ == "__main__":
     unittest.main()

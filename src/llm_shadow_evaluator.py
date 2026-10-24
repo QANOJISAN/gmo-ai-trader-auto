@@ -25,6 +25,41 @@ logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
 
+# Deep Research #2 【追加実装3】: Shadowデータの未約定バイアス割引重み (w_shadow = 0.25)
+SHADOW_DISCOUNT_WEIGHT = 0.25
+
+
+def evaluate_mintrl_freeze_stage(live_trade_count: int) -> Dict[str, Any]:
+    """
+    Deep Research #2 【追加実装3】: MinTRL 100件凍結ゲート
+    - 実約定件数 < 100件  : `STAGE0_HARD_FREEZE` (全ハイパーパラメータ・閾値最適化を完全凍結)
+    - 100〜249件          : `STAGE1_BOUNDARY_AUDIT` (境界監査のみ許可・コア構造固定)
+    - >= 250件            : `STAGE2_MINTRL_UNLOCKED` (統計的有意サンプル到達・フル更新解禁)
+    """
+    n_live = max(0, int(live_trade_count or 0))
+    if n_live < 100:
+        stage = "STAGE0_HARD_FREEZE"
+        allow_param_tuning = False
+        allow_boundary_audit = False
+    elif n_live < 250:
+        stage = "STAGE1_BOUNDARY_AUDIT"
+        allow_param_tuning = False
+        allow_boundary_audit = True
+    else:
+        stage = "STAGE2_MINTRL_UNLOCKED"
+        allow_param_tuning = True
+        allow_boundary_audit = True
+
+    return {
+        "live_trade_count": n_live,
+        "mintrl_stage": stage,
+        "parameters_frozen": not allow_param_tuning,
+        "allow_parameter_tuning": allow_param_tuning,
+        "allow_boundary_audit": allow_boundary_audit,
+        "remaining_to_stage1": max(0, 100 - n_live),
+        "remaining_to_stage2": max(0, 250 - n_live),
+    }
+
 
 def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     if now_dt is None:
@@ -328,12 +363,17 @@ class LLMShadowEvaluator:
         alpha_0: float = 2.0,
         beta_0: float = 2.0,
         k_weight: float = 5.0,
+        live_trade_count: int = 0,
+        live_wins: int = 0,
+        live_losses: int = 0,
+        w_shadow: float = SHADOW_DISCOUNT_WEIGHT,
     ) -> Dict[str, Any]:
         """
         直近20〜30件の `llm_shadow_evaluations` レコードから閉ループ自己較正スコアカードを集計する。
         - ① FPR（過信率）：`BUY` 判定後に SL 被弾した割合と直近の失敗要約
         - ② FNR（機会損失率）：`HOLD`（Veto）判定後に `+2.0R` 以上上昇（または TP 到達）した割合と逃したトレード要約
         - ③ TNR（Veto正解率）：`HOLD` 判定により下落・SL 被弾を回避した割合
+        - ④ Shadowデータ重み割引 (`w_shadow = 0.25`) と MinTRL 100件凍結ステージ (`STAGE0_HARD_FREEZE` / `STAGE1_BOUNDARY_AUDIT` / `STAGE2_MINTRL_UNLOCKED`)
         - ベータ・二項ベイズ較正パラメータと動的閾値 `effective_threshold = max(0.72, Quantile_0.75)`
         """
         recent_recs = self._collect_recent_records_for_calibration(limit=limit)
@@ -411,8 +451,30 @@ class LLMShadowEvaluator:
         effective_threshold = max(0.72, round(q75, 4))
         empirical_win_rate = (buy_wins / buy_total) if buy_total > 0 else 0.50
 
+        w_shd = max(0.0, min(1.0, float(w_shadow)))
+        n_live = max(int(live_trade_count or 0), int(live_wins or 0) + int(live_losses or 0))
+        weighted_shadow_wins = round(w_shd * float(buy_wins), 4)
+        weighted_shadow_losses = round(w_shd * float(buy_sl_hits), 4)
+        weighted_shadow_total = round(w_shd * float(buy_total), 4)
+        weighted_shadow_sample_size = round(w_shd * float(buy_total + hold_total), 4)
+        effective_weighted_wins = round(float(live_wins or 0) + weighted_shadow_wins, 4)
+        effective_weighted_total = round(float(n_live) + weighted_shadow_total, 4)
+        mintrl_info = evaluate_mintrl_freeze_stage(n_live)
+
         return {
             "evaluated_sample_size": buy_total + hold_total,
+            "shadow_weight": w_shd,
+            "weighted_shadow_sample_size": weighted_shadow_sample_size,
+            "weighted_shadow_wins": weighted_shadow_wins,
+            "weighted_shadow_losses": weighted_shadow_losses,
+            "weighted_shadow_total": weighted_shadow_total,
+            "live_trade_count": n_live,
+            "live_wins": int(live_wins or 0),
+            "live_losses": int(live_losses or 0),
+            "effective_weighted_wins": effective_weighted_wins,
+            "effective_weighted_total": effective_weighted_total,
+            "mintrl_stage": mintrl_info["mintrl_stage"],
+            "mintrl_info": mintrl_info,
             "buy_total": buy_total,
             "buy_wins": buy_wins,
             "buy_sl_hits": buy_sl_hits,
@@ -438,10 +500,15 @@ class LLMShadowEvaluator:
         alpha_0: float = 2.0,
         beta_0: float = 2.0,
         k_weight: float = 5.0,
+        live_trade_count: int = 0,
+        live_wins: int = 0,
+        live_losses: int = 0,
+        w_shadow: float = SHADOW_DISCOUNT_WEIGHT,
     ) -> Dict[str, Any]:
         """
         ベータ・二項ベイズ較正＆動的分位点閾値調整を実行する:
           p_calibrated = (alpha_0 + W + k * p_raw) / (alpha_0 + beta_0 + N + k)
+          p_shadow_discounted = (alpha_0 + (W_live + 0.25*W_shd) + k * p_raw) / (alpha_0 + beta_0 + (N_live + 0.25*N_shd) + k)
           effective_threshold = max(0.72, Quantile_0.75)
         """
         p_raw = max(0.0, min(1.0, float(raw_confidence or 0.0)))
@@ -450,6 +517,10 @@ class LLMShadowEvaluator:
             alpha_0=alpha_0,
             beta_0=beta_0,
             k_weight=k_weight,
+            live_trade_count=live_trade_count,
+            live_wins=live_wins,
+            live_losses=live_losses,
+            w_shadow=w_shadow,
         )
         w_wins = float(scorecard["buy_wins"])
         n_total = float(scorecard["buy_total"])
@@ -459,10 +530,24 @@ class LLMShadowEvaluator:
             if denom > 0
             else p_raw
         )
+
+        w_eff = float(scorecard["effective_weighted_wins"])
+        n_eff = float(scorecard["effective_weighted_total"])
+        denom_eff = float(alpha_0) + float(beta_0) + n_eff + float(k_weight)
+        p_shadow_discounted = (
+            (float(alpha_0) + w_eff + float(k_weight) * p_raw) / denom_eff
+            if denom_eff > 0
+            else p_raw
+        )
+
         effective_threshold = float(scorecard["effective_threshold"])
         return {
             "raw_confidence": round(p_raw, 4),
             "calibrated_confidence": round(p_calibrated, 4),
+            "shadow_discounted_calibrated_confidence": round(p_shadow_discounted, 4),
+            "shadow_weight": scorecard["shadow_weight"],
+            "mintrl_stage": scorecard["mintrl_stage"],
+            "parameters_frozen": scorecard.get("parameters_frozen", True),
             "quantile_75_confidence": scorecard["quantile_75_confidence"],
             "effective_threshold": round(effective_threshold, 4),
             "passes_dynamic_threshold": p_raw >= effective_threshold,

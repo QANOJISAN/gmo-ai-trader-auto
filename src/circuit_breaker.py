@@ -34,11 +34,210 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.llm_shadow_evaluator import SHADOW_DISCOUNT_WEIGHT, evaluate_mintrl_freeze_stage
+from src.regime_filter import BLACKLISTED_SYMBOLS, TIER1_SYMBOLS, TIER2_SYMBOLS
 from src.validator import DEFAULT_SYMBOL_RULES, _to_decimal, compute_anti_martingale_risk_params
 
 logger = logging.getLogger(__name__)
 
 JST = timezone(timedelta(hours=9))
+
+# Wald's SPRT 定数 (p0=0.55 vs p1=0.40, alpha=0.05, beta=0.10)
+SPRT_P0_HEALTHY_WIN_RATE = 0.55
+SPRT_P1_DEGRADED_WIN_RATE = 0.40
+SPRT_ALPHA = 0.05
+SPRT_BETA = 0.10
+SPRT_WIN_LLR_COEFF = -0.3185        # ln(0.40 / 0.55)
+SPRT_LOSS_LLR_COEFF = 0.2877        # ln(0.60 / 0.45)
+SPRT_LOWER_BOUNDARY_B = -2.2513     # ln(beta / (1 - alpha)) = ln(0.10 / 0.95)
+SPRT_UPPER_BOUNDARY_A = 2.8904      # ln((1 - beta) / alpha) = ln(0.90 / 0.05)
+
+# Page's Lower CUSUM 定数 (mu0=+0.15, sigma_R=1.05, k=0.5, h=4.0, 1R=300 JPY)
+CUSUM_MU_0 = 0.15
+CUSUM_SIGMA_R = 1.05
+CUSUM_SLACK_K = 0.50
+CUSUM_THRESHOLD_H = 4.00
+CUSUM_BASE_1R_JPY = 300.0
+
+
+def evaluate_losing_streak_ladder(
+    consecutive_losses: int,
+    base_slot_cap_jpy: float = 9_000.0,
+) -> Dict[str, Any]:
+    """
+    Deep Research #2 【追加実装3】: 連敗段階ガード (Losing Streak Ladder)
+    - 0〜4連敗 (Green/Normal): Tier 1 + Tier 2 許可、1枠上限 100% (9,000円)
+    - 5連敗 (Yellow)         : 対象を `Tier 1 (4銘柄: BTC, ETH, XRP, SOL)` のみに限定
+    - 6連敗 (Orange)         : `Tier 1` のみ ＋ 1枠上限を `50%` (`4,500円`) に縮小
+    - 7連敗 (Red)            : 新規発注を一時停止し Shadow 追跡モードへ移行
+    - 8連敗以上 (Halt)       : システム保護 Halt (実発注完全停止)
+    """
+    streak = max(0, int(consecutive_losses or 0))
+    base_cap = max(1000.0, float(base_slot_cap_jpy or 9000.0))
+
+    if streak < 5:
+        return {
+            "consecutive_losses": streak,
+            "color": "GREEN",
+            "ladder_stage": "GREEN_NORMAL",
+            "allowed_tiers": ["TIER1", "TIER2"],
+            "allowed_symbols": sorted(TIER1_SYMBOLS | TIER2_SYMBOLS),
+            "tier1_only": False,
+            "slot_cap_mult": 1.00,
+            "max_slot_cap_jpy": round(base_cap, 2),
+            "max_slot_jpy": round(base_cap, 2),
+            "allow_live_buy": True,
+            "shadow_only_mode": False,
+            "system_halt": False,
+        }
+    if streak == 5:
+        return {
+            "consecutive_losses": streak,
+            "color": "YELLOW",
+            "ladder_stage": "YELLOW_TIER1_ONLY",
+            "allowed_tiers": ["TIER1"],
+            "allowed_symbols": sorted(TIER1_SYMBOLS),
+            "tier1_only": True,
+            "slot_cap_mult": 1.00,
+            "max_slot_cap_jpy": round(base_cap, 2),
+            "max_slot_jpy": round(base_cap, 2),
+            "allow_live_buy": True,
+            "shadow_only_mode": False,
+            "system_halt": False,
+        }
+    if streak == 6:
+        return {
+            "consecutive_losses": streak,
+            "color": "ORANGE",
+            "ladder_stage": "ORANGE_HALF_SLOT",
+            "allowed_tiers": ["TIER1"],
+            "allowed_symbols": sorted(TIER1_SYMBOLS),
+            "tier1_only": True,
+            "slot_cap_mult": 0.50,
+            "max_slot_cap_jpy": 4500.0,
+            "max_slot_jpy": 4500.0,
+            "allow_live_buy": True,
+            "shadow_only_mode": False,
+            "system_halt": False,
+        }
+    if streak == 7:
+        return {
+            "consecutive_losses": streak,
+            "color": "RED",
+            "ladder_stage": "RED_SHADOW_ONLY",
+            "allowed_tiers": [],
+            "allowed_symbols": [],
+            "tier1_only": True,
+            "slot_cap_mult": 0.00,
+            "max_slot_cap_jpy": 0.0,
+            "max_slot_jpy": 0.0,
+            "allow_live_buy": False,
+            "shadow_only_mode": True,
+            "system_halt": False,
+        }
+    return {
+        "consecutive_losses": streak,
+        "color": "HALT",
+        "ladder_stage": "HALT_SYSTEM_PROTECTION",
+        "allowed_tiers": [],
+        "allowed_symbols": [],
+        "tier1_only": True,
+        "slot_cap_mult": 0.00,
+        "max_slot_cap_jpy": 0.0,
+        "max_slot_jpy": 0.0,
+        "allow_live_buy": False,
+        "shadow_only_mode": True,
+        "system_halt": True,
+    }
+
+
+def compute_wald_sprt_step(
+    prev_llr: float,
+    is_win: bool,
+    weight: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Deep Research #2 【追加実装3】: Wald's SPRT (p0=0.55 vs p1=0.40, alpha=0.05, beta=0.10)
+    - トレード決済ごとに対数尤度比 LLR_n = -0.3185 * W_n + 0.2877 * L_n を更新
+    - 下側健全境界 B = -2.2513 以下で LLR_n = 0 にリセット (HEALTHY_RESET_ZERO)
+    - 上側劣化境界 A = +2.8904 以上で勝率劣化アラームを発火 (DEGRADATION_ALARM: ロット50%縮小またはShadow移行)
+    """
+    w = max(0.0, float(weight))
+    delta = (SPRT_WIN_LLR_COEFF if is_win else SPRT_LOSS_LLR_COEFF) * w
+    raw_llr = float(prev_llr) + delta
+
+    if raw_llr <= SPRT_LOWER_BOUNDARY_B:
+        return {
+            "llr_before_reset": round(raw_llr, 4),
+            "llr": 0.0,
+            "delta_llr": round(delta, 4),
+            "status": "HEALTHY_RESET_ZERO",
+            "healthy_reset_triggered": True,
+            "sprt_alarm": False,
+            "alarm_triggered": False,
+            "recommended_action": "NORMAL_OPERATION",
+            "lot_scale_mult": 1.0,
+            "lower_boundary_b": SPRT_LOWER_BOUNDARY_B,
+            "upper_boundary_a": SPRT_UPPER_BOUNDARY_A,
+        }
+    if raw_llr >= SPRT_UPPER_BOUNDARY_A:
+        return {
+            "llr_before_reset": round(raw_llr, 4),
+            "llr": round(raw_llr, 4),
+            "delta_llr": round(delta, 4),
+            "status": "DEGRADATION_ALARM",
+            "healthy_reset_triggered": False,
+            "sprt_alarm": True,
+            "alarm_triggered": True,
+            "recommended_action": "HALF_LOT_OR_SHADOW",
+            "lot_scale_mult": 0.50,
+            "lower_boundary_b": SPRT_LOWER_BOUNDARY_B,
+            "upper_boundary_a": SPRT_UPPER_BOUNDARY_A,
+        }
+    return {
+        "llr_before_reset": round(raw_llr, 4),
+        "llr": round(raw_llr, 4),
+        "delta_llr": round(delta, 4),
+        "status": "CONTINUING",
+        "healthy_reset_triggered": False,
+        "sprt_alarm": False,
+        "alarm_triggered": False,
+        "recommended_action": "NORMAL_OPERATION",
+        "lot_scale_mult": 1.0,
+        "lower_boundary_b": SPRT_LOWER_BOUNDARY_B,
+        "upper_boundary_a": SPRT_UPPER_BOUNDARY_A,
+    }
+
+
+def compute_pages_lower_cusum_step(
+    prev_s_minus: float,
+    net_pnl_jpy: Optional[float] = None,
+    r_multiple: Optional[float] = None,
+    base_1r_jpy: float = CUSUM_BASE_1R_JPY,
+) -> Dict[str, Any]:
+    """
+    Deep Research #2 【追加実装3】: Page's Lower CUSUM (mu0=+0.15, sigma_R=1.05, k=0.5, h=4.0)
+    - 実現R倍数 r_i = NetPnL_i / 300 に対し:
+        S_i^- = max(0, S_{i-1}^- - (r_i - 0.15) / 1.05 - 0.5)
+    - S_i^- > 4.0 到達でアラーム発火（銘柄別で S_i^- > 4.0 到達した銘柄は動的ブラックリストへ自動隔離）
+    """
+    if r_multiple is not None and net_pnl_jpy is None:
+        r_i = float(r_multiple)
+    else:
+        denom = max(1.0, float(base_1r_jpy or CUSUM_BASE_1R_JPY))
+        r_i = float(net_pnl_jpy or 0.0) / denom
+
+    s_prev = max(0.0, float(prev_s_minus or 0.0))
+    s_next = max(0.0, s_prev - ((r_i - CUSUM_MU_0) / CUSUM_SIGMA_R) - CUSUM_SLACK_K)
+    breached = bool(s_next > CUSUM_THRESHOLD_H)
+
+    return {
+        "r_multiple": round(r_i, 4),
+        "prev_s_minus": round(s_prev, 4),
+        "s_minus": round(s_next, 4),
+        "threshold_h": CUSUM_THRESHOLD_H,
+        "alarm_triggered": breached,
+    }
 
 # Windows SetThreadExecutionState フラグ
 ES_CONTINUOUS = 0x80000000
@@ -262,6 +461,27 @@ class MultiTierCircuitBreaker:
         self.l5_last_conservative_equity_jpy: Decimal = Decimal("20000")
         self.hwm_candidate_readings: List[Decimal] = []
 
+        # Deep Research #2 【追加実装3】: Wald's SPRT & Page's Lower CUSUM 状態変数
+        self.sprt_llr: float = 0.0
+        self.sprt_wins_since_reset: int = 0
+        self.sprt_losses_since_reset: int = 0
+        self.sprt_alarm_active: bool = False
+        self.portfolio_cusum_s_minus: float = 0.0
+        self.symbol_cusum_s_minus: Dict[str, float] = {}
+        self.dynamic_blacklisted_symbols: set[str] = set()
+
+    @property
+    def _dynamic_blacklisted_symbols(self) -> set[str]:
+        return self.dynamic_blacklisted_symbols
+
+    @property
+    def sprt_alarm_latched(self) -> bool:
+        return self.sprt_alarm_active
+
+    @property
+    def _sprt_llr(self) -> float:
+        return self.sprt_llr
+
     # ------------------------------------------------------------------
     # L1: 個別銘柄一時除外（スプレッド急拡大・データ遅延）
     # ------------------------------------------------------------------
@@ -475,7 +695,13 @@ class MultiTierCircuitBreaker:
                 self.l4_paused_until = target_until
             reasons.append(f"L4: {streak}連敗到達 (>= {self.l4_max_consecutive_losses}連敗 -> 12hクールダウン)")
 
-        blocked = bool(self.l4_paused_until and now_jst < self.l4_paused_until)
+        ladder_info = evaluate_losing_streak_ladder(streak)
+        if not ladder_info["allow_live_buy"]:
+            reasons.append(
+                f"連敗段階ガード ({ladder_info['ladder_stage']}): {streak}連敗により実発注停止・Shadow/Halt保護"
+            )
+
+        blocked = bool((self.l4_paused_until and now_jst < self.l4_paused_until) or not ladder_info["allow_live_buy"])
         return {
             "level": "L4",
             "blocked": blocked,
@@ -483,6 +709,7 @@ class MultiTierCircuitBreaker:
             "weekly_starting_equity_jpy": float(weekly_starting_eq),
             "weekly_loss_limit_jpy": float(effective_l4_limit),
             "consecutive_losses": streak,
+            "losing_streak_ladder": ladder_info,
             "weekly_pnl_jpy": float(weekly_pnl),
             "paused_until": self.l4_paused_until.isoformat(timespec="seconds") if self.l4_paused_until else None,
             "reasons": reasons,
@@ -691,3 +918,142 @@ class MultiTierCircuitBreaker:
         """
         conservative_eq, _ = self.calculate_conservative_equity_jpy(portfolio, tickers)
         return compute_anti_martingale_risk_params(portfolio=portfolio, total_equity=conservative_eq)
+
+    def evaluate_streak_ladder(
+        self,
+        portfolio_or_streak: Any,
+        base_slot_cap_jpy: float = 9_000.0,
+    ) -> Dict[str, Any]:
+        """連敗段階ガード (Losing Streak Ladder: 5連敗Yellow, 6連敗Orange 4500円, 7連敗Red Shadow, 8連敗Halt) を判定する"""
+        if isinstance(portfolio_or_streak, dict):
+            explicit_st = portfolio_or_streak.get("consecutive_losses")
+            if explicit_st is not None:
+                streak = int(explicit_st)
+            else:
+                streak = 0
+                for tr in reversed(portfolio_or_streak.get("closed_trades", []) or []):
+                    pnl = _to_decimal(tr.get("realized_pnl_jpy", tr.get("pnl_jpy", 0)))
+                    if pnl < Decimal("0"):
+                        streak += 1
+                    else:
+                        break
+        else:
+            streak = int(portfolio_or_streak or 0)
+        self.consecutive_losses = streak
+        return evaluate_losing_streak_ladder(streak, base_slot_cap_jpy=base_slot_cap_jpy)
+
+    def record_closed_trade_sprt_and_cusum(
+        self,
+        symbol: str,
+        net_pnl_jpy: float,
+        r_multiple: Optional[float] = None,
+        weight: float = 1.0,
+        is_shadow: bool = False,
+        db_wal: Optional[Any] = None,
+        portfolio: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        トレード決済ごとに Wald's SPRT 対数尤度比 LLR_n と Page's Lower CUSUM (全体・銘柄別 S_i^-) を更新し、
+        銘柄別 S_i^- > 4.0 到達時は当該銘柄を自動的に動的ブラックリストへ隔離する。
+        """
+        if is_shadow and weight == 1.0:
+            weight = SHADOW_DISCOUNT_WEIGHT
+        sym_up = str(symbol or "NONE").strip().upper()
+        pnl_val = float(net_pnl_jpy or 0.0)
+        is_win = pnl_val > 0.0
+
+        if is_win:
+            self.sprt_wins_since_reset += 1
+        else:
+            self.sprt_losses_since_reset += 1
+
+        sprt_res = compute_wald_sprt_step(prev_llr=self.sprt_llr, is_win=is_win, weight=weight)
+        self.sprt_llr = float(sprt_res["llr"])
+        if sprt_res["healthy_reset_triggered"]:
+            self.sprt_wins_since_reset = 0
+            self.sprt_losses_since_reset = 0
+            self.sprt_alarm_active = False
+        elif sprt_res["sprt_alarm"]:
+            self.sprt_alarm_active = True
+
+        pf_cusum_res = compute_pages_lower_cusum_step(
+            prev_s_minus=self.portfolio_cusum_s_minus,
+            net_pnl_jpy=pnl_val,
+            r_multiple=r_multiple,
+        )
+        self.portfolio_cusum_s_minus = float(pf_cusum_res["s_minus"])
+
+        sym_prev_s = float(self.symbol_cusum_s_minus.get(sym_up, 0.0) or 0.0)
+        sym_cusum_res = compute_pages_lower_cusum_step(
+            prev_s_minus=sym_prev_s,
+            net_pnl_jpy=pnl_val,
+            r_multiple=r_multiple,
+        )
+        self.symbol_cusum_s_minus[sym_up] = float(sym_cusum_res["s_minus"])
+
+        newly_quarantined = False
+        if sym_cusum_res["alarm_triggered"] and sym_up not in ("", "NONE"):
+            if sym_up not in self.dynamic_blacklisted_symbols:
+                newly_quarantined = True
+            self.dynamic_blacklisted_symbols.add(sym_up)
+
+        state_snapshot = {
+            "sprt_llr": round(self.sprt_llr, 4),
+            "sprt_wins_since_reset": self.sprt_wins_since_reset,
+            "sprt_losses_since_reset": self.sprt_losses_since_reset,
+            "sprt_status": sprt_res["status"],
+            "sprt_alarm": self.sprt_alarm_active,
+            "sprt_recommended_action": sprt_res["recommended_action"],
+            "portfolio_cusum_s_minus": round(self.portfolio_cusum_s_minus, 4),
+            "portfolio_cusum_alarm": bool(pf_cusum_res["alarm_triggered"]),
+            "symbol": sym_up,
+            "symbol_r_multiple": sym_cusum_res["r_multiple"],
+            "symbol_cusum_s_minus": round(self.symbol_cusum_s_minus[sym_up], 4),
+            "symbol_cusum_alarm": bool(sym_cusum_res["alarm_triggered"]),
+            "symbol_cusum": sym_cusum_res,
+            "portfolio_cusum": pf_cusum_res,
+            "sprt": sprt_res,
+            "symbol_newly_quarantined": newly_quarantined,
+            "symbol_cusum_map": {k: round(v, 4) for k, v in sorted(self.symbol_cusum_s_minus.items())},
+            "dynamic_blacklisted_symbols": sorted(self.dynamic_blacklisted_symbols),
+        }
+
+        if portfolio is not None and isinstance(portfolio, dict):
+            existing_dyn = {
+                str(s).strip().upper()
+                for s in (portfolio.get("dynamic_blacklisted_symbols", []) or [])
+                if s
+            }
+            portfolio["dynamic_blacklisted_symbols"] = sorted(existing_dyn | self.dynamic_blacklisted_symbols)
+            portfolio["sprt_cusum_state"] = state_snapshot
+
+        if db_wal is not None and hasattr(db_wal, "save_sprt_cusum_state"):
+            try:
+                db_wal.save_sprt_cusum_state(state_snapshot)
+            except Exception as exc:
+                logger.debug("save_sprt_cusum_state スキップ: %s", exc)
+
+        return state_snapshot
+
+    def load_sprt_cusum_from_wal(self, db_wal: Optional[Any]) -> Dict[str, Any]:
+        """DatabaseWAL から永続化済みの SPRT & CUSUM 状態を復元する"""
+        if db_wal is None or not hasattr(db_wal, "load_sprt_cusum_state"):
+            return {}
+        try:
+            st = db_wal.load_sprt_cusum_state()
+        except Exception:
+            st = {}
+        if not isinstance(st, dict) or not st:
+            return {}
+        self.sprt_llr = float(st.get("sprt_llr", 0.0) or 0.0)
+        self.sprt_wins_since_reset = int(st.get("sprt_wins_since_reset", 0) or 0)
+        self.sprt_losses_since_reset = int(st.get("sprt_losses_since_reset", 0) or 0)
+        self.sprt_alarm_active = bool(st.get("sprt_alarm", False))
+        self.portfolio_cusum_s_minus = float(st.get("portfolio_cusum_s_minus", 0.0) or 0.0)
+        raw_map = st.get("symbol_cusum_map") or {}
+        if isinstance(raw_map, dict):
+            self.symbol_cusum_s_minus = {str(k).upper(): float(v or 0.0) for k, v in raw_map.items()}
+        raw_bl = st.get("dynamic_blacklisted_symbols") or []
+        if isinstance(raw_bl, list):
+            self.dynamic_blacklisted_symbols = {str(x).strip().upper() for x in raw_bl if x}
+        return st

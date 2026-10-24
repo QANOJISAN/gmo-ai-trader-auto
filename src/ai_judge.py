@@ -28,6 +28,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.dpapi_vault import get_secret_env
 from src.json_utils import dumps_json
+from src.llm_shadow_evaluator import SHADOW_DISCOUNT_WEIGHT, evaluate_mintrl_freeze_stage
+from src.regime_filter import (
+    BLACKLISTED_SYMBOLS,
+    SOL_PRIORITY_SCORE_BONUS,
+    TIER1_SYMBOLS,
+    TIER2_SYMBOLS,
+    classify_symbol_tier,
+)
 from src.validator import (
     DEFAULT_SYMBOL_RULES,
     VALID_ACTIONS,
@@ -51,7 +59,7 @@ DEFAULT_GEMINI_FALLBACK_MODELS = [
     "gemini-2.5-flash-lite",
 ]
 
-MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP"}
+MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP", "SOL"}
 
 SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買の最高リスク責任者（CRO: Chief Risk Officer）兼クオンツ審査AI（Veto Gate）です。
 確証バイアス（Confirmation Bias）を排除するため、以下の【4ステップ反証型「Pre-Mortem」プロトコル】を厳格に実行し、反対仮説（`bearish_invalidation_points` / `bearish_counter_thesis` 最低2項目）を上回る強気エッジ（`bullish_edge_points` / `bullish_conviction_factors`）と確信度スコア（`conviction_score`: 0〜100）が 75点以上（かつ動的較正閾値 `effective_threshold` 以上）ある場合のみ `BUY` を承認してください。
@@ -709,9 +717,20 @@ class AIJudge:
         ]
 
         active_shadow = shadow_evaluator or self.shadow_evaluator
+        live_trades_list = list((portfolio or {}).get("closed_trades", []) or [])
+        live_trade_count = int((portfolio or {}).get("live_trade_count", len(live_trades_list)) or len(live_trades_list))
+        live_wins = sum(1 for t in live_trades_list if float(t.get("net_pnl_jpy", t.get("pnl_jpy", 0.0)) or 0.0) > 0.0)
+        live_losses = sum(1 for t in live_trades_list if float(t.get("net_pnl_jpy", t.get("pnl_jpy", 0.0)) or 0.0) <= 0.0)
+        mintrl_info = evaluate_mintrl_freeze_stage(live_trade_count)
+
         self_calibration_scorecard: Dict[str, Any] = {}
         if active_shadow is not None and hasattr(active_shadow, "compute_self_calibration_scorecard"):
             try:
+                self_calibration_scorecard = active_shadow.compute_self_calibration_scorecard(
+                    limit=30,
+                    live_trade_count=live_trade_count,
+                )
+            except TypeError:
                 self_calibration_scorecard = active_shadow.compute_self_calibration_scorecard(limit=30)
             except Exception:
                 self_calibration_scorecard = {}
@@ -790,12 +809,27 @@ class AIJudge:
         if act_norm == "MODIFY":
             decision["limit_price"] = 0
 
-        # Shadow Evaluation 閉ループ自己較正（ベータ・二項ベイズ較正＆動的閾値 effective_threshold = max(0.72, Quantile_0.75)）
+        # Shadow Evaluation 閉ループ自己較正（ベータ・二項ベイズ較正＆動的閾値 effective_threshold = max(0.72, Quantile_0.75) / Shadow重み25% / MinTRL 100件凍結ゲート）
         effective_min_conv_score = self.min_conviction_score
+        decision["mintrl_stage"] = mintrl_info["mintrl_stage"]
+        decision["mintrl_parameters_frozen"] = mintrl_info["parameters_frozen"]
+        decision["shadow_weight"] = SHADOW_DISCOUNT_WEIGHT
         if active_shadow is not None and hasattr(active_shadow, "calibrate_confidence_and_threshold"):
             try:
-                cal = active_shadow.calibrate_confidence_and_threshold(decision["confidence"])
+                try:
+                    cal = active_shadow.calibrate_confidence_and_threshold(
+                        decision["confidence"],
+                        live_trade_count=live_trade_count,
+                        live_wins=live_wins,
+                        live_losses=live_losses,
+                    )
+                except TypeError:
+                    cal = active_shadow.calibrate_confidence_and_threshold(decision["confidence"])
                 decision["calibrated_confidence"] = cal["calibrated_confidence"]
+                decision["shadow_discounted_calibrated_confidence"] = cal.get(
+                    "shadow_discounted_calibrated_confidence",
+                    cal["calibrated_confidence"],
+                )
                 decision["effective_confidence_threshold"] = cal["effective_threshold"]
                 decision["self_calibration_scorecard"] = cal["scorecard"]
                 if int(cal["scorecard"].get("evaluated_sample_size", 0)) >= 4:
@@ -1135,8 +1169,12 @@ class AIJudge:
         best_score = -999.0
         best_details: Dict[str, Any] = {}
 
+        dyn_blacklisted = {str(s).strip().upper() for s in (portfolio.get("dynamic_blacklisted_symbols", []) or [])}
+
         for sym, summary in market_summaries.items():
             sym_up = sym.upper()
+            if sym_up in BLACKLISTED_SYMBOLS or sym_up in dyn_blacklisted:
+                continue
             if sym_up in held_symbols:
                 continue
             on_sl_cd, _ = self.is_symbol_on_sl_cooldown(sym_up, now_dt=now_dt)
@@ -1223,6 +1261,10 @@ class AIJudge:
                 reasons.append("下ヒゲSpring・売り吸収(CVD Absorption)検知")
             if bool(micro.get("is_upper_wick_trap", False)):
                 score -= 15.0
+
+            if sym_up == "SOL":
+                score += SOL_PRIORITY_SCORE_BONUS
+                reasons.append("Tier1流動性・Makerリベート(-0.03%)中核銘柄SOLボーナス")
 
             if score > best_score:
                 best_score = score
