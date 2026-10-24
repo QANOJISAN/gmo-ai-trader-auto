@@ -325,13 +325,13 @@ class TestV2AutoTradingSystem(unittest.TestCase):
                     price=tp_price,
                 )
 
-            # 3. +1.0R 到達 ➔ AI判定を待たずに自動建値ロック (`AUTO_BREAKEVEN_LOCKED`)
+            # 3. +1.65R 到達 ➔ AI判定を待たずに自動建値＋+0.15Rロック (`AUTO_BREAKEVEN_LOCKED`)
             t2 = t1 + timedelta(minutes=20)
             one_r_dist = limit_price - sl_price
-            bid_at_plus_1r = limit_price + one_r_dist + 20.0
+            bid_at_plus_1r = limit_price + (one_r_dist * 1.65)
             # ただし TP 未満であることを保証
             if bid_at_plus_1r >= tp_price:
-                bid_at_plus_1r = (limit_price + tp_price) / 2.0
+                bid_at_plus_1r = tp_price - 10.0
 
             tickers_1r = {
                 "BCH": {
@@ -348,7 +348,13 @@ class TestV2AutoTradingSystem(unittest.TestCase):
             self.assertEqual(events_1r[0]["type"], "AUTO_BREAKEVEN_LOCKED")
             self.assertEqual(events_1r[0]["old_sl_order_id"], first_sl_order_id)
 
-            expected_be_sl = calculate_breakeven_sl_price(limit_price, "BCH", DEFAULT_SYMBOL_RULES)
+            expected_be_sl = calculate_breakeven_sl_price(
+                limit_price,
+                "BCH",
+                DEFAULT_SYMBOL_RULES,
+                one_r_distance=one_r_dist,
+                profit_lock_r=0.15,
+            )
             self.assertEqual(events_1r[0]["new_sl_price"], expected_be_sl)
             self.assertGreater(expected_be_sl, limit_price)
 

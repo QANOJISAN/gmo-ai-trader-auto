@@ -100,6 +100,19 @@ def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     return now_dt.astimezone(JST)
 
 
+def is_in_daily_fee_settlement_freeze_window(now_dt: Optional[datetime] = None) -> bool:
+    """
+    毎朝 05:59:30〜06:00:30 JST（60秒間）の手数料端数精算ウィンドウかどうかを判定する。
+    この60秒間は緊急SL脱出を除く通常注文・changeOrderを一時停止し、精算処理との競合を防止する。
+    """
+    now_jst = _now_jst(now_dt)
+    if now_jst.hour == 5 and now_jst.minute == 59 and now_jst.second >= 30:
+        return True
+    if now_jst.hour == 6 and now_jst.minute == 0 and now_jst.second <= 30:
+        return True
+    return False
+
+
 def _normalize_v1_path(path: str) -> str:
     """`/private/v1/order` や `v1/order` を署名用パス `/v1/order` に正規化する"""
     p = path.strip()
@@ -270,11 +283,13 @@ class GMOPrivateClient:
         t_recv_ms: float,
         responsetime_str: Optional[str] = None,
         http_date_header: Optional[str] = None,
+        min_threshold_ms: int = 500,
     ) -> Optional[int]:
         """
         クリスティアンのアルゴリズムにより通信往復遅延 $\\text{RTT}/2$ を補正して
         サーバー時刻オフセット `clock_offset_ms` を更新する。
-        $\\text{offset} = (T_{\\text{server}} + \\text{RTT}/2) - T_{\\text{recv}}$
+        $|\\Delta t| \\ge 500\\text{ms}$ (`min_threshold_ms`) の場合のみ `clock_offset_ms` に適用し、
+        微小ジッターによる不要な揺れを防止しつつ `ERR-5008` / `ERR-5009` を予防する。
         """
         server_ms = parse_server_time_ms(responsetime_str, http_date_header)
         if server_ms is None:
@@ -282,7 +297,35 @@ class GMOPrivateClient:
         rtt_ms = max(0.0, float(t_recv_ms) - float(t_send_ms))
         self.last_rtt_ms = rtt_ms
         estimated_server_now_ms = float(server_ms) + (rtt_ms / 2.0)
-        self.clock_offset_ms = int(round(estimated_server_now_ms - float(t_recv_ms)))
+        delta_t_ms = int(round(estimated_server_now_ms - float(t_recv_ms)))
+        if abs(delta_t_ms) >= max(0, int(min_threshold_ms)):
+            self.clock_offset_ms = delta_t_ms
+        elif self.clock_offset_ms == 0:
+            self.clock_offset_ms = 0
+        return self.clock_offset_ms
+
+    def calibrate_clock_offset_from_http_date(
+        self,
+        http_date_header: str,
+        local_now_ms: Optional[float] = None,
+        rtt_ms: float = 0.0,
+        min_threshold_ms: int = 500,
+    ) -> int:
+        """
+        HTTP `Date` ヘッダ（または ISO 時刻文字列）とローカル時計の時刻差 $\\Delta t$ を測定し、
+        $|\\Delta t| \\ge 500\\text{ms}$ の場合は `clock_offset_ms` を自動更新して返す。
+        """
+        now_ms = float(local_now_ms if local_now_ms is not None else time.time() * 1000.0)
+        server_ms = parse_server_time_ms(None, http_date_header)
+        if server_ms is None:
+            server_ms = parse_server_time_ms(http_date_header, None)
+        if server_ms is None:
+            return self.clock_offset_ms
+        delta_t_ms = int(round((float(server_ms) + max(0.0, float(rtt_ms)) / 2.0) - now_ms))
+        if abs(delta_t_ms) >= max(0, int(min_threshold_ms)):
+            self.clock_offset_ms = delta_t_ms
+        else:
+            self.clock_offset_ms = 0
         return self.clock_offset_ms
 
     def _build_auth_headers(
@@ -698,6 +741,67 @@ class GMOPrivateClient:
                 results.append(self._normalize_order_dict(item))
         return results
 
+    def _resolve_idempotent_change_or_cancel_race(
+        self,
+        order_id: Union[str, int],
+        fallback_price: Optional[Union[str, int, float, Decimal]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        `changeOrder` または `cancelOrder` 実行時に `ERR-5003`（対象注文状態不正）や `ERR-5016`（タイムアウト）が
+        返った際、L2サーキットブレーカーのAPIエラーにせず `get_orders` / `latestExecutions` を1回照会し、
+        既に `EXECUTED`（約定済み）であれば正常約定完了として冪等に返す。
+        """
+        oid_str = str(order_id).strip()
+        if not oid_str:
+            return None
+        try:
+            orders = self.get_orders([oid_str])
+            if orders:
+                ord_info = orders[0]
+                if str(ord_info.get("status", "")).upper() == "EXECUTED":
+                    out = dict(ord_info)
+                    out.update(
+                        {
+                            "order_id": oid_str,
+                            "orderId": oid_str,
+                            "status": "EXECUTED",
+                            "order_status": "EXECUTED",
+                            "orderStatus": "EXECUTED",
+                            "idempotent_already_executed": True,
+                        }
+                    )
+                    return out
+            sym = ""
+            if orders:
+                sym = str(orders[0].get("symbol", "")).strip().upper()
+            elif self.wal_db is not None:
+                wal_ord = self.wal_db.get_order(oid_str)
+                if wal_ord:
+                    sym = str(wal_ord.get("symbol", "")).strip().upper()
+            if sym:
+                execs = self.get_latest_executions(sym, count=20)
+                matched = [e for e in execs if str(e.get("order_id", "")) == oid_str]
+                if matched:
+                    ex0 = matched[0]
+                    exec_sz = sum((float(e.get("size", 0) or 0) for e in matched), 0.0)
+                    exec_px = float(ex0.get("price", fallback_price or 0) or 0)
+                    return {
+                        "order_id": oid_str,
+                        "orderId": oid_str,
+                        "symbol": sym,
+                        "price": exec_px,
+                        "executed_price": exec_px,
+                        "size": exec_sz,
+                        "executed_size": exec_sz,
+                        "status": "EXECUTED",
+                        "order_status": "EXECUTED",
+                        "orderStatus": "EXECUTED",
+                        "idempotent_already_executed": True,
+                    }
+        except Exception as rec_exc:
+            logger.debug("change/cancel 競合照合スキップ (order_id=%s): %s", oid_str, rec_exc)
+        return None
+
     def change_order(
         self,
         order_id: Union[str, int],
@@ -716,10 +820,17 @@ class GMOPrivateClient:
             try:
                 self._request("POST", "/private/v1/changeOrder", body=body, priority=2)
                 break
-            except GMOPrivateAPIError as exc:
-                if "ERR-5122" in (exc.error_codes or []) and attempt < 3:
+            except (GMOPrivateAPIError, GMOOrderOutcomeUnknownError) as exc:
+                codes = getattr(exc, "error_codes", []) or []
+                if "ERR-5122" in codes and attempt < 3:
                     self._sleep(0.25 * (attempt + 1))
                     continue
+                if isinstance(exc, GMOOrderOutcomeUnknownError) or any(
+                    c in ("ERR-5003", "ERR-5016", "ERR-5106") for c in codes
+                ):
+                    resolved = self._resolve_idempotent_change_or_cancel_race(order_id, fallback_price=price)
+                    if resolved is not None:
+                        return resolved
                 raise
         oid_str = str(order_id)
         return {
@@ -738,10 +849,17 @@ class GMOPrivateClient:
             try:
                 self._request("POST", "/private/v1/cancelOrder", body={"orderId": oid}, priority=2)
                 break
-            except GMOPrivateAPIError as exc:
-                if "ERR-5122" in (exc.error_codes or []) and attempt < 3:
+            except (GMOPrivateAPIError, GMOOrderOutcomeUnknownError) as exc:
+                codes = getattr(exc, "error_codes", []) or []
+                if "ERR-5122" in codes and attempt < 3:
                     self._sleep(0.25 * (attempt + 1))
                     continue
+                if isinstance(exc, GMOOrderOutcomeUnknownError) or any(
+                    c in ("ERR-5003", "ERR-5016", "ERR-5106") for c in codes
+                ):
+                    resolved = self._resolve_idempotent_change_or_cancel_race(order_id)
+                    if resolved is not None:
+                        return resolved
                 raise
         oid_str = str(order_id)
         return {"order_id": oid_str, "orderId": oid_str, "status": "CANCELED", "orderStatus": "CANCELED"}
@@ -1561,7 +1679,12 @@ class PaperBroker:
         state = self._ensure_state_file()
         for o in state.get("orders", []):
             if str(o.get("order_id", "")) == oid:
-                if str(o.get("status", "")).upper() not in ("WAITING", "ORDERED"):
+                cur_st = str(o.get("status", "")).upper()
+                if cur_st == "EXECUTED":
+                    norm = GMOPrivateClient._normalize_order_dict(o)
+                    norm["idempotent_already_executed"] = True
+                    return norm
+                if cur_st not in ("WAITING", "ORDERED"):
                     raise GMOPrivateAPIError(f"非アクティブ注文は変更できません: {oid}")
                 sym = str(o.get("symbol", "")).upper()
                 tick = _to_decimal(DEFAULT_SYMBOL_RULES.get(sym, {}).get("tick_size", "1"))

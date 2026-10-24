@@ -476,27 +476,27 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             )
             self.assertLess(retreat_ord["pending_order"]["limit_price"], 20000)
 
-            # #17: 4段階トレーリングSL (+1.0R 建値、+1.5R +0.65Rロック、+2.0R シャンデリア & 0.20R ヒステリシス)
+            # #17: 4段階トレーリングSL (Stage 1: <+1.5R 初期SL維持、Stage 2: >=+1.6R +0.15Rロック、Stage 3: >=+2.2R シャンデリア、Stage 4: >=+3.0R クライマックス & 0.15R ヒステリシス)
             st1, p1, upd1 = compute_four_stage_trailing_sl(
                 entry_price=10000, current_bid=10300, highest_bid=10300, current_sl=9700, one_r_dist=300, symbol="SOL"
             )
             self.assertEqual(st1, 1)
-            self.assertTrue(upd1)
-            self.assertGreater(p1, 10000)
+            self.assertFalse(upd1)
+            self.assertEqual(p1, 9700)
 
             st2, p2, upd2 = compute_four_stage_trailing_sl(
-                entry_price=10000, current_bid=10460, highest_bid=10460, current_sl=p1, one_r_dist=300, symbol="SOL"
+                entry_price=10000, current_bid=10480, highest_bid=10480, current_sl=9700, one_r_dist=300, symbol="SOL"
             )
             self.assertEqual(st2, 2)
             self.assertTrue(upd2)
-            self.assertGreaterEqual(p2, 10195)
+            self.assertGreaterEqual(p2, 10045)
 
             st3, p3, upd3 = compute_four_stage_trailing_sl(
                 entry_price=10000, current_bid=10700, highest_bid=10700, current_sl=p2, one_r_dist=300, symbol="SOL"
             )
             self.assertGreaterEqual(st3, 3)
             self.assertTrue(upd3)
-            # 0.20R (60円) 未満の微動では更新しない (ヒステリシス)
+            # 0.15R (45円) 未満の微動では更新しない (ヒステリシス)
             _, _, upd_hyst = compute_four_stage_trailing_sl(
                 entry_price=10000, current_bid=10720, highest_bid=10720, current_sl=p3, one_r_dist=300, symbol="SOL"
             )
@@ -1248,8 +1248,19 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 symbol="SOL",
             )
             self.assertEqual(st1, 1)
-            self.assertTrue(upd1)
-            self.assertEqual(sl1, 100_200)
+            self.assertFalse(upd1)
+            self.assertEqual(sl1, 98_000)
+            st2_r1, sl2_r1, upd2_r1 = compute_four_stage_trailing_sl(
+                entry_price=100_000,
+                current_bid=103_300,
+                highest_bid=103_300,
+                current_sl=98_000,
+                one_r_dist=2_000,
+                symbol="SOL",
+            )
+            self.assertEqual(st2_r1, 2)
+            self.assertTrue(upd2_r1)
+            self.assertEqual(sl2_r1, 100_300)
             be_with_r = calculate_breakeven_sl_price(100_000, "SOL", one_r_distance=2_000)
             self.assertEqual(be_with_r, 100_300)
 
@@ -1773,9 +1784,9 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 tickers={"BCH": {"ask": 40100.0, "bid": 40050.0, "last": 40080.0}},
                 now_dt=t0 + timedelta(minutes=5, seconds=15),
             )
-            # 60秒グレース期間経過後 (t0 + 6m30s): DUST_QUARANTINED へ隔離されること
+            # 60秒グレース期間経過後 (t0 + 6m30s, RISK_OFF_CRASH緊急時): DUST_QUARANTINED へ隔離されること
             fast_d = daemon.run_fast_cycle(
-                tickers={"BCH": {"ask": 40100.0, "bid": 40050.0, "last": 40080.0}},
+                tickers={"BCH": {"ask": 40100.0, "bid": 40050.0, "last": 40080.0, "risk_off_crash": True}},
                 now_dt=t0 + timedelta(minutes=6, seconds=30),
             )
             self.assertTrue(any(e.get("type") == "PARTIAL_DUST_QUARANTINED" for e in fast_d["events"]))
@@ -2200,13 +2211,13 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
                 fill_price=44000.0,
                 now_dt=t0 + timedelta(minutes=3, seconds=5),
             )
-            # 1回目の step で PARTIAL_FILLED 検知＆60秒グレースタイマー開始 -> 65秒後の step で DUST_QUARANTINED に隔離
+            # 1回目の step で PARTIAL_FILLED 検知＆60秒グレースタイマー開始 -> 65秒後の step (RISK_OFF_CRASH緊急時) で DUST_QUARANTINED に隔離
             daemon.oco_manager.step(
                 tickers={"BCH": {"ask": 44200.0, "bid": 44150.0, "last": 44180.0}},
                 now_dt=t0 + timedelta(minutes=3, seconds=10),
             )
             daemon.oco_manager.step(
-                tickers={"BCH": {"ask": 44200.0, "bid": 44150.0, "last": 44180.0}},
+                tickers={"BCH": {"ask": 44200.0, "bid": 44150.0, "last": 44180.0, "risk_off_crash": True}},
                 now_dt=t0 + timedelta(minutes=4, seconds=15),
             )
             pf_bch1 = daemon.oco_manager.load_portfolio()
@@ -3357,6 +3368,443 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         archive_v1 = repo_root / "archive_v1"
         for f in ("portfolio.json", "history_log.csv", "latest_decision.json", "PERFORMANCE_REPORT.md"):
             self.assertTrue((archive_v1 / f).exists(), f"archive_v1/{f} must exist")
+
+    # ==================================================================
+    # Round 13 Audit: Step 1（長期無人稼働の死角封じ・取引所API安全弁）
+    #               + Step 2（エグジット4段階再設計・15秒Maker利確・Time-Stop・ロット逆算＆動的枠拡張）
+    # ==================================================================
+    def test_round13_step1_and_step2_comprehensive_upgrade_audit(self) -> None:
+        import os
+
+        from src.gmo_private_client import (
+            GMOPrivateAPIError,
+            GMOPrivateClient,
+            is_in_daily_fee_settlement_freeze_window,
+        )
+        from web_dashboard import cleanup_stale_git_push_lock
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            wal = DatabaseWAL(tmp_dir / "round13.db", portfolio_json_path=tmp_dir / "portfolio.json", auto_sync_files=True)
+            ex = ChaosMockExchange(tmp_dir, wal_db=wal)
+            oco = PseudoOCOManager(
+                broker=ex,
+                portfolio_path=tmp_dir / "portfolio.json",
+                wal_db=wal,
+                dry_run_notify=True,
+                async_tp_trial_mode=True,
+            )
+            t0 = datetime(2026, 10, 24, 12, 0, 0, tzinfo=JST)
+
+            # ------------------------------------------------------------------
+            # ① STOP 失効（STOP_EXPIRED_UNFILLED: 約定ゼロ失効）時の即時追撃決済フェイルセーフ
+            #    ＆ changeOrder 競合（ERR-5003 -> EXECUTED 照合）の冪等処理
+            # ------------------------------------------------------------------
+            oco.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000,
+                    "size": 0.1,
+                    "take_profit_price": 46500,
+                    "stop_loss_price": 42500,
+                },
+                tickers={"BCH": {"symbol": "BCH", "ask": 44100, "bid": 44050, "last": 44050}},
+                now_dt=t0,
+            )
+            oco.step(
+                tickers={"BCH": {"symbol": "BCH", "ask": 43990, "bid": 43980, "last": 43985}},
+                now_dt=t0 + timedelta(seconds=10),
+            )
+            pf1 = oco.load_portfolio()
+            self.assertEqual(len(pf1["positions"]), 1)
+            sl_oid_exp = pf1["positions"][0]["sl_order_id"]
+
+            # フラッシュクラッシュ（±20%超制限）で STOP (FAK) が executed_size=0 のまま EXPIRED 失効したケースを注入
+            ex.inject_partial_stop_fill_and_expire(
+                sl_oid_exp,
+                filled_size=0.0,
+                fill_price=42500.0,
+                now_dt=t0 + timedelta(seconds=20),
+            )
+            guardian_evs = oco.run_fast_recovery_guardian(
+                tickers={"BCH": {"symbol": "BCH", "ask": 34100, "bid": 34000, "last": 34000}},
+                now_dt=t0 + timedelta(seconds=21),
+            )
+            self.assertTrue(
+                any(e.get("state_transition") == "STOP_EXPIRED_UNFILLED" for e in guardian_evs),
+                f"200ms guardian must detect STOP_EXPIRED_UNFILLED and chase-liquidate: {guardian_evs}",
+            )
+            self.assertEqual(len(oco.load_portfolio()["positions"]), 0)
+
+            # changeOrder 競合（ERR-5003 / ERR-5016 -> get_orders で EXECUTED 確認時は例外にせず冪等完了）
+            priv_client = GMOPrivateClient(
+                api_key="dummy_key",
+                api_secret="dummy_secret",
+                wal_db=wal,
+            )
+            priv_client._sleep = lambda _: None  # type: ignore[method-assign]
+            race_calls = {"change": 0, "orders": 0}
+
+            def _mock_request_race(method: str, path: str, params=None, body=None, priority: int = 3):
+                if path == "/private/v1/changeOrder":
+                    race_calls["change"] += 1
+                    raise GMOPrivateAPIError(
+                        "ERR-5003 invalid order state",
+                        messages=[{"message_code": "ERR-5003", "message_string": "Order state invalid"}],
+                    )
+                if path == "/private/v1/orders":
+                    race_calls["orders"] += 1
+                    return {
+                        "list": [
+                            {
+                                "orderId": 999111,
+                                "symbol": "SOL",
+                                "side": "SELL",
+                                "executionType": "STOP",
+                                "orderStatus": "EXECUTED",
+                                "price": "20500",
+                                "size": "0.1",
+                                "executedSize": "0.1",
+                            }
+                        ]
+                    }
+                return {}
+
+            priv_client._request = _mock_request_race  # type: ignore[method-assign]
+            idemp_res = priv_client.change_order("999111", 20600)
+            self.assertEqual(idemp_res["status"], "EXECUTED")
+            self.assertTrue(idemp_res.get("idempotent_already_executed"))
+            self.assertEqual(race_calls["change"], 1)
+            self.assertEqual(race_calls["orders"], 1)
+
+            # HTTP Date ヘッダからの時刻オフセット自動補正 (|Δt| >= 500ms)
+            offset_applied = priv_client.calibrate_clock_offset_from_http_date(
+                "Sat, 24 Oct 2026 03:00:02 GMT",
+                local_now_ms=int(datetime(2026, 10, 24, 3, 0, 0, tzinfo=timezone.utc).timestamp() * 1000),
+                rtt_ms=40,
+            )
+            self.assertGreaterEqual(abs(offset_applied), 500)
+            self.assertEqual(priv_client.clock_offset_ms, offset_applied)
+
+            # 非対称銘柄 (BCH: min=0.01, step=0.001) の最小ロット未満部分約定 (0.004 < 0.01) が 60秒グレースで安易にキャンセルされないこと
+            buy_submin = oco.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000,
+                    "size": 0.02,
+                    "take_profit_price": 46500,
+                    "stop_loss_price": 42500,
+                },
+                tickers={"BCH": {"symbol": "BCH", "ask": 44100, "bid": 44050, "last": 44050}},
+                now_dt=t0 + timedelta(minutes=1),
+            )
+            submin_oid = buy_submin["order"]["order_id"]
+            ex.simulate_partial_fill(submin_oid, filled_size=0.004, fill_price=44000.0, now_dt=t0 + timedelta(minutes=1, seconds=5))
+            oco.step(
+                tickers={"BCH": {"symbol": "BCH", "ask": 44150, "bid": 44100, "last": 44100}},
+                now_dt=t0 + timedelta(minutes=1, seconds=10),
+            )
+            # 90秒経過時点 (> 60秒グレース、ただし < 4時間期限 & 通常相場) でもキャンセルされず待機継続
+            oco.step(
+                tickers={"BCH": {"symbol": "BCH", "ask": 44150, "bid": 44100, "last": 44100}},
+                now_dt=t0 + timedelta(minutes=2, seconds=50),
+            )
+            pf_submin = oco.load_portfolio()
+            self.assertEqual(len(pf_submin["pending_orders"]), 1)
+            self.assertTrue(pf_submin["pending_orders"][0].get("sub_min_grace_hold"))
+            # その後追加約定で 0.012 >= minOrderSize(0.01) に達した瞬間にトランシェ STOP が即時発注されること
+            ex.simulate_partial_fill(submin_oid, filled_size=0.008, fill_price=44000.0, now_dt=t0 + timedelta(minutes=3))
+            tranche_evs = oco.step(
+                tickers={"BCH": {"symbol": "BCH", "ask": 44150, "bid": 44100, "last": 44100}},
+                now_dt=t0 + timedelta(minutes=3, seconds=5),
+            )
+            self.assertTrue(any(e.get("type") == "PARTIAL_FILL_TRANCHE_SL_PLACED" for e in tranche_evs))
+            # 60秒グレース超過かつ >= minOrderSize のため残りはキャンセルされ SL_ACTIVE ポジションへ昇格
+            self.assertTrue(any(e.get("type") == "BUY_FILLED_AND_SL_PLACED" for e in tranche_evs))
+            oco.close_position_immediately("BCH", reason="CLEANUP_TEST", now_dt=t0 + timedelta(minutes=3, seconds=10))
+
+            # ------------------------------------------------------------------
+            # ② 4段階トレーリング（Stage 1: <+1.5R 変更なし、Stage 2: >=+1.6R 建値++0.15Rロック、
+            #    Stage 3: >=+2.2R シャンデリア、Stage 4: >=+3.0R クライマックス）の単調引き上げ検証
+            # ------------------------------------------------------------------
+            # Stage 1: +1.4R (10000 -> 10420, 1R=300) では初期SL(9700)を維持し should_update=False
+            s1_st, s1_px, s1_upd = compute_four_stage_trailing_sl(
+                entry_price=10000,
+                current_bid=10420,
+                highest_bid=10420,
+                current_sl=9700,
+                one_r_dist=300,
+                symbol="SOL",
+            )
+            self.assertEqual(s1_st, 1)
+            self.assertFalse(s1_upd)
+            self.assertEqual(s1_px, 9700)
+
+            # Stage 2 (早期構造条件): +1.25R (10375) かつ higher_low_15m=True & buy_flow_positive=True で発動
+            s2e_st, s2e_px, s2e_upd = compute_four_stage_trailing_sl(
+                entry_price=10000,
+                current_bid=10375,
+                highest_bid=10375,
+                current_sl=9700,
+                one_r_dist=300,
+                symbol="SOL",
+                higher_low_15m=True,
+                buy_flow_positive=True,
+            )
+            self.assertEqual(s2e_st, 2)
+            self.assertTrue(s2e_upd)
+            self.assertGreaterEqual(s2e_px, 10045)
+
+            # Stage 2 (標準): +1.65R (10495) で 往復コスト＋スリッページ＋+0.15R (+45円) ロック
+            s2_st, s2_px, s2_upd = compute_four_stage_trailing_sl(
+                entry_price=10000,
+                current_bid=10495,
+                highest_bid=10495,
+                current_sl=9700,
+                one_r_dist=300,
+                symbol="SOL",
+            )
+            self.assertEqual(s2_st, 2)
+            self.assertTrue(s2_upd)
+            self.assertGreaterEqual(s2_px, 10045)
+
+            # Stage 3 (適応型シャンデリア): +2.4R (10720) & atr_15m=120 で highest_bid - k*ATR_15m に追従
+            s3_st, s3_px, s3_upd = compute_four_stage_trailing_sl(
+                entry_price=10000,
+                current_bid=10720,
+                highest_bid=10720,
+                current_sl=s2_px,
+                one_r_dist=300,
+                symbol="SOL",
+                atr_15m=120,
+            )
+            self.assertEqual(s3_st, 3)
+            self.assertTrue(s3_upd)
+            self.assertGreater(s3_px, s2_px)
+
+            # Stage 4 (クライマックス): +3.1R (10930) または RSI > 78 で直近安値直下へタイトニング
+            s4_st, s4_px, s4_upd = compute_four_stage_trailing_sl(
+                entry_price=10000,
+                current_bid=10930,
+                highest_bid=10930,
+                current_sl=s3_px,
+                one_r_dist=300,
+                symbol="SOL",
+                atr_15m=120,
+                rsi_15m=81.5,
+                recent_low_15m=10780,
+            )
+            self.assertEqual(s4_st, 4)
+            self.assertTrue(s4_upd)
+            self.assertGreater(s4_px, s3_px)
+
+            # ------------------------------------------------------------------
+            # ③ 利確（TP）時の「15秒 Maker (SOK) トライアル ➔ 未約定または仮想ストップ割れ時の cancelBefore=true 成行フォールバック」
+            # ------------------------------------------------------------------
+            oco.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "limit_price": 20000,
+                    "size": 0.1,
+                    "take_profit_price": 20800,
+                    "stop_loss_price": 19500,
+                },
+                tickers={"SOL": {"symbol": "SOL", "ask": 20050, "bid": 20010, "last": 20010}},
+                now_dt=t0 + timedelta(minutes=10),
+            )
+            oco.step(
+                tickers={"SOL": {"symbol": "SOL", "ask": 19995, "bid": 19990, "last": 19990}},
+                now_dt=t0 + timedelta(minutes=10, seconds=10),
+            )
+            # TP (20800) 到達 -> SOK 売り発注 & 15秒トライアル開始 (TP_MAKER_TRIAL_STARTED)
+            tp_start_evs = oco.step(
+                tickers={"SOL": {"symbol": "SOL", "ask": 20820, "bid": 20805, "last": 20805}},
+                now_dt=t0 + timedelta(minutes=11),
+            )
+            self.assertTrue(any(e.get("type") == "TP_MAKER_TRIAL_STARTED" for e in tp_start_evs))
+            pf_tp_trial = oco.load_portfolio()
+            self.assertEqual(pf_tp_trial["positions"][0]["state"], "TP_MAKER_TRIAL")
+            self.assertEqual(pf_tp_trial["positions"][0]["tp_virtual_stop_price"], 20802.0)  # BestBid(20805) - 3 ticks
+
+            # 16秒経過（> 15秒）かつ未約定 -> 直ちに cancelBefore=true 付き MARKET / FAK / SELL フォールバックで利確完了
+            tp_fb_evs = oco.step(
+                tickers={"SOL": {"symbol": "SOL", "ask": 20830, "bid": 20804, "last": 20804}},
+                now_dt=t0 + timedelta(minutes=11, seconds=16),
+            )
+            self.assertTrue(any(e.get("type") == "TP_EXECUTED" for e in tp_fb_evs))
+            self.assertEqual(tp_fb_evs[0].get("tp_execution_mode"), "MARKET_FALLBACK_AFTER_15S")
+            self.assertEqual(len(oco.load_portfolio()["positions"]), 0)
+
+            # ------------------------------------------------------------------
+            # ④ 時間減衰エグジット（4.5h 停滞撤退 TIME_STOP_STAGNATION ＆ 8.0h 高確信枠ローテーション TIME_STOP_SLOT_ROTATION）
+            # ------------------------------------------------------------------
+            t_stag = t0 + timedelta(minutes=20)
+            oco.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "XRP",
+                    "limit_price": 100.0,
+                    "size": 50.0,
+                    "take_profit_price": 106.0,
+                    "stop_loss_price": 98.0,
+                },
+                tickers={"XRP": {"symbol": "XRP", "ask": 100.2, "bid": 100.1, "last": 100.1}},
+                now_dt=t_stag,
+            )
+            oco.step(
+                tickers={"XRP": {"symbol": "XRP", "ask": 99.9, "bid": 99.8, "last": 99.8}},
+                now_dt=t_stag + timedelta(seconds=10),
+            )
+            # エントリーから 4.6時間経過、MFE < +0.8R、現在 +0.10R ([-0.35R, +0.45R] ノイズ帯) -> TIME_STOP_STAGNATION_EXIT
+            stag_evs = oco.step(
+                tickers={"XRP": {"symbol": "XRP", "ask": 100.3, "bid": 100.2, "last": 100.2}},
+                now_dt=t_stag + timedelta(hours=4, minutes=40),
+            )
+            self.assertTrue(any(e.get("type") == "TIME_STOP_STAGNATION_EXIT" for e in stag_evs))
+            self.assertEqual(len(oco.load_portfolio()["positions"]), 0)
+
+            # 8.0h 高確信枠ローテーション: 2枠満杯で 8.5時間経過・含み益 +0.1R の停滞枠がある状態から、他銘柄の confidence=0.88 BUY シグナル発生
+            t_rot = t_stag + timedelta(hours=5)
+            oco.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "XRP",
+                    "limit_price": 100.0,
+                    "size": 30.0,
+                    "take_profit_price": 106.0,
+                    "stop_loss_price": 98.0,
+                },
+                tickers={"XRP": {"symbol": "XRP", "ask": 100.2, "bid": 100.1, "last": 100.1}},
+                now_dt=t_rot,
+            )
+            oco.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000,
+                    "size": 0.05,
+                    "take_profit_price": 46500,
+                    "stop_loss_price": 42500,
+                },
+                tickers={"BCH": {"symbol": "BCH", "ask": 44100, "bid": 44050, "last": 44050}},
+                now_dt=t_rot,
+            )
+            oco.step(
+                tickers={
+                    "XRP": {"symbol": "XRP", "ask": 99.9, "bid": 99.8, "last": 99.8},
+                    "BCH": {"symbol": "BCH", "ask": 43950, "bid": 43900, "last": 43900},
+                },
+                now_dt=t_rot + timedelta(seconds=10),
+            )
+            pf_two = oco.load_portfolio()
+            self.assertEqual(len(pf_two["positions"]), 2)
+            # XRP の opened_at を 8.5時間前に設定
+            pf_two["positions"][0]["opened_at"] = (t_rot - timedelta(hours=8, minutes=30)).isoformat(timespec="seconds")
+            pf_two["positions"][0]["current_price"] = 100.2  # +0.1R (< +0.5R)
+            pf_two["positions"][1]["current_price"] = 45200.0  # +0.8R (>= +0.5R)
+            oco.save_portfolio(pf_two, now_dt=t_rot + timedelta(seconds=20))
+
+            val_rot = validate_and_adjust_decision(
+                decision={
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "order_type": "LIMIT",
+                    "limit_price": 20000,
+                    "size": 0.2,
+                    "take_profit_price": 21200,
+                    "stop_loss_price": 19500,
+                    "confidence": 0.88,
+                    "conviction_score": 88,
+                },
+                portfolio=oco.load_portfolio(),
+                market_summaries={
+                    "XRP": {"price": {"best_bid": 100.2, "best_ask": 100.25, "last": 100.2}, "h1_indicators": {"atr_14": 1.2}},
+                    "BCH": {"price": {"best_bid": 45200, "best_ask": 45220, "last": 45200}, "h1_indicators": {"atr_14": 600}},
+                    "SOL": {"price": {"best_bid": 20010, "best_ask": 20015, "last": 20010}, "h1_indicators": {"atr_14": 250}},
+                },
+                symbol_rules=DEFAULT_SYMBOL_RULES,
+            )
+            self.assertEqual(val_rot["action"], "BUY", val_rot.get("reasoning"))
+            self.assertTrue(val_rot.get("slot_rotation_required"))
+            self.assertEqual(val_rot.get("slot_rotation_target_symbol"), "XRP")
+
+            rot_exec = oco.place_new_buy_order(
+                decision=val_rot,
+                tickers={
+                    "XRP": {"symbol": "XRP", "ask": 100.3, "bid": 100.2, "last": 100.2},
+                    "BCH": {"symbol": "BCH", "ask": 45250, "bid": 45200, "last": 45200},
+                    "SOL": {"symbol": "SOL", "ask": 20050, "bid": 20010, "last": 20010},
+                },
+                now_dt=t_rot + timedelta(seconds=30),
+            )
+            self.assertEqual(rot_exec["status"], "PENDING_BUY")
+            self.assertTrue(rot_exec.get("slot_rotation_executed"))
+            self.assertEqual(rot_exec["rotated_closed_trade"]["reason"], "TIME_STOP_SLOT_ROTATION")
+
+            # ------------------------------------------------------------------
+            # ⑤ ロット切り捨て余剰リスクによる初期SL引き下げ補正（Breathing Room）
+            #    ＆ 0ポジション高確信時の第1枠 65% 動的拡張の検証
+            # ------------------------------------------------------------------
+            pf_zero = {
+                "initial_capital_jpy": 20000,
+                "jpy_balance": 20025,
+                "peak_equity_jpy": 20025,
+                "positions": [],
+                "pending_orders": [],
+            }
+            val_dyn = validate_and_adjust_decision(
+                decision={
+                    "action": "BUY",
+                    "symbol": "BTC",
+                    "order_type": "LIMIT",
+                    "limit_price": 12500000,
+                    "size": 0.00109,  # 0.0001刻みへ切り捨て -> 0.0010 BTC (12,500円: 45%枠9,011円を超え65%枠13,016円以内)
+                    "take_profit_price": 12950000,
+                    "stop_loss_price": 12280000,  # d_SL = 1.76% < 2.2%
+                    "confidence": 0.85,
+                    "conviction_score": 85,
+                },
+                portfolio=pf_zero,
+                market_summaries={
+                    "BTC": {
+                        "price": {"best_bid": 12502000, "best_ask": 12505000, "last": 12502000},
+                        "h1_indicators": {"atr_14": 150000},
+                    }
+                },
+                symbol_rules=DEFAULT_SYMBOL_RULES,
+            )
+            self.assertEqual(val_dyn["action"], "BUY")
+            self.assertTrue(val_dyn.get("dynamic_slot_expansion_applied"))
+            self.assertEqual(val_dyn.get("effective_slot_alloc_pct"), 0.65)
+            self.assertGreater(val_dyn["expected_cost_jpy"], 9011)
+            self.assertLessEqual(val_dyn["expected_cost_jpy"], 13016)
+            self.assertTrue(val_dyn.get("breathing_room_applied"))
+            self.assertLess(val_dyn["stop_loss_price"], 12280000)
+            self.assertLessEqual(val_dyn["expected_loss_jpy"], 300)
+
+            # 05:59:30〜06:00:30 JST 手数料端数精算ウィンドウ判定 & Stale Git lock 解除 & WAL TRUNCATE 検証
+            self.assertTrue(
+                is_in_daily_fee_settlement_freeze_window(datetime(2026, 10, 25, 5, 59, 45, tzinfo=JST))
+            )
+            self.assertTrue(
+                is_in_daily_fee_settlement_freeze_window(datetime(2026, 10, 25, 6, 0, 15, tzinfo=JST))
+            )
+            self.assertFalse(
+                is_in_daily_fee_settlement_freeze_window(datetime(2026, 10, 25, 6, 0, 31, tzinfo=JST))
+            )
+            stale_lock = tmp_dir / "v2_git_push.lock"
+            stale_lock.write_text("stale", encoding="utf-8")
+            old_mtime = time.time() - 360.0
+            os.utime(stale_lock, (old_mtime, old_mtime))
+            self.assertTrue(cleanup_stale_git_push_lock(stale_lock, max_age_sec=300.0))
+            self.assertFalse(stale_lock.exists())
+
+            trunc_res = wal.checkpoint_truncate()
+            self.assertEqual(trunc_res["mode"], "TRUNCATE")
+            wal.close()
 
 
 if __name__ == "__main__":

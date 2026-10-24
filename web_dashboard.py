@@ -87,6 +87,30 @@ DEFAULT_GITHUB_PAGES_URL = "https://qanojisan.github.io/gmo-ai-trader-auto/"
 _GIT_PUSH_LOCK = threading.Lock()
 _LAST_GIT_PUSH_MONO: float = 0.0
 DEFAULT_GIT_PUSH_MIN_INTERVAL_SEC: float = 300.0
+STALE_GIT_PUSH_LOCK_MAX_AGE_SEC: float = 300.0
+
+
+def cleanup_stale_git_push_lock(
+    lock_path: Path,
+    max_age_sec: float = STALE_GIT_PUSH_LOCK_MAX_AGE_SEC,
+    now_epoch: Optional[float] = None,
+) -> bool:
+    """
+    `v2_git_push.lock` が5分（300秒）以上放置されている場合、
+    スタックしたロック（Stale Lock）とみなして自動解除（削除）する。
+    """
+    lp = Path(lock_path)
+    if not lp.exists():
+        return False
+    try:
+        cur_ts = float(now_epoch if now_epoch is not None else time.time())
+        age_sec = cur_ts - lp.stat().st_mtime
+        if age_sec < float(max_age_sec):
+            return False
+        lp.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
 
 
 def push_docs_snapshot_async(
@@ -118,10 +142,16 @@ def push_docs_snapshot_async(
         global _LAST_GIT_PUSH_MONO
         if not _GIT_PUSH_LOCK.acquire(blocking=False):
             return
-        file_lock = SingleInstanceLock(resolved / "v2_git_push.lock")
+        push_lock_path = resolved / "v2_git_push.lock"
+        cleanup_stale_git_push_lock(push_lock_path, max_age_sec=STALE_GIT_PUSH_LOCK_MAX_AGE_SEC)
+        file_lock = SingleInstanceLock(push_lock_path)
         try:
             if not file_lock.acquire():
-                return
+                if cleanup_stale_git_push_lock(push_lock_path, max_age_sec=STALE_GIT_PUSH_LOCK_MAX_AGE_SEC):
+                    if not file_lock.acquire():
+                        return
+                else:
+                    return
 
             stamp_file = resolved / "v2_git_push.last"
             if not force and stamp_file.exists():

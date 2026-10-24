@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import logging
 import os
 import sys
@@ -48,6 +49,7 @@ from src.gmo_private_client import (
     GMOPrivateClient,
     PaperBroker,
     create_broker_client,
+    is_in_daily_fee_settlement_freeze_window,
 )
 from src.json_utils import load_json_file, write_json_file
 from src.live_probe import GMOCoinLiveProbe
@@ -317,9 +319,74 @@ class AutoTraderDaemon:
         self._daily_trade_date: str = ""
         self._daily_trade_count: int = 0
         self._last_digest_date: str = ""
+        self._last_fee_settlement_date: str = ""
+        self._last_wal_truncate_date: str = ""
         self._phase1_pre_freeze_cleared: bool = False
         self._phase2_pre_freeze_cleared: bool = False
         self.campaign_phase: str = "PHASE1_ACTIVE"
+
+    def absorb_daily_fee_fraction_settlement(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
+        """
+        毎朝 06:00 JST の GMOコイン手数料端数精算ウィンドウ（05:59:30〜06:00:30 JST）直後の 06:00:30 JST に、
+        数十円の残高微増（<= 50 JPY）を `DAILY_FEE_FRACTION_SETTLEMENT` として台帳・L3基準値・HWMへ自動吸収する。
+        """
+        now_jst = _now_jst(now_dt)
+        pf = self.oco_manager.load_portfolio()
+        pending_buys = [
+            o
+            for o in (pf.get("pending_orders", []) or [])
+            if str(o.get("side", "BUY")).upper() == "BUY"
+            and str(o.get("state", "PENDING_BUY")).upper() in ("PENDING_BUY", "ENTRY_PENDING", "PARTIAL_FILLED")
+        ]
+        if pending_buys:
+            return {"status": "SKIPPED_PENDING_BUYS", "delta_jpy": 0}
+
+        try:
+            balances = self.broker.get_jpy_and_spot_balances()
+            actual_jpy = int(round(float(balances.get("jpy_available", pf.get("jpy_balance", 0)) or 0)))
+        except Exception as exc:
+            logger.debug("06:00:30 手数料端数精算時の残高取得スキップ: %s", exc)
+            return {"status": "SKIPPED_ERROR", "delta_jpy": 0}
+
+        expected_jpy = int(round(float(pf.get("jpy_balance", actual_jpy) or actual_jpy)))
+        delta_jpy = actual_jpy - expected_jpy
+        if 0 < delta_jpy <= 50:
+            pf["jpy_balance"] = actual_jpy
+            pf["realized_pnl_total_jpy"] = int(pf.get("realized_pnl_total_jpy", 0) or 0) + delta_jpy
+            pf["total_realized_pnl_jpy"] = pf["realized_pnl_total_jpy"]
+            if pf.get("day_start_equity_jpy") is not None:
+                pf["day_start_equity_jpy"] = float(pf.get("day_start_equity_jpy", 0) or 0) + delta_jpy
+            if getattr(self.circuit_breaker, "_l3_day_start_equity_jpy", None) is not None:
+                self.circuit_breaker._l3_day_start_equity_jpy = (
+                    float(self.circuit_breaker._l3_day_start_equity_jpy or 0.0) + delta_jpy
+                )
+            prev_peak = float(pf.get("peak_equity_jpy", 0) or 0)
+            if float(actual_jpy) > prev_peak:
+                pf["peak_equity_jpy"] = actual_jpy
+            pf["last_fee_fraction_settlement"] = {
+                "type": "DAILY_FEE_FRACTION_SETTLEMENT",
+                "delta_jpy": delta_jpy,
+                "new_jpy_balance": actual_jpy,
+                "timestamp": now_jst.isoformat(timespec="seconds"),
+            }
+            if self.db_wal is not None:
+                try:
+                    self.db_wal.record_fee_adjustment(
+                        date_str=now_jst.strftime("%Y-%m-%d"),
+                        amount_jpy=delta_jpy,
+                        note="DAILY_FEE_FRACTION_SETTLEMENT (06:00:30 JST)",
+                    )
+                except Exception as wal_exc:
+                    logger.warning("DAILY_FEE_FRACTION_SETTLEMENT WAL記録警告: %s", wal_exc)
+            self.oco_manager.save_portfolio(pf, now_dt=now_jst)
+            return {
+                "status": "ABSORBED",
+                "type": "DAILY_FEE_FRACTION_SETTLEMENT",
+                "delta_jpy": delta_jpy,
+                "new_jpy_balance": actual_jpy,
+                "peak_equity_jpy": pf.get("peak_equity_jpy", actual_jpy),
+            }
+        return {"status": "NO_ADJUSTMENT", "delta_jpy": delta_jpy}
 
     def _get_daily_trade_count(self, now_jst: datetime) -> int:
         # GMO取引日基準 (06:00 JST) で日次カウントをリセット
@@ -649,7 +716,7 @@ class AutoTraderDaemon:
                 "events": events,
             }
 
-        # 2. 第1回 終了2時間前エントリー凍結 (2027-07-08 22:00:00 <= now < 2027-07-09 00:00:00 JST)
+        # 2. 第1回 終了2時間前エントリー凍結 & 2段階手仕舞い (2027-07-08 22:00:00 <= now < 2027-07-09 00:00:00 JST)
         if p1_freeze_start <= now_jst < p1_end:
             self.campaign_phase = "PHASE1_PRE_DEADLINE_FREEZE"
             pf = self.oco_manager.load_portfolio()
@@ -664,6 +731,44 @@ class AutoTraderDaemon:
                             "timestamp": now_jst.isoformat(timespec="seconds"),
                         }
                     )
+            p1_graceful_start = p1_end - timedelta(minutes=30)
+            p1_final_sweep_start = p1_end - timedelta(minutes=1)
+            if p1_graceful_start <= now_jst < p1_final_sweep_start:
+                unwind_res = self.oco_manager.graceful_maker_unwind_positions(
+                    tickers=tickers,
+                    now_dt=now_jst,
+                    phase_label="PHASE1",
+                )
+                if unwind_res.get("unwound_orders") or unwind_res.get("closed_trades"):
+                    events.append(
+                        {
+                            "type": "PHASE1_GRACEFUL_MAKER_UNWIND_STEP",
+                            "detail": unwind_res,
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+            elif p1_final_sweep_start <= now_jst < p1_end:
+                pf_s1 = self.oco_manager.load_portfolio()
+                for pos_s1 in list(pf_s1.get("positions", []) or []):
+                    if str(pos_s1.get("state", "")).strip().upper() == "DUST_QUARANTINED":
+                        continue
+                    s1_sym = str(pos_s1.get("symbol", "")).strip().upper()
+                    if s1_sym:
+                        closed_s1 = self.oco_manager.close_position_immediately(
+                            symbol=s1_sym,
+                            reason="PHASE1_FINAL_MARKET_SWEEP",
+                            now_dt=now_jst,
+                        )
+                        if closed_s1:
+                            events.append(
+                                {
+                                    "type": "PHASE1_FINAL_MARKET_SWEEP",
+                                    "symbol": s1_sym,
+                                    "exit_price": closed_s1.get("exit_price", 0),
+                                    "pnl_jpy": closed_s1.get("pnl_jpy", 0),
+                                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                                }
+                            )
             return {
                 "phase": "PHASE1_PRE_DEADLINE_FREEZE",
                 "allow_new_buy": False,
@@ -708,7 +813,7 @@ class AutoTraderDaemon:
                 "events": events,
             }
 
-        # 5. 第2回 終了2時間前エントリー凍結 (2027-12-09 22:00:00 <= now < 2027-12-10 00:00:00 JST)
+        # 5. 第2回 終了2時間前エントリー凍結 & 2段階手仕舞い (2027-12-09 22:00:00 <= now < 2027-12-10 00:00:00 JST)
         if p2_freeze_start <= now_jst < p2_end:
             self.campaign_phase = "PHASE2_PRE_DEADLINE_FREEZE"
             pf = self.oco_manager.load_portfolio()
@@ -723,6 +828,44 @@ class AutoTraderDaemon:
                             "timestamp": now_jst.isoformat(timespec="seconds"),
                         }
                     )
+            p2_graceful_start = p2_end - timedelta(minutes=30)
+            p2_final_sweep_start = p2_end - timedelta(minutes=1)
+            if p2_graceful_start <= now_jst < p2_final_sweep_start:
+                unwind_res = self.oco_manager.graceful_maker_unwind_positions(
+                    tickers=tickers,
+                    now_dt=now_jst,
+                    phase_label="PHASE2",
+                )
+                if unwind_res.get("unwound_orders") or unwind_res.get("closed_trades"):
+                    events.append(
+                        {
+                            "type": "PHASE2_GRACEFUL_MAKER_UNWIND_STEP",
+                            "detail": unwind_res,
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
+            elif p2_final_sweep_start <= now_jst < p2_end:
+                pf_s2 = self.oco_manager.load_portfolio()
+                for pos_s2 in list(pf_s2.get("positions", []) or []):
+                    if str(pos_s2.get("state", "")).strip().upper() == "DUST_QUARANTINED":
+                        continue
+                    s2_sym = str(pos_s2.get("symbol", "")).strip().upper()
+                    if s2_sym:
+                        closed_s2 = self.oco_manager.close_position_immediately(
+                            symbol=s2_sym,
+                            reason="PHASE2_FINAL_MARKET_SWEEP",
+                            now_dt=now_jst,
+                        )
+                        if closed_s2:
+                            events.append(
+                                {
+                                    "type": "PHASE2_FINAL_MARKET_SWEEP",
+                                    "symbol": s2_sym,
+                                    "exit_price": closed_s2.get("exit_price", 0),
+                                    "pnl_jpy": closed_s2.get("pnl_jpy", 0),
+                                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                                }
+                            )
             return {
                 "phase": "PHASE2_PRE_DEADLINE_FREEZE",
                 "allow_new_buy": False,
@@ -774,7 +917,7 @@ class AutoTraderDaemon:
                 "events": [],
             }
 
-        # 0. SQLite WAL のリモート制御コマンドポーリング & 06:00 JST デイリーダイジェスト送信 & WAL チェックポイント
+        # 0. SQLite WAL のリモート制御コマンドポーリング & 06:00 JST デイリーダイジェスト送信 / 06:00:30 端数精算 / 06:05 WAL TRUNCATE
         self.remote_control.poll_and_execute_db_commands(now_dt=now_jst)
         if now_jst.hour >= 6:
             digest_day = now_jst.strftime("%Y-%m-%d")
@@ -785,6 +928,18 @@ class AutoTraderDaemon:
                     self.db_wal.checkpoint_wal("PASSIVE")
                 except Exception as wal_exc:
                     logger.warning("日次 WAL チェックポイント警告: %s", wal_exc)
+            if (now_jst.hour > 6 or now_jst.minute > 0 or now_jst.second >= 30) and self._last_fee_settlement_date != digest_day:
+                self._last_fee_settlement_date = digest_day
+                try:
+                    self.absorb_daily_fee_fraction_settlement(now_dt=now_jst)
+                except Exception as fee_exc:
+                    logger.warning("06:00:30 日次手数料端数精算警告: %s", fee_exc)
+            if (now_jst.hour > 6 or now_jst.minute >= 5) and self._last_wal_truncate_date != digest_day:
+                self._last_wal_truncate_date = digest_day
+                try:
+                    self.db_wal.checkpoint_truncate()
+                except Exception as tr_exc:
+                    logger.warning("06:05 日次 WAL TRUNCATE チェックポイント警告: %s", tr_exc)
 
         # 0a. 第1回・第2回 運用期限スケジュール判定・自動全決済チェック
         campaign_res = self.evaluate_and_enforce_campaign_schedule(now_dt=now_jst, tickers=tickers)
@@ -806,6 +961,11 @@ class AutoTraderDaemon:
             if not self.in_maintenance_sleep:
                 self.in_maintenance_sleep = True
                 logger.info("🔧 取引所メンテナンス枠 (土曜定時または臨時/水曜メンテ) に入ったため自動スリープを開始します。")
+                try:
+                    self.db_wal.checkpoint_truncate()
+                except Exception:
+                    pass
+                gc.collect()
                 self.notifier.notify_event(
                     title="取引所メンテナンス自動スリープ開始",
                     message="GMOコインメンテナンス枠のため、再開確認まで API 発注・変更を一時休止します。",
@@ -873,6 +1033,19 @@ class AutoTraderDaemon:
                         now_sec=now_jst.timestamp(),
                     )
                     if cancel_chk.get("should_cancel"):
+                        exec_size_pre = float(p_ord.get("executed_size", 0) or 0)
+                        try:
+                            fetched_pre = self.broker.get_orders([p_oid])
+                            if fetched_pre:
+                                exec_size_pre = float(fetched_pre[0].get("executed_size", exec_size_pre) or 0)
+                        except Exception:
+                            pass
+                        min_sz_pre = float(
+                            DEFAULT_SYMBOL_RULES.get(p_sym, {}).get("min_order_size", 0.0001) or 0.0001
+                        )
+                        if 0 < exec_size_pre < min_sz_pre and not bool(p_ord.get("force_cancel_on_crash", False)):
+                            remaining_pending.append(p_ord)
+                            continue
                         try:
                             self.broker.cancel_order(p_oid)
                         except Exception as exc:
@@ -886,13 +1059,6 @@ class AutoTraderDaemon:
                                 "timestamp": now_jst.isoformat(timespec="seconds"),
                             }
                         )
-                        exec_size_pre = 0.0
-                        try:
-                            ord_info = self.oco_manager._query_orders_by_id([p_oid]).get(p_oid)
-                            if ord_info is not None:
-                                exec_size_pre = float(ord_info.get("executed_size", 0) or 0)
-                        except Exception:
-                            exec_size_pre = 0.0
                         if exec_size_pre > 0:
                             # 部分約定または全約定していた場合は step() で SL_ACTIVE / DUST_QUARANTINED へ処理させる
                             remaining_pending.append(p_ord)
@@ -1203,6 +1369,9 @@ class AutoTraderDaemon:
                 block_reason = ""
                 if not campaign_res.get("allow_new_buy", True):
                     block_reason = f"[{campaign_res['phase']}: 運用期限2時間前エントリー凍結中によりHOLDへ自動補正] "
+                elif is_in_daily_fee_settlement_freeze_window(now_jst):
+                    block_reason = "[05:59:30〜06:00:30 JST 手数料端数精算ウィンドウ保護によりHOLDへ自動補正] "
+                    validated["deferred_by_fee_settlement_window"] = True
                 elif is_paused_now:
                     block_reason = "[リモートPAUSE中によりHOLDへ自動補正] "
                 elif self.circuit_breaker.l5_kill_switch_latched:

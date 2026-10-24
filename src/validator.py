@@ -17,8 +17,9 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
-from typing import Any, Dict, List, Union
+from typing import Any, Dict, List, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -653,15 +654,78 @@ def validate_and_adjust_decision(
     available_jpy_for_new_buy = max(Decimal("0"), jpy_balance - locked_pending_buy_jpy)
 
     # 新規買い (BUY) 時の同時保有銘柄数＋発注中指値数上限チェック
+    # （ただし 2スロット満杯でも confidence >= 0.85 かつ 8.0時間以上経過＆含み益 < +0.5R の停滞ポジションがあれば入れ替えを許可）
+    effective_active_positions = list(active_positions)
+    conf_for_rot = _to_decimal(adjusted.get("confidence", 0.0))
     if action == "BUY" and (len(active_positions) + len(active_pending_buys)) >= max_concurrent:
-        return _hold_decision(
-            adjusted,
-            symbol=symbol,
-            reason_prefix=(
-                f"[同時保有・発注上限によりHOLDへ自動補正] 既に最大同時枠 ({max_concurrent}枠: "
-                f"保有{len(active_positions)}件＋待機指値{len(active_pending_buys)}件) に達しているため、新規買いエントリーを見送ります。"
-            ),
-        )
+        rotatable_pos: Optional[Dict[str, Any]] = None
+        if conf_for_rot >= Decimal("0.85"):
+            now_ref_str = str(portfolio.get("last_updated", "") or adjusted.get("timestamp", "")).strip()
+            now_ref_dt: Optional[datetime] = None
+            if now_ref_str:
+                try:
+                    now_ref_dt = datetime.fromisoformat(now_ref_str.replace("Z", "+00:00"))
+                except Exception:
+                    now_ref_dt = None
+            for p_cand in active_positions:
+                p_sym = str(p_cand.get("symbol", "")).strip().upper()
+                if not p_sym or p_sym == symbol:
+                    continue
+                held_h = _to_decimal(p_cand.get("held_hours", p_cand.get("holding_hours", -1)))
+                if p_cand.get("opened_at"):
+                    try:
+                        op_dt = datetime.fromisoformat(str(p_cand["opened_at"]).replace("Z", "+00:00"))
+                        ref_dt = now_ref_dt or datetime.now(op_dt.tzinfo)
+                        calc_h = _to_decimal((ref_dt - op_dt).total_seconds() / 3600.0)
+                        if calc_h > held_h:
+                            held_h = calc_h
+                    except Exception:
+                        if held_h < Decimal("0"):
+                            held_h = Decimal("0")
+                elif held_h < Decimal("0"):
+                    held_h = Decimal("0")
+                if held_h < Decimal("8.0"):
+                    continue
+                p_entry = _to_decimal(p_cand.get("entry_price", 0))
+                p_sl = _to_decimal(p_cand.get("initial_sl_price", p_cand.get("stop_loss_price", 0)))
+                p_one_r = p_entry - p_sl if (p_entry > p_sl > Decimal("0")) else (p_entry * Decimal("0.035"))
+                p_sum = (market_summaries or {}).get(p_sym, {}) or {}
+                p_cur = _to_decimal(
+                    p_sum.get("price", {}).get("best_bid")
+                    or p_sum.get("price", {}).get("last")
+                    or p_cand.get("current_price")
+                    or p_entry
+                )
+                cur_r = ((p_cur - p_entry) / p_one_r) if p_one_r > Decimal("0") else Decimal("0")
+                if cur_r < Decimal("0.50"):
+                    rotatable_pos = p_cand
+                    break
+
+        if rotatable_pos is not None:
+            rot_sym = str(rotatable_pos.get("symbol", "")).strip().upper()
+            effective_active_positions = [p for p in active_positions if p is not rotatable_pos]
+            rot_size = _to_decimal(rotatable_pos.get("size", 0))
+            rot_sum = (market_summaries or {}).get(rot_sym, {}) or {}
+            rot_px = _to_decimal(
+                rot_sum.get("price", {}).get("best_bid")
+                or rot_sum.get("price", {}).get("last")
+                or rotatable_pos.get("current_price")
+                or rotatable_pos.get("entry_price", 0)
+            )
+            rot_proceeds = rot_size * rot_px * Decimal("0.9995")
+            available_jpy_for_new_buy += max(Decimal("0"), rot_proceeds)
+            adjusted["slot_rotation_required"] = True
+            adjusted["slot_rotation_target_symbol"] = rot_sym
+            adjusted["slot_rotation_reason"] = f"TIME_STOP_SLOT_ROTATION (保有8.0h以上・含み益<+0.5Rの停滞枠 {rot_sym} を高確信 {symbol} へ入れ替え)"
+        else:
+            return _hold_decision(
+                adjusted,
+                symbol=symbol,
+                reason_prefix=(
+                    f"[同時保有・発注上限によりHOLDへ自動補正] 既に最大同時枠 ({max_concurrent}枠: "
+                    f"保有{len(active_positions)}件＋待機指値{len(active_pending_buys)}件) に達しているため、新規買いエントリーを見送ります。"
+                ),
+            )
 
     # 新規買い (BUY) 時の既保有・待機中銘柄重複エントリー防止ガード
     held_symbols_active = {
@@ -882,7 +946,13 @@ def validate_and_adjust_decision(
         sl_dec = Decimal("0")
 
     # パターンA（自動複利スケール型）: 1銘柄あたり最大投入比率 45% (MAX_POSITION_ALLOCATION_PCT = 0.45)
+    # ただし保有0件（2スロット空）かつ confidence >= 0.80、ストップ距離率 d_SL < 2.2%、主要銘柄 (BTC/ETH/XRP/SOL) の場合は
+    # 第1スロット配分上限を最大 65% まで動的拡張し、第2スロット上限を残り 25%（合計上限 90%・現金予備 10% 死守）に制御する。
     MAX_POSITION_ALLOCATION_PCT = Decimal("0.45")
+    DYNAMIC_EXPANDED_SLOT1_ALLOCATION_PCT = Decimal("0.65")
+    MAX_TOTAL_EXPOSURE_PCT = Decimal("0.90")
+    DYNAMIC_SLOT_MAJOR_SYMBOLS = {"BTC", "ETH", "XRP", "SOL"}
+
     raw_alloc_pct = _to_decimal(portfolio.get("max_allocation_per_trade_pct", MAX_POSITION_ALLOCATION_PCT))
     if raw_alloc_pct <= Decimal("0") or raw_alloc_pct > Decimal("0.50") or total_equity > Decimal("15000"):
         max_alloc_pct = MAX_POSITION_ALLOCATION_PCT
@@ -910,7 +980,40 @@ def validate_and_adjust_decision(
         effective_max_risk_jpy = min(max_risk_cfg, dynamic_hard_max_risk_jpy)
 
     fee_buffer = Decimal("1") + taker_fee
-    per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct)
+    init_sl_diff = limit_dec - sl_dec if (action == "BUY" and limit_dec > sl_dec > Decimal("0")) else Decimal("0")
+    init_sl_dist_rate = (init_sl_diff / limit_dec) if limit_dec > Decimal("0") else Decimal("0")
+    occupied_slots_count = len(effective_active_positions) + len(active_pending_buys)
+
+    dynamic_slot_expanded = False
+    if (
+        action == "BUY"
+        and occupied_slots_count == 0
+        and conf_val >= Decimal("0.80")
+        and Decimal("0") < init_sl_dist_rate < Decimal("0.022")
+        and symbol in DYNAMIC_SLOT_MAJOR_SYMBOLS
+    ):
+        max_alloc_pct = DYNAMIC_EXPANDED_SLOT1_ALLOCATION_PCT
+        dynamic_slot_expanded = True
+
+    existing_invested_jpy = Decimal("0")
+    for p_act in effective_active_positions:
+        p_cost = _to_decimal(p_act.get("cost_jpy", 0) or 0)
+        if p_cost <= Decimal("0"):
+            p_cost = _to_decimal(p_act.get("entry_price", 0) or 0) * _to_decimal(p_act.get("size", 0) or 0)
+        existing_invested_jpy += max(Decimal("0"), p_cost)
+    for o_act in active_pending_buys:
+        o_px = _to_decimal(o_act.get("limit_price", o_act.get("price", 0)) or 0)
+        o_sz = max(Decimal("0"), _to_decimal(o_act.get("size", 0) or 0) - _to_decimal(o_act.get("executed_size", 0) or 0))
+        existing_invested_jpy += max(Decimal("0"), o_px * o_sz)
+
+    max_total_exposure_jpy = total_equity * MAX_TOTAL_EXPOSURE_PCT
+    remaining_exposure_cap_jpy = max(Decimal("0"), max_total_exposure_jpy - existing_invested_jpy)
+    cash_reserve_floor_jpy = total_equity * (Decimal("1") - MAX_TOTAL_EXPOSURE_PCT)
+    usable_jpy_after_reserve = max(Decimal("0"), available_jpy_for_new_buy - max(Decimal("0"), cash_reserve_floor_jpy - max(Decimal("0"), jpy_balance - available_jpy_for_new_buy)))
+    if occupied_slots_count >= 1:
+        per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct, remaining_exposure_cap_jpy)
+    else:
+        per_trade_cap_jpy = min(available_jpy_for_new_buy, total_equity * max_alloc_pct, max_total_exposure_jpy)
     available_budget = per_trade_cap_jpy / fee_buffer
 
     raw_size = _to_decimal(adjusted.get("size", 0) or 0)
@@ -943,7 +1046,7 @@ def validate_and_adjust_decision(
 
         # 3. 2枠目を新規BUYする際の「ポートフォリオ合計リスク」上限（総資産の3.0%＝初期300円）チェック
         max_portfolio_risk_jpy = total_equity * Decimal("0.03")
-        existing_risk_jpy = calculate_existing_portfolio_risk_jpy(active_positions, merged_rules, active_pending_buys)
+        existing_risk_jpy = calculate_existing_portfolio_risk_jpy(effective_active_positions, merged_rules, active_pending_buys)
         remaining_portfolio_risk_jpy = max_portfolio_risk_jpy - existing_risk_jpy
         if remaining_portfolio_risk_jpy <= Decimal("0"):
             return _hold_decision(
@@ -1003,8 +1106,9 @@ def validate_and_adjust_decision(
         if stressed_loss_per_unit <= 0:
             stressed_loss_per_unit = nominal_loss_per_unit
 
+        raw_risk_size = nominal_target_risk_jpy / nominal_loss_per_unit
         size_by_nominal_target = round_to_step(
-            nominal_target_risk_jpy / nominal_loss_per_unit,
+            raw_risk_size,
             size_step,
             rounding=ROUND_DOWN,
         )
@@ -1034,7 +1138,7 @@ def validate_and_adjust_decision(
             ):
                 size_dec = min_order_size
             else:
-                if (len(active_positions) + len(active_pending_buys)) >= 1 and (
+                if occupied_slots_count >= 1 and (
                     existing_risk_jpy + min_lot_nominal_loss > max_portfolio_risk_jpy
                     or existing_risk_jpy + min_lot_stressed_loss > max_portfolio_risk_jpy
                 ):
@@ -1057,6 +1161,38 @@ def validate_and_adjust_decision(
                     ),
                 )
 
+        # 6. 最小ロット切り捨て (Floor) で浮いたリスク許容額を初期ストップ距離へ逆算還元 (Breathing Room Adjustment)
+        original_sl_dec = sl_dec
+        breathing_ticks = 0
+        base_nominal_loss = nominal_loss_per_unit * size_dec
+        base_stressed_loss = stressed_loss_per_unit * size_dec
+        if size_dec > Decimal("0") and base_nominal_loss < nominal_target_risk_jpy and base_stressed_loss < hard_max_risk_jpy:
+            leftover_nominal_jpy = max(Decimal("0"), nominal_target_risk_jpy - base_nominal_loss)
+            leftover_stressed_jpy = max(Decimal("0"), hard_max_risk_jpy - base_stressed_loss)
+            # ロット切り捨て1ステップ分相当（または初期SL距離の15%）を上限として安全に数ティック引き下げる
+            step_risk_cap_jpy = size_step * nominal_loss_per_unit
+            effective_leftover_jpy = min(leftover_nominal_jpy, leftover_stressed_jpy, step_risk_cap_jpy)
+            max_extra_dist = min(effective_leftover_jpy / size_dec, sl_diff * Decimal("0.15"))
+            candidate_ticks = int((max_extra_dist / tick_size).to_integral_value(rounding=ROUND_DOWN))
+            if candidate_ticks > 0:
+                for t_try in range(candidate_ticks, max(0, candidate_ticks - 5), -1):
+                    cand_sl = original_sl_dec - (Decimal(t_try) * tick_size)
+                    if cand_sl <= Decimal("0"):
+                        continue
+                    cand_diff = limit_dec - cand_sl
+                    cand_nom_unit = cand_diff + (cand_sl * taker_fee)
+                    cand_str_unit = cand_nom_unit + (cand_sl * slippage_reserve_rate)
+                    if (
+                        (cand_nom_unit * size_dec) <= nominal_target_risk_jpy
+                        and (cand_str_unit * size_dec) <= hard_max_risk_jpy
+                    ):
+                        sl_dec = cand_sl
+                        sl_diff = cand_diff
+                        nominal_loss_per_unit = cand_nom_unit
+                        stressed_loss_per_unit = cand_str_unit
+                        breathing_ticks = t_try
+                        break
+
         expected_cost = int((limit_dec * size_dec).to_integral_value(rounding=ROUND_HALF_UP))
         reward = tp_dec - limit_dec
         risk = limit_dec - sl_dec
@@ -1069,6 +1205,21 @@ def validate_and_adjust_decision(
         adjusted["portfolio_total_risk_jpy"] = int(
             (existing_risk_jpy + (nominal_loss_per_unit * size_dec)).to_integral_value(rounding=ROUND_HALF_UP)
         )
+        adjusted["original_stop_loss_price"] = _format_number(original_sl_dec)
+        adjusted["breathing_room_ticks"] = breathing_ticks
+        adjusted["breathing_room_applied"] = bool(breathing_ticks > 0)
+        adjusted["dynamic_slot_expanded"] = dynamic_slot_expanded
+        adjusted["dynamic_slot_expansion_applied"] = dynamic_slot_expanded
+        adjusted["effective_slot_alloc_pct"] = float(max_alloc_pct)
+        adjusted["effective_slot_allocation_pct"] = (
+            float(round(per_trade_cap_jpy / total_equity, 4)) if total_equity > Decimal("0") else float(max_alloc_pct)
+        )
+        adjusted["slot2_remaining_allocation_pct"] = (
+            float(round(max(Decimal("0"), MAX_TOTAL_EXPOSURE_PCT - ( Decimal(expected_cost) / total_equity )), 4))
+            if (occupied_slots_count == 0 and total_equity > Decimal("0"))
+            else float(round(remaining_exposure_cap_jpy / total_equity, 4)) if total_equity > Decimal("0") else 0.25
+        )
+        adjusted["cash_reserve_floor_jpy"] = int(cash_reserve_floor_jpy.to_integral_value(rounding=ROUND_DOWN))
 
     else:
         # SELL または MODIFY の場合は保有ポジション数量を確認

@@ -428,7 +428,28 @@ class TechnicalRadar:
 
         cd_syms = {str(s).strip().upper() for s in (cooldown_symbols or set()) if s}
         has_open_slot = (len(positions) + len(active_pending_buys)) < max_concurrent
-        if has_open_slot and not kill_switch_active and not cb_triggered and regime_info["allow_new_buy"]:
+        has_rotatable_slot = False
+        if not has_open_slot and positions and not active_pending_buys:
+            for p_chk in positions:
+                opened_raw = str(p_chk.get("opened_at", "") or "").strip()
+                held_h_chk = float(p_chk.get("held_hours", p_chk.get("holding_hours", 0.0)) or 0.0)
+                if opened_raw:
+                    try:
+                        op_dt = datetime.fromisoformat(opened_raw)
+                        if op_dt.tzinfo is None:
+                            op_dt = op_dt.replace(tzinfo=JST)
+                        held_h_chk = max(held_h_chk, (now_jst - op_dt.astimezone(JST)).total_seconds() / 3600.0)
+                    except Exception:
+                        pass
+                p_ent = float(p_chk.get("entry_price", 0) or 0)
+                p_sl0 = float(p_chk.get("initial_stop_loss_price") or p_chk.get("stop_loss_price") or 0)
+                p_cur = float(p_chk.get("current_price", p_ent) or p_ent)
+                r_dist = max(abs(p_ent - p_sl0), p_ent * 0.015) if p_ent > 0 else 1.0
+                cur_r = ((p_cur - p_ent) / r_dist) if r_dist > 0 else 0.0
+                if held_h_chk >= 8.0 and cur_r < 0.50:
+                    has_rotatable_slot = True
+                    break
+        if (has_open_slot or has_rotatable_slot) and not kill_switch_active and not cb_triggered and regime_info["allow_new_buy"]:
             for sym, summary in market_summaries.items():
                 sym_up = sym.strip().upper()
                 if sym_up in held_or_pending_symbols or sym_up in GATE0_EXCLUDED_SYMBOLS or sym_up in cd_syms:

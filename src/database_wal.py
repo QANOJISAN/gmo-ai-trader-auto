@@ -69,6 +69,9 @@ POSITION_STATES = frozenset(
         "SL_ACTIVE",
         "PROTECTED",
         "STOP_REARMING",
+        "STOP_EXPIRED_UNFILLED",
+        "TP_MAKER_TRIAL",
+        "GRACEFUL_MAKER_UNWIND",
     }
 )
 
@@ -405,7 +408,7 @@ class DatabaseWAL:
                 "busy_timeout": int(bt),
             }
 
-    def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict[str, int]:
+    def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict[str, Any]:
         """SQLite WAL チェックポイントを実行し、WAL ファイル (`.db-wal`) の肥大化を防止する"""
         valid_modes = {"PASSIVE", "FULL", "RESTART", "TRUNCATE"}
         mode_up = str(mode or "PASSIVE").strip().upper()
@@ -415,11 +418,16 @@ class DatabaseWAL:
             row = self._conn.execute(f"PRAGMA wal_checkpoint({mode_up});").fetchone()
             if row is not None and len(row) >= 3:
                 return {
+                    "mode": mode_up,
                     "busy": int(row[0] or 0),
                     "log_frames": int(row[1] or 0),
                     "checkpointed_frames": int(row[2] or 0),
                 }
-            return {"busy": 0, "log_frames": 0, "checkpointed_frames": 0}
+            return {"mode": mode_up, "busy": 0, "log_frames": 0, "checkpointed_frames": 0}
+
+    def checkpoint_truncate(self) -> Dict[str, Any]:
+        """`PRAGMA wal_checkpoint(TRUNCATE);` を実行し、WALログを本体DBへ完全統合して `.db-wal` を0バイトへ切り詰める"""
+        return self.checkpoint_wal("TRUNCATE")
 
     def close(self) -> None:
         with self._lock:

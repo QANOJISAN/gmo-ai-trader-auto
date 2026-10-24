@@ -43,8 +43,9 @@ class WSHybridEngine:
     PRIVATE_WS_URL_BASE = "wss://api.coin.z.com/ws/private/v1"
 
     TOKEN_REFRESH_INTERVAL_SEC = 35 * 60.0  # 35分周期 (有効期限60分に対し25分の安全マージン)
-    SUBSCRIPTION_INTERVAL_SEC = 1.2         # 1.2秒間隔シリアル購読 (1 req/sec 制限遵守)
+    SUBSCRIPTION_INTERVAL_SEC = 1.15        # 1.15秒間隔シリアル購読 (1 req/sec 制限遵守)
     SILENCE_TIMEOUT_SEC = 75.0              # 75秒無音検知で能動Ping / 再接続
+    HALF_OPEN_SILENCE_TIMEOUT_SEC = 10.0    # 10秒無音 (Half-open切断) で自動再接続＋RESTフォールバック
     MAX_EVENT_BUFFER_LEN = 5000
     MAX_SUBSCRIPTION_TIMESTAMPS = 200
 
@@ -53,7 +54,7 @@ class WSHybridEngine:
         broker: Union[GMOPrivateClient, PaperBroker],
         wal_db: DatabaseWAL,
         watched_symbols: Optional[List[str]] = None,
-        subscription_interval_sec: float = 1.2,
+        subscription_interval_sec: float = 1.15,
         sleep_fn: Optional[Callable[[float], None]] = None,
     ) -> None:
         self.broker = broker
@@ -70,6 +71,7 @@ class WSHybridEngine:
         self.ping_sent_count: int = 0
         self.reconnect_count: int = 0
         self.malformed_message_count: int = 0
+        self.rest_fallback_active: bool = False
 
         self.ws_event_buffer: Deque[Dict[str, Any]] = collections.deque(maxlen=self.MAX_EVENT_BUFFER_LEN)
         self.subscribed_private_channels: List[str] = []
@@ -193,6 +195,43 @@ class WSHybridEngine:
                 pass
         self.sync_state = SyncState.RECONNECTING
         return "RECONNECT_REQUIRED"
+
+    def check_half_open_silence_and_recover(
+        self,
+        now_mono: Optional[float] = None,
+        timeout_sec: Optional[float] = None,
+        symbols: Optional[List[str]] = None,
+        send_fn: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        10秒以上 (`HALF_OPEN_SILENCE_TIMEOUT_SEC`) の無音（Half-open切断）を検知した際、
+        直ちに REST フォールバックを有効化しつつ自動再接続＆1.15秒直列再購読を実行する。
+        """
+        now = float(now_mono if now_mono is not None else time.monotonic())
+        limit_sec = float(timeout_sec if timeout_sec is not None else self.HALF_OPEN_SILENCE_TIMEOUT_SEC)
+        silence_sec = max(0.0, now - self.last_message_ts)
+        if silence_sec < limit_sec:
+            return {
+                "half_open_detected": False,
+                "silence_sec": round(silence_sec, 3),
+                "rest_fallback_triggered": False,
+                "reconnected": False,
+                "subscription_interval_sec": self.subscription_interval_sec,
+            }
+
+        self.sync_state = SyncState.RECONNECTING
+        self.rest_fallback_active = True
+        sync_report = self.run_four_phase_sync(symbols=symbols, send_fn=send_fn)
+        self.last_message_ts = float(now_mono if now_mono is not None else time.monotonic())
+        self.rest_fallback_active = False
+        return {
+            "half_open_detected": True,
+            "silence_sec": round(silence_sec, 3),
+            "rest_fallback_triggered": True,
+            "reconnected": True,
+            "subscription_interval_sec": self.subscription_interval_sec,
+            "sync_report": sync_report,
+        }
 
     # ------------------------------------------------------------------
     # 4. 4フェーズ先行購読バッファリング同期 (Phase 1 -> Phase 2 -> Phase 3 -> Phase 4)
