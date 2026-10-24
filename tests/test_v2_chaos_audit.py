@@ -3806,6 +3806,573 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             self.assertEqual(trunc_res["mode"], "TRUNCATE")
             wal.close()
 
+    def test_round14_step3_microstructure_3mode_premortem_correlation_and_antimartingale_audit(self) -> None:
+        """
+        Round 14 監査テスト (Step 3 最終フェーズ完全検証):
+        ① 5大マイクロストラクチャ特徴量 (OBI_5, TFI & CVD Absorption, BKSR, WTR, OBDR > 0.45% Hollow Book 即座除外)
+           ＋ 4状態マーケットレジーム判定 (BROAD_RISK_ON, BTC_DOMINANCE_DRAIN, NEUTRAL_SELECTIVE, RISK_OFF_CRASH Stage 4 タイト化)
+        ② 3モード動的指値執行 (AGGRESSIVE_BREAKOUT_PEG 15秒チェイス最大3回・45分失効, MOMENTUM_PULLBACK_DYNAMIC サポート壁+1tick前置き・2時間失効, DEEP_LIQUIDITY_DIP 4時間失効)
+           ＋ トランシェ分割可否判定 (< 4.0 * minOrderSize の単一注文強制) ＋ 接近時OFIガード (<= 0.15 * ATR キャンセル)
+        ③ 5ブロック無次元化特徴量テンソル (Normalized Feature Tensor) ＋ CRO反証型 Pre-Mortem プロンプト・先頭キー順序
+           ＋ Shadow Evaluation 閉ループ自己較正スコアカード (FPR/FNR/TNR・ベイズ較正・動的閾値 max(0.72, Quantile_0.75))
+        ④ 2枠同時保有時の対BTC相関・ベータ制御 (高相関・高ベータ制限、オープンリスク連動 R2=0.85%=170円縮小、Stage 2 到達後 Free-Roll Risk Recycling 1.50%=300円回復)
+        ⑤ 連続的アンチ・マーチンゲール関数 (DD <3%->1.50%, 3..6%->1.15%, 6..10%->0.80%, 10..15%->0.50%) ＋ 非対称利益クッション (月次>+6% & DD<2% で最大1.85%)
+        """
+        from src.ai_judge import SYSTEM_PROMPT, build_normalized_feature_tensor
+        from src.indicators import (
+            compute_bksr_squeeze,
+            compute_btc_beta_and_correlation_matrix,
+            compute_obdr_slippage,
+            compute_orderbook_microstructure,
+            compute_trade_flow_and_absorption,
+            compute_wick_toxicity_ratio,
+        )
+        from src.radar import TechnicalRadar, evaluate_symbol_gates
+        from src.regime_filter import MarketRegimeFilter
+        from src.validator import (
+            compute_3mode_dynamic_limit_execution,
+            compute_anti_martingale_risk_params,
+            evaluate_slot2_correlation_and_beta_control,
+            evaluate_tranche_split_feasibility,
+        )
+
+        # ------------------------------------------------------------------
+        # ① 5大マイクロストラクチャ特徴量 ＆ Hollow Book 即座除外 ＆ 4状態レジーム検証
+        # ------------------------------------------------------------------
+        # 1-1. OBI_5 & Micro-Price & サポート壁 (+1 tick 前置き)
+        ob_sample = {
+            "bids": [
+                {"price": "100.000", "size": "150"},
+                {"price": "99.900", "size": "120"},
+                {"price": "99.500", "size": "2500"},  # 巨大サポート買い壁 (>= 平均×3.0)
+                {"price": "99.400", "size": "100"},
+                {"price": "99.300", "size": "100"},
+            ],
+            "asks": [
+                {"price": "100.100", "size": "50"},
+                {"price": "100.200", "size": "80"},
+                {"price": "100.300", "size": "90"},
+                {"price": "100.400", "size": "100"},
+                {"price": "100.500", "size": "110"},
+            ],
+        }
+        ob_micro = compute_orderbook_microstructure(ob_sample, tick_size=0.001)
+        self.assertGreater(ob_micro["obi_5"], 0.50)
+        self.assertAlmostEqual(ob_micro["best_imbalance_it"], 150.0 / 200.0, places=4)
+        self.assertGreater(ob_micro["micro_price"], ob_micro["mid_price"])
+        self.assertAlmostEqual(ob_micro["support_wall_price"], 99.500, places=3)
+        self.assertAlmostEqual(ob_micro["support_wall_front_run_price"], 99.501, places=3)
+
+        # 1-2. TFI (Trade Flow Imbalance) & CVD Absorption
+        now_ms = int(datetime(2026, 10, 24, 12, 0, 0, tzinfo=JST).timestamp() * 1000)
+        trades_sample = [
+            {"side": "SELL", "price": 100.0, "size": 500.0, "timestamp": now_ms - 60000},
+            {"side": "BUY", "price": 100.05, "size": 100.0, "timestamp": now_ms - 30000},
+        ]
+        klines_abs = [
+            {"open": 100.10, "high": 100.20, "low": 98.80, "close": 100.05, "volume": 1000},
+        ]
+        tfi_res = compute_trade_flow_and_absorption(
+            trades_sample, klines_15m=klines_abs, atr_15m=0.50, now_ts_ms=now_ms
+        )
+        self.assertLess(tfi_res["tfi_15m"], -0.40)
+        self.assertTrue(tfi_res["cvd_absorption_detected"])
+
+        # 1-3. BKSR ボラティリティ・スクイーズ比 (< 1.0 でスクイーズ、上抜けでブレイクアウト)
+        squeeze_klines = []
+        for i in range(25):
+            # 高値・安値幅(ATR=4.0)に対して終値変動が極小(フラット) -> 4*sigma < 3*ATR -> BKSR < 1.0
+            c_val = 100.0 + (0.05 if i % 2 == 0 else -0.05)
+            squeeze_klines.append({"open": 100.0, "high": 102.0, "low": 98.0, "close": c_val, "volume": 100})
+        # 最終足でボリンジャー上限を上抜け
+        squeeze_klines[-1] = {"open": 100.0, "high": 103.0, "low": 99.5, "close": 101.5, "volume": 300}
+        bksr_res = compute_bksr_squeeze(squeeze_klines)
+        self.assertLess(bksr_res["bksr"], 1.0)
+        self.assertTrue(bksr_res["is_squeeze"])
+        self.assertTrue(bksr_res["squeeze_breakout_up"])
+
+        # 1-4. WTR (Wick Toxicity Ratio: 上ヒゲ罠 vs 下ヒゲSpring)
+        wtr_trap = compute_wick_toxicity_ratio(
+            [{"open": 100.0, "high": 105.0, "low": 99.8, "close": 100.2, "volume": 200}],
+            lookback=1,
+        )
+        self.assertTrue(wtr_trap["is_upper_wick_trap"])
+        wtr_spring = compute_wick_toxicity_ratio(
+            [{"open": 100.0, "high": 100.2, "low": 95.0, "close": 100.1, "volume": 200}],
+            lookback=1,
+        )
+        self.assertTrue(wtr_spring["is_lower_wick_spring"])
+
+        # 1-5. OBDR (9,011円成行売却シミュレーションでスリッページ > 0.45% の Hollow Book を即座除外)
+        hollow_ob = {
+            "asks": [{"price": "100.10", "size": "100"}],
+            "bids": [
+                {"price": "100.00", "size": "5"},   # 500円分のみ最良気配 (見かけスプレッド 0.10% <= 0.35%)
+                {"price": "99.00", "size": "100"},  # 残り8,511円は 99.00円で約定 -> 加重平均 ~99.05円 (スリッページ ~0.95% > 0.45%)
+            ],
+        }
+        obdr_res = compute_obdr_slippage(hollow_ob, target_notional_jpy=9011.0)
+        self.assertGreater(obdr_res["obdr_slippage_pct"], 0.45)
+        self.assertTrue(obdr_res["is_hollow_book"])
+
+        gate_hollow = evaluate_symbol_gates(
+            symbol="XLM",
+            ticker={"bid": 100.00, "ask": 100.10, "last": 100.00, "volume": 500000},  # スプレッド 0.10% <= 0.35%
+            klines_1h=[{"open": 99, "high": 101, "low": 98, "close": 100, "volume": 10000}] * 24,
+            orderbook=hollow_ob,
+            max_spread_pct=0.35,
+            max_obdr_slippage_pct=0.45,
+        )
+        self.assertFalse(gate_hollow["passed"])
+        self.assertEqual(gate_hollow["failed_gate"], "GATE_2_HOLLOW_BOOK_OBDR")
+
+        # 1-6. 4状態マーケットレジーム判定 (BROAD_RISK_ON, BTC_DOMINANCE_DRAIN, NEUTRAL_SELECTIVE, RISK_OFF_CRASH)
+        rf = MarketRegimeFilter()
+        reg_broad = rf.evaluate(
+            market_summaries={
+                "BTC": {"daily_indicators": {"trend": "STRONG_UPTREND"}, "h4_indicators": {"rsi_14": 58.0}},
+                "ETH": {"daily_indicators": {"trend": "STRONG_UPTREND"}},
+                "SOL": {"daily_indicators": {"trend": "UPTREND"}},
+                "XRP": {"daily_indicators": {"trend": "UPTREND"}},
+            },
+        )
+        self.assertEqual(reg_broad["regime"], "BROAD_RISK_ON")
+        self.assertEqual(reg_broad["regime"], "TREND_UP")  # 後方互換性確認
+
+        reg_drain = rf.evaluate(
+            market_summaries={
+                "BTC": {"daily_indicators": {"trend": "STRONG_UPTREND"}, "h4_indicators": {"rsi_14": 58.0}},
+                "ETH": {"daily_indicators": {"trend": "DOWNTREND_OR_RANGE"}, "above_ema50": False},
+                "SOL": {"daily_indicators": {"trend": "DOWNTREND_OR_RANGE"}, "above_ema50": False},
+                "XRP": {"daily_indicators": {"trend": "DOWNTREND_OR_RANGE"}, "above_ema50": False},
+            },
+        )
+        self.assertEqual(reg_drain["regime"], "BTC_DOMINANCE_DRAIN")
+        self.assertEqual(reg_drain["allowed_symbol_filter"], "MAJORS_OR_HIGH_TFI")
+
+        reg_crash = rf.evaluate(
+            market_summaries={
+                "BTC": {"h1_indicators": {"change_1h_pct": -3.2}, "h4_indicators": {"change_4h_pct": -4.8, "rsi_14": 20.0}},
+            },
+        )
+        self.assertEqual(reg_crash["regime"], "RISK_OFF_CRASH")
+        self.assertTrue(reg_crash["should_cancel_pending_buys"])
+        self.assertTrue(reg_crash["tighten_trailing_to_stage4"])
+
+        # RISK_OFF_CRASH 時の保有ポジション Stage 4 タイト化確認
+        st_crash, sl_crash, upd_crash = compute_four_stage_trailing_sl(
+            entry_price=100.0,
+            current_bid=102.5,
+            highest_bid=103.0,
+            current_sl=98.0,
+            one_r_dist=2.0,
+            symbol="XRP",
+            atr_15m=0.5,
+            force_stage4_tightening=True,
+        )
+        self.assertEqual(st_crash, 4)
+        self.assertTrue(upd_crash)
+        self.assertGreater(sl_crash, 100.0)
+
+        # ------------------------------------------------------------------
+        # ② 3モード動的指値執行 ＆ トランシェ分割可否 ＆ 接近時OFIガード検証
+        # ------------------------------------------------------------------
+        # Mode 1: AGGRESSIVE_BREAKOUT_PEG (有効期限 45分 = 0.75h, max_peg_count = 3)
+        m1 = compute_3mode_dynamic_limit_execution(
+            symbol="SOL",
+            confidence=0.88,
+            summary={
+                "price": {"last": 20010, "best_bid": 20000, "best_ask": 20020},
+                "h1_indicators": {"atr_14": 300, "adx_14": 32.0},
+                "microstructure": {"best_imbalance_it": 0.72, "bksr": 0.85, "squeeze_breakout_up": True},
+            },
+            tick_size=Decimal("1"),
+            explicit_mode="AGGRESSIVE_BREAKOUT_PEG",
+        )
+        self.assertEqual(m1["execution_mode_type"], "AGGRESSIVE_BREAKOUT_PEG")
+        self.assertEqual(m1["calculated_limit_decimal"], Decimal("20000"))
+        self.assertAlmostEqual(m1["order_expiry_hours"], 0.75, places=2)
+        self.assertEqual(m1["max_peg_count"], 3)
+
+        # Mode 2: MOMENTUM_PULLBACK_DYNAMIC (サポート壁 99.500 の +1 tick = 99.501 前置き、有効期限 2.0h)
+        m2 = compute_3mode_dynamic_limit_execution(
+            symbol="XRP",
+            confidence=0.78,
+            summary={
+                "price": {"last": 100.000, "best_bid": 100.000, "best_ask": 100.050},
+                "h1_indicators": {"atr_14": 1.000},
+                "microstructure": {"support_wall_price": 99.500, "support_wall_front_run_price": 99.501},
+            },
+            tick_size=Decimal("0.001"),
+            explicit_mode="MOMENTUM_PULLBACK_DYNAMIC",
+        )
+        self.assertEqual(m2["execution_mode_type"], "MOMENTUM_PULLBACK_DYNAMIC")
+        self.assertEqual(m2["calculated_limit_decimal"], Decimal("99.501"))
+        self.assertTrue(m2["front_run_tick_applied"])
+        self.assertAlmostEqual(m2["order_expiry_hours"], 2.0, places=2)
+
+        # Mode 3: DEEP_LIQUIDITY_DIP (有効期限 4.0h)
+        m3 = compute_3mode_dynamic_limit_execution(
+            symbol="ETH",
+            confidence=0.72,
+            summary={
+                "price": {"last": 400000, "best_bid": 400000, "best_ask": 400200},
+                "h1_indicators": {"atr_14": 5000},
+                "microstructure": {},
+            },
+            tick_size=Decimal("1"),
+            explicit_mode="DEEP_LIQUIDITY_DIP",
+        )
+        self.assertEqual(m3["execution_mode_type"], "DEEP_LIQUIDITY_DIP")
+        self.assertAlmostEqual(m3["order_expiry_hours"], 4.0, places=2)
+
+        # トランシェ分割可否: BTC (0.0003 < 4 * 0.0001) は単一注文強制、XRP (90 >= 4 * 1) は2トランシェ分割可
+        tr_btc = evaluate_tranche_split_feasibility(
+            symbol="BTC",
+            order_size=Decimal("0.0003"),
+            min_order_size=Decimal("0.0001"),
+            size_step=Decimal("0.0001"),
+            limit_price=Decimal("12500000"),
+            atr_15m=Decimal("50000"),
+            tick_size=Decimal("1"),
+        )
+        self.assertFalse(tr_btc["tranche_split_allowed"])
+        self.assertEqual(tr_btc["execution_tranche_mode"], "SINGLE_ORDER_DYNAMIC_PEG")
+
+        tr_xrp = evaluate_tranche_split_feasibility(
+            symbol="XRP",
+            order_size=Decimal("90"),
+            min_order_size=Decimal("1"),
+            size_step=Decimal("1"),
+            limit_price=Decimal("100.000"),
+            atr_15m=Decimal("0.500"),
+            tick_size=Decimal("0.001"),
+        )
+        self.assertTrue(tr_xrp["tranche_split_allowed"])
+        self.assertEqual(tr_xrp["execution_tranche_mode"], "TWO_TRANCHE_SPLIT")
+
+        # Mode 1 15秒ループの動的チェイス・ペギング (changeOrder 最大3回) と Approaching OFI Velocity Guard 検証
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            wal_s3 = DatabaseWAL(tmp_dir / "s3.db", portfolio_json_path=tmp_dir / "pf.json")
+            broker_s3 = PaperBroker(
+                paper_orders_path=tmp_dir / "paper_orders.json",
+                portfolio_path=tmp_dir / "pf.json",
+                wal_db=wal_s3,
+            )
+            oco_s3 = PseudoOCOManager(
+                broker=broker_s3,
+                portfolio_path=tmp_dir / "pf.json",
+                dry_run_notify=True,
+                wal_db=wal_s3,
+            )
+            t0_s3 = datetime(2026, 10, 24, 13, 0, 0, tzinfo=JST)
+            res_peg_ord = oco_s3.place_new_buy_order(
+                decision={
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "order_type": "LIMIT_POST_ONLY",
+                    "execution_mode_type": "AGGRESSIVE_BREAKOUT_PEG",
+                    "order_expiry_hours": 0.75,
+                    "max_peg_count": 3,
+                    "limit_price": 20000,
+                    "size": 0.2,
+                    "take_profit_price": 21200,
+                    "stop_loss_price": 19500,
+                },
+                tickers={"SOL": {"symbol": "SOL", "ask": 20050, "bid": 20010, "last": 20010}},
+                now_dt=t0_s3,
+            )
+            self.assertEqual(res_peg_ord["status"], "PENDING_BUY")
+            # Best Bid が 20015 -> 20025 -> 20035 -> 20045 へ上昇し best_imbalance_it=0.75 (>0.60) の時、最大3回まで追従ペグ
+            for step_i, bid_p in enumerate([20015, 20025, 20035, 20045], start=1):
+                evs_peg = oco_s3.step(
+                    tickers={
+                        "SOL": {
+                            "symbol": "SOL",
+                            "ask": bid_p + 30,
+                            "bid": bid_p,
+                            "last": bid_p + 10,
+                            "best_imbalance_it": 0.75,
+                        }
+                    },
+                    now_dt=t0_s3 + timedelta(seconds=15 * step_i),
+                )
+                if step_i <= 3:
+                    self.assertTrue(any(e.get("type") == "AGGRESSIVE_BREAKOUT_PEG_UPDATED" for e in evs_peg))
+                else:
+                    # 4回目は max_peg_count=3 到達により追従しない
+                    self.assertFalse(any(e.get("type") == "AGGRESSIVE_BREAKOUT_PEG_UPDATED" for e in evs_peg))
+
+            pf_peg_after = oco_s3.load_portfolio()
+            self.assertEqual(pf_peg_after["pending_orders"][0]["peg_count"], 3)
+            self.assertEqual(float(pf_peg_after["pending_orders"][0]["limit_price"]), 20035.0)
+            wal_s3.close()
+
+        # 接近時 OFI ガード (Approaching OFI Velocity Guard): 指値から 0.15 * ATR 以内に接近かつ売り優勢で即キャンセル
+        adv_guard = AdverseSelectionGuard()
+        adv_guard.record_orderbook(
+            symbol="XRP",
+            asks=[{"price": 100.10, "size": 500}],
+            bids=[{"price": 100.05, "size": 50}],  # サポート壁が消滅 (50 < 2.0 * 100)
+            timestamp_sec=1000.0,
+        )
+        for i in range(5):
+            adv_guard.record_taker_trade("XRP", "SELL", 100.06, 200.0, 995.0 + i)
+        app_chk = adv_guard.should_cancel_resting_buy_order(
+            symbol="XRP",
+            order_price=100.00,
+            order_size=100.0,
+            atr_5m=1.0,  # 距離 0.05 <= 0.15 * 1.0 (0.15 ATR 以内に接近)
+            now_sec=1000.0,
+        )
+        self.assertTrue(app_chk["should_cancel"])
+        self.assertTrue(app_chk["approaching_guard"]["should_cancel"])
+
+        # ------------------------------------------------------------------
+        # ③ 5ブロック Normalized Feature Tensor ＋ Pre-Mortem プロンプト ＋ Shadow閉ループ自己較正検証
+        # ------------------------------------------------------------------
+        self.assertIn("Pre-Mortem", SYSTEM_PROMPT)
+        self.assertIn("bearish_invalidation_points", SYSTEM_PROMPT)
+        self.assertIn("execution_mode_type", SYSTEM_PROMPT)
+
+        sample_summaries = {
+            "XRP": {
+                "market_regime": "BROAD_RISK_ON",
+                "price": {
+                    "last": 100.0,
+                    "best_bid": 99.95,
+                    "best_ask": 100.05,
+                    "high": 104.0,
+                    "low": 96.0,
+                    "spread_pct": 0.10,
+                    "relative_strength_vs_btc_24h_pct": 3.2,
+                    "relative_strength_vs_btc_7d_pct": 5.5,
+                    "beta_vs_btc": 1.15,
+                    "correlation_vs_btc": 0.62,
+                },
+                "daily_indicators": {"atr_14": 3.0, "sma_25": 97.0, "rsi_14": 56.0, "trend": "STRONG_UPTREND"},
+                "h4_indicators": {"atr_14": 1.2, "rsi_14": 54.0},
+                "h1_indicators": {"atr_14": 0.6, "ema_20": 99.2},
+                "microstructure": {
+                    "obi_5": 0.42,
+                    "best_imbalance_it": 0.68,
+                    "micro_price_divergence_bps": 4.5,
+                    "tfi_15m": 0.35,
+                    "tfi_1h": 0.28,
+                    "cvd_absorption_detected": True,
+                    "absorption_score": 1.5,
+                    "obdr_slippage_pct": 0.12,
+                    "is_hollow_book": False,
+                    "bksr": 0.88,
+                    "is_squeeze": True,
+                    "squeeze_breakout_up": True,
+                    "upper_wick_ratio": 0.15,
+                    "lower_wick_ratio": 0.60,
+                    "wtr_net_score": 0.45,
+                    "is_upper_wick_trap": False,
+                    "is_lower_wick_spring": True,
+                    "support_wall_price": 99.0,
+                    "resistance_wall_price": 103.5,
+                },
+            }
+        }
+        nft = build_normalized_feature_tensor(sample_summaries, DEFAULT_SYMBOL_RULES, market_regime="BROAD_RISK_ON")
+        self.assertIn("XRP", nft)
+        for blk_key in (
+            "regime_and_relative_strength",
+            "multi_timeframe_structure",
+            "microstructure_and_flow",
+            "volatility_and_trap_metrics",
+            "cost_adjusted_economics",
+        ):
+            self.assertIn(blk_key, nft["XRP"])
+
+        # Pre-Mortem スキーマ先頭キー順序と Shadow Evaluation 閉ループ自己較正の検証
+        shd = LLMShadowEvaluator()
+        # 直近の判定で AI Confidence が 0.80〜0.88 にインフレし、かつ BUY の一部が SL 被弾している状況を登録
+        for idx, (act, conv, out_cls, pnl_v, mfe_v, mae_v) in enumerate(
+            [
+                ("BUY", 84, "SL_HIT", -280.0, 0.5, -3.2),
+                ("BUY", 86, "SL_HIT", -290.0, 0.4, -3.5),
+                ("BUY", 88, "TP_HIT", 520.0, 5.8, -0.8),
+                ("HOLD", 78, "TP_HIT", 480.0, 4.5, -0.5),
+                ("HOLD", 82, "SL_HIT", -300.0, 0.2, -3.8),
+                ("HOLD", 85, "SL_HIT", -260.0, 0.1, -3.1),
+            ]
+        ):
+            eid = shd.record_decision(
+                symbol="XRP",
+                ai_action=act,
+                conviction_score=conv,
+                entry_price=100.0,
+                tp_price=105.0,
+                sl_price=97.0,
+            )
+            shd.records[eid]["outcome_24h"] = out_cls
+            shd.records[eid]["virtual_pnl_24h_jpy"] = pnl_v
+            shd.records[eid]["mfe_24h_pct"] = mfe_v
+            shd.records[eid]["mae_24h_pct"] = mae_v
+
+        scorecard = shd.compute_self_calibration_scorecard(limit=30)
+        self.assertAlmostEqual(scorecard["fpr_overconfidence_rate"], 2.0 / 3.0, places=3)
+        self.assertAlmostEqual(scorecard["fnr_missed_opportunity_rate"], 1.0 / 3.0, places=3)
+        self.assertAlmostEqual(scorecard["tnr_veto_accuracy_rate"], 2.0 / 3.0, places=3)
+        self.assertGreater(scorecard["effective_threshold"], 0.80)  # max(0.72, Quantile_0.75) により動的引き上げ
+
+        cal_res = shd.calibrate_confidence_and_threshold(raw_confidence=0.80)
+        # (alpha_0=2 + W=1 + k=5 * 0.80) / (2 + 2 + N=3 + 5) = 7.0 / 12.0 = 0.5833
+        self.assertAlmostEqual(cal_res["calibrated_confidence"], 7.0 / 12.0, places=3)
+        self.assertFalse(cal_res["passes_dynamic_threshold"])  # 0.80 < effective_threshold (~0.8575)
+
+        judge_s3 = AIJudge(provider="rule_based", shadow_evaluator=shd)
+        dec_s3 = judge_s3.judge(
+            market_summaries=sample_summaries,
+            portfolio={"jpy_balance": 20025, "positions": [], "pending_orders": []},
+            symbol_rules=DEFAULT_SYMBOL_RULES,
+        )
+        # 先頭キーが bearish_invalidation_points であることの確認
+        first_keys = list(dec_s3.keys())[:6]
+        self.assertEqual(
+            first_keys[:5],
+            [
+                "bearish_invalidation_points",
+                "bearish_counter_thesis",
+                "bullish_edge_points",
+                "bullish_conviction_factors",
+                "execution_mode_type",
+            ],
+        )
+
+        # ------------------------------------------------------------------
+        # ④ 2枠同時保有時の対BTC相関・ベータ制御 ＆ Free-Roll Risk Recycling 検証
+        # ------------------------------------------------------------------
+        # 4-1. 1時間足リターンからの対BTCベータ & ペアワイズ相関行列計算
+        btc_rets = [0.01 * (i % 3 - 1) for i in range(24)]
+        eth_rets = [0.015 * (i % 3 - 1) for i in range(24)]  # 高ベータ・高相関
+        corr_mat = compute_btc_beta_and_correlation_matrix(
+            {
+                "BTC": {"h1_indicators": {"returns_1h": btc_rets}},
+                "ETH": {"h1_indicators": {"returns_1h": eth_rets}},
+            }
+        )
+        self.assertGreater(corr_mat["corr_vs_btc"]["ETH"], 0.90)
+        self.assertGreater(corr_mat["betas_vs_btc"]["ETH"], 1.30)
+
+        # 4-2. 高相関(rho=0.85 > 0.80) かつ 高ベータ合算(1.5 + 1.5 = 3.0 > 2.8) で confidence=0.78 (< 0.82) はブロック
+        slot1_active_pos = [
+            {
+                "symbol": "ETH",
+                "size": 0.02,
+                "entry_price": 400000,
+                "stop_loss_price": 392000,  # OpenRisk_1 > 0 (Stage 1: SL < entry)
+                "trailing_stage": 1,
+                "breakeven_locked": False,
+                "beta_vs_btc": 1.50,
+            }
+        ]
+        ms_corr = {
+            "ETH": {"beta_vs_btc": 1.50, "pairwise_corr": {"SOL": 0.85}},
+            "SOL": {"beta_vs_btc": 1.50, "pairwise_corr": {"ETH": 0.85}},
+        }
+        c_block = evaluate_slot2_correlation_and_beta_control(
+            candidate_symbol="SOL",
+            candidate_confidence=0.78,
+            active_positions=slot1_active_pos,
+            market_summaries=ms_corr,
+            base_1r_pct=Decimal("0.015"),
+        )
+        self.assertTrue(c_block["blocked_by_high_corr_beta"])
+        self.assertEqual(c_block["required_min_confidence"], 0.82)
+
+        # 4-3. OpenRisk_1 > 0 かつ 相関 rho=0.72 (> 0.65) の場合、第2枠の許容リスク R2 を 1.50%(300円) -> 0.85%(170円) に縮小
+        ms_mid_corr = {
+            "ETH": {"beta_vs_btc": 1.10, "pairwise_corr": {"SOL": 0.72}},
+            "SOL": {"beta_vs_btc": 1.20, "pairwise_corr": {"ETH": 0.72}},
+        }
+        c_reduced = evaluate_slot2_correlation_and_beta_control(
+            candidate_symbol="SOL",
+            candidate_confidence=0.80,
+            active_positions=slot1_active_pos,
+            market_summaries=ms_mid_corr,
+            base_1r_pct=Decimal("0.015"),
+        )
+        self.assertFalse(c_reduced["blocked_by_high_corr_beta"])
+        self.assertTrue(c_reduced["correlation_haircut_applied"])
+        self.assertEqual(c_reduced["effective_slot2_risk_pct_decimal"], Decimal("0.0085"))
+        self.assertAlmostEqual(float(c_reduced["effective_slot2_risk_pct_decimal"]) * 20025.0, 170.21, delta=1.0)  # 約170円
+
+        # 4-4. 第1枠が Stage 2（+0.15R 建値ロック完了 = OpenRisk_1 == 0）に到達した場合、Free-Roll Risk Recycling で R2 = 1.50% (300円) へ全額回復
+        slot1_freeroll_pos = [
+            {
+                "symbol": "ETH",
+                "size": 0.02,
+                "entry_price": 400000,
+                "stop_loss_price": 401200,  # SL >= entry (OpenRisk_1 == 0)
+                "trailing_stage": 2,
+                "breakeven_locked": True,
+            }
+        ]
+        c_freeroll = evaluate_slot2_correlation_and_beta_control(
+            candidate_symbol="SOL",
+            candidate_confidence=0.80,
+            active_positions=slot1_freeroll_pos,
+            market_summaries=ms_mid_corr,
+            base_1r_pct=Decimal("0.015"),
+        )
+        self.assertFalse(c_freeroll["blocked_by_high_corr_beta"])
+        self.assertTrue(c_freeroll["free_roll_recycling_active"])
+        self.assertEqual(c_freeroll["effective_slot2_risk_pct_decimal"], Decimal("0.015"))
+        self.assertAlmostEqual(float(c_freeroll["effective_slot2_risk_pct_decimal"]) * 20025.0, 300.38, delta=1.0)  # 約300円
+
+        # ------------------------------------------------------------------
+        # ⑤ 連続的アンチ・マーチンゲール関数 ＆ 非対称利益クッション検証
+        # ------------------------------------------------------------------
+        # DD = 0.0% (< 3.0%): 1R = 1.50% (300円)
+        am_normal = compute_anti_martingale_risk_params(
+            portfolio={"initial_capital_jpy": 20000, "peak_equity_jpy": 20025},
+            total_equity=Decimal("20025"),
+        )
+        self.assertEqual(am_normal["anti_martingale_tier"], "TIER_0_NORMAL_150BPS")
+        self.assertEqual(am_normal["risk_pct_decimal"], Decimal("0.0150"))
+
+        # DD = 4.5% (3.0% <= DD < 6.0%): 1R = 1.15% (~220円)
+        am_dd4 = compute_anti_martingale_risk_params(
+            portfolio={"initial_capital_jpy": 20000, "peak_equity_jpy": 20000},
+            total_equity=Decimal("19100"),
+        )
+        self.assertEqual(am_dd4["anti_martingale_tier"], "TIER_1_DD_3_TO_6PCT_115BPS")
+        self.assertEqual(am_dd4["risk_pct_decimal"], Decimal("0.0115"))
+
+        # DD = 8.0% (6.0% <= DD < 10.0%): 1R = 0.80%
+        am_dd8 = compute_anti_martingale_risk_params(
+            portfolio={"initial_capital_jpy": 20000, "peak_equity_jpy": 20000},
+            total_equity=Decimal("18400"),
+        )
+        self.assertEqual(am_dd8["anti_martingale_tier"], "TIER_2_DD_6_TO_10PCT_80BPS")
+        self.assertEqual(am_dd8["risk_pct_decimal"], Decimal("0.0080"))
+
+        # DD = 12.0% (10.0% <= DD < 15.0%): 1R = 0.50%
+        am_dd12 = compute_anti_martingale_risk_params(
+            portfolio={"initial_capital_jpy": 20000, "peak_equity_jpy": 20000},
+            total_equity=Decimal("17600"),
+        )
+        self.assertEqual(am_dd12["anti_martingale_tier"], "TIER_3_DD_10_TO_15PCT_50BPS")
+        self.assertEqual(am_dd12["risk_pct_decimal"], Decimal("0.0050"))
+
+        # 非対称利益クッション: 月次リターン > +6.0% (例: +41.0%, Equity=22,000円) かつ DD < 2.0% の時、最大 1.85% まで拡張
+        am_cushion = compute_anti_martingale_risk_params(
+            portfolio={
+                "initial_capital_jpy": 20000,
+                "peak_equity_jpy": 22000,
+                "monthly_realized_return_pct": 41.0,
+            },
+            total_equity=Decimal("22000"),
+        )
+        self.assertEqual(am_cushion["anti_martingale_tier"], "TIER_0_PROFIT_CUSHION_BOOST")
+        self.assertTrue(am_cushion["asymmetric_cushion_applied"])
+        self.assertEqual(am_cushion["risk_pct_decimal"], Decimal("0.0185"))
+
 
 if __name__ == "__main__":
     unittest.main()

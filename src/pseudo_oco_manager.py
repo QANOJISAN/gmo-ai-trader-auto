@@ -146,6 +146,7 @@ def compute_four_stage_trailing_sl(
     buy_flow_positive: bool = False,
     trend_strength: float = 0.5,
     recent_low_15m: Optional[Union[str, int, float, Decimal]] = None,
+    force_stage4_tightening: bool = False,
 ) -> Tuple[int, Union[int, float], bool]:
     """
     4段階ダイナミック・トレーリングSL計算:
@@ -156,7 +157,7 @@ def compute_four_stage_trailing_sl(
       往復コスト＋スリッパージ＋`+0.15R` の純利益を確定させる位置へ `STOP` を引き上げ。
     - Stage 3（適応型シャンデリア・トレイル）: 含み益 **`+2.2R` 以上** で、`最高値(Best Bid) - k * ATR_15m`
       （トレンド強度に応じ $2.2 \\le k \\le 3.0$）で段階的に追従。
-    - Stage 4（クライマックス・タイトニング）: **`+3.0R` 以上** または15分足 `RSI > 78` で直近安値直下へタイト化。
+    - Stage 4（クライマックス・タイトニング）: **`+3.0R` 以上** または15分足 `RSI > 78`（または `RISK_OFF_CRASH` による `force_stage4_tightening=True`）で直近安値直下へタイト化。
     - ※ `changeOrder` は最低 `0.15R` 以上の引き上げ幅があるときのみ実行。
     戻り値: `(stage, target_sl_price, should_update)`
     """
@@ -177,6 +178,30 @@ def compute_four_stage_trailing_sl(
     high_r_multiple = (high_d - entry_d) / r_d
     eff_r = max(r_multiple, high_r_multiple)
 
+    be_plus_015r = _to_decimal(
+        calculate_breakeven_sl_price(entry_d, sym, rules, one_r_distance=r_d)
+    )
+    min_step_r = r_d * Decimal("0.15")
+
+    if force_stage4_tightening:
+        # テーマ2-(2): RISK_OFF_CRASH 時は既存建玉のトレーリングを直ちに Stage 4（タイト保護）へ移行
+        stage = 4
+        if recent_low_15m is not None and _to_decimal(recent_low_15m) > Decimal("0"):
+            raw_s4 = _to_decimal(recent_low_15m) - tick_size
+        elif atr_15m is not None and _to_decimal(atr_15m) > Decimal("0"):
+            raw_s4 = bid_d - (_to_decimal(atr_15m) * Decimal("0.8"))
+        else:
+            raw_s4 = bid_d - (r_d * Decimal("0.40"))
+        if bid_d > be_plus_015r:
+            target_d = max(be_plus_015r, round_to_step(raw_s4, tick_size, rounding=ROUND_UP))
+        else:
+            target_d = max(curr_sl_d, round_to_step(raw_s4, tick_size, rounding=ROUND_UP))
+        if bid_d > tick_size and target_d >= bid_d:
+            target_d = round_to_step(bid_d - tick_size, tick_size, rounding=ROUND_DOWN)
+        should_upd = (target_d > curr_sl_d) and ((target_d - curr_sl_d) >= min(min_step_r, tick_size)) and (bid_d > target_d)
+        out_p: Union[int, float] = int(target_d) if target_d == target_d.to_integral_value() else float(target_d)
+        return 4, out_p, bool(should_upd)
+
     early_structural_s2 = bool(eff_r >= Decimal("1.2") and higher_low_15m and buy_flow_positive)
     stage2_reached = bool(eff_r >= Decimal("1.6") or early_structural_s2)
 
@@ -187,11 +212,6 @@ def compute_four_stage_trailing_sl(
         )
         return 1, out_cur, False
 
-    # Stage 2 基準価格: 往復コスト＋スリッパージ＋+0.15R 純利益ロック
-    be_plus_015r = _to_decimal(
-        calculate_breakeven_sl_price(entry_d, sym, rules, one_r_distance=r_d)
-    )
-    min_step_r = r_d * Decimal("0.15")
     climax_rsi = bool(rsi_15m is not None and _to_decimal(rsi_15m) > Decimal("78"))
 
     if eff_r >= Decimal("3.0") or (climax_rsi and eff_r >= Decimal("1.6")):
@@ -978,20 +998,45 @@ class PseudoOCOManager:
         actual_limit_price = float(order_info.get("price", limit_price) or limit_price)
         actual_size = float(order_info.get("size", size) or size)
 
+        exec_mode_type = str(decision.get("execution_mode_type", "") or "").strip().upper()
+        if decision.get("order_expiry_hours") is not None:
+            eff_expiry_hours = float(decision.get("order_expiry_hours") or self.order_expiry_hours)
+        elif exec_mode_type == "AGGRESSIVE_BREAKOUT_PEG":
+            eff_expiry_hours = 0.75
+        elif exec_mode_type == "MOMENTUM_PULLBACK_DYNAMIC":
+            eff_expiry_hours = 2.0
+        elif exec_mode_type == "DEEP_LIQUIDITY_DIP":
+            eff_expiry_hours = 4.0
+        else:
+            eff_expiry_hours = self.order_expiry_hours
+
+        max_peg_count = (
+            int(decision["max_peg_count"])
+            if decision.get("max_peg_count") is not None
+            else (3 if exec_mode_type == "AGGRESSIVE_BREAKOUT_PEG" else 0)
+        )
+
         pending_entry = {
             "order_id": str(order_info["order_id"]),
             "symbol": sym,
             "side": "BUY",
             "execution_type": "LIMIT",
             "time_in_force": "SOK",
+            "execution_mode_type": exec_mode_type or "MOMENTUM_PULLBACK_DYNAMIC",
             "limit_price": actual_limit_price,
+            "initial_limit_price": actual_limit_price,
             "size": actual_size,
             "take_profit_price": float(tp_price),
             "stop_loss_price": float(sl_price),
             "initial_risk_jpy": expected_loss_jpy,
             "state": "PENDING_BUY",
             "placed_at": now_str,
-            "expires_at": (now_jst + timedelta(hours=self.order_expiry_hours)).isoformat(timespec="seconds"),
+            "order_expiry_hours": eff_expiry_hours,
+            "expires_at": (now_jst + timedelta(hours=eff_expiry_hours)).isoformat(timespec="seconds"),
+            "max_peg_count": max_peg_count,
+            "peg_count": 0,
+            "support_wall_price": float(decision.get("support_wall_price", 0.0) or 0.0),
+            "support_wall_size": float(decision.get("support_wall_size", 0.0) or 0.0),
             "post_only_adjusted": bool(order_info.get("post_only_adjusted", False)),
             "adjust_count": int(order_info.get("adjust_count", 0)),
             "reasoning": str(decision.get("reasoning", "")),
@@ -1084,6 +1129,7 @@ class PseudoOCOManager:
 
             placed_dt = _parse_iso_jst(str(pending.get("placed_at", "")), now_jst)
             elapsed_hours = (now_jst - placed_dt).total_seconds() / 3600.0
+            order_expiry_h = float(pending.get("order_expiry_hours", self.order_expiry_hours) or self.order_expiry_hours)
 
             fetched_list = self.broker.get_orders([oid])
             order_state = fetched_list[0] if fetched_list else {}
@@ -1126,7 +1172,7 @@ class PseudoOCOManager:
                 partial_elapsed_sec = (now_jst - first_partial_dt).total_seconds()
                 will_remain_open = (
                     partial_elapsed_sec < self.PARTIAL_FILL_GRACE_SEC
-                    and elapsed_hours < self.order_expiry_hours
+                    and elapsed_hours < order_expiry_h
                     and status not in ("CANCELED", "EXPIRED")
                 )
 
@@ -1171,7 +1217,7 @@ class PseudoOCOManager:
                     except Exception as tr_exc:
                         logger.warning("部分約定トランシェSTOP発注時の警告 (%s): %s", sym, tr_exc)
 
-                if partial_elapsed_sec >= self.PARTIAL_FILL_GRACE_SEC and elapsed_hours < self.order_expiry_hours:
+                if partial_elapsed_sec >= self.PARTIAL_FILL_GRACE_SEC and elapsed_hours < order_expiry_h:
                     t_sym_p = (tickers or {}).get(sym, {})
                     is_crash_emergency = bool(pending.get("force_cancel_on_crash", False)) or bool(
                         t_sym_p.get("risk_off_crash", False)
@@ -1217,8 +1263,8 @@ class PseudoOCOManager:
                     pf_changed = True
                     continue
 
-            # ケース2: 有効期限（4時間）経過によるタイムアウト
-            if elapsed_hours >= self.order_expiry_hours:
+            # ケース2: 有効期限（Mode1: 0.75h / Mode2: 2.0h / Mode3: 4.0h）経過によるタイムアウト
+            if elapsed_hours >= order_expiry_h:
                 try:
                     self.broker.cancel_order(oid)
                 except Exception as exc:
@@ -1265,7 +1311,7 @@ class PseudoOCOManager:
                         message=(
                             f"・注文ID: `{oid}`\n"
                             f"・指値: {format_price_jpy(pending.get('limit_price', 0))} 円 × {format_decimal_plain(total_size)} {sym}\n"
-                            f"・経過時間: {elapsed_hours:.2f} 時間 (上限 {self.order_expiry_hours:.1f} 時間)"
+                            f"・経過時間: {elapsed_hours:.2f} 時間 (上限 {order_expiry_h:.2f} 時間)"
                         ),
                         level="EXPIRE",
                         dry_run=self.dry_run_notify,
@@ -1298,6 +1344,51 @@ class PseudoOCOManager:
                     )
                 pf_changed = True
                 continue
+
+            # ケース4: Mode 1 (AGGRESSIVE_BREAKOUT_PEG) の15秒ループ動的ペギング追従 (最大3回まで changeOrder)
+            exec_mode_t = str(pending.get("execution_mode_type", "")).upper()
+            peg_count_now = int(pending.get("peg_count", 0) or 0)
+            max_peg_allow = int(pending.get("max_peg_count", 3 if exec_mode_t == "AGGRESSIVE_BREAKOUT_PEG" else 0) or 0)
+            if (
+                exec_mode_t == "AGGRESSIVE_BREAKOUT_PEG"
+                and exec_size <= 0
+                and peg_count_now < max_peg_allow
+                and not is_in_daily_fee_settlement_freeze_window(now_jst)
+            ):
+                t_peg = (tickers or {}).get(sym, {})
+                peg_bid = _to_decimal(t_peg.get("bid", 0))
+                peg_ask = _to_decimal(t_peg.get("ask", 0))
+                peg_it = float(t_peg.get("best_imbalance_it", t_peg.get("imbalance_it", 0.70)) or 0.70)
+                cur_lim_d = _to_decimal(pending.get("limit_price", 0))
+                p_tick = _to_decimal(rule.get("tick_size", "1"), default=Decimal("1"))
+                if peg_it > 0.60 and peg_bid > cur_lim_d and cur_lim_d > Decimal("0"):
+                    target_peg_d = peg_bid
+                    if peg_ask > p_tick and target_peg_d >= peg_ask:
+                        target_peg_d = peg_ask - p_tick
+                    target_peg_d = round_to_step(target_peg_d, p_tick, rounding=ROUND_DOWN)
+                    if target_peg_d > cur_lim_d:
+                        try:
+                            if hasattr(self.broker, "change_order"):
+                                self.broker.change_order(oid, float(target_peg_d))
+                            old_lim_f = float(cur_lim_d)
+                            pending["limit_price"] = float(target_peg_d)
+                            pending["peg_count"] = peg_count_now + 1
+                            pf_changed = True
+                            events.append(
+                                {
+                                    "type": "AGGRESSIVE_BREAKOUT_PEG_UPDATED",
+                                    "symbol": sym,
+                                    "order_id": oid,
+                                    "old_limit_price": old_lim_f,
+                                    "new_limit_price": float(target_peg_d),
+                                    "peg_count": pending["peg_count"],
+                                    "max_peg_count": max_peg_allow,
+                                    "best_imbalance_it": round(peg_it, 4),
+                                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                                }
+                            )
+                        except Exception as peg_exc:
+                            logger.warning("AGGRESSIVE_BREAKOUT_PEG 追従変更時の警告 (%s): %s", sym, peg_exc)
 
             remaining_pending.append(pending)
 
@@ -1857,7 +1948,7 @@ class PseudoOCOManager:
                 pf_changed = True
                 continue
 
-            # 3) 4段階ダイナミック・トレーリングSL (Stage 1: <+1.5R初期SL維持 / Stage 2: >=+1.6Rまたは+1.2R構造転換で+0.15Rロック / Stage 3: >=+2.2Rシャンデリア / Stage 4: >=+3.0RまたはRSI>78クライマックス)
+            # 3) 4段階ダイナミック・トレーリングSL (Stage 1: <+1.5R初期SL維持 / Stage 2: >=+1.6Rまたは+1.2R構造転換で+0.15Rロック / Stage 3: >=+2.2Rシャンデリア / Stage 4: >=+3.0RまたはRSI>78またはRISK_OFF_CRASHでタイト化)
             stage, target_sl_price, should_update_sl = compute_four_stage_trailing_sl(
                 entry_price=entry_price,
                 current_bid=current_bid,
@@ -1871,6 +1962,11 @@ class PseudoOCOManager:
                 recent_low_15m=ticker.get("recent_low_15m") or pos.get("recent_low_15m"),
                 higher_low_15m=bool(ticker.get("higher_low_15m") or pos.get("higher_low_15m", False)),
                 buy_flow_positive=bool(ticker.get("buy_flow_positive") or pos.get("buy_flow_positive", False)),
+                force_stage4_tightening=bool(
+                    ticker.get("risk_off_crash")
+                    or pos.get("risk_off_crash", False)
+                    or str(pf.get("market_regime", "")).upper() == "RISK_OFF_CRASH"
+                ),
             )
 
             # 毎朝 05:59:30〜06:00:30 JST の手数料端数精算ウィンドウ中は非緊急の changeOrder（トレーリングSL更新）を一時停止

@@ -53,8 +53,14 @@ DEFAULT_GEMINI_FALLBACK_MODELS = [
 
 MAJOR_PULLBACK_SYMBOLS = {"BTC", "ETH", "XRP"}
 
-SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買クオンツアナリスト兼リスク審査AI（Veto Gate）です。
-確証バイアス（Confirmation Bias）を排除するため、必ず最初に「エントリーを見送るべき弱気要因・反対仮説 (`bearish_counter_thesis` 最低2項目)」を検証した上で、それを上回る強気根拠 (`bullish_conviction_factors`) と確信度スコア (`conviction_score`: 0〜100) が 75点以上ある場合のみ `BUY` を承認してください。
+SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）」専門の24時間常時監視・全自動売買の最高リスク責任者（CRO: Chief Risk Officer）兼クオンツ審査AI（Veto Gate）です。
+確証バイアス（Confirmation Bias）を排除するため、以下の【4ステップ反証型「Pre-Mortem」プロトコル】を厳格に実行し、反対仮説（`bearish_invalidation_points` / `bearish_counter_thesis` 最低2項目）を上回る強気エッジ（`bullish_edge_points` / `bullish_conviction_factors`）と確信度スコア（`conviction_score`: 0〜100）が 75点以上（かつ動的較正閾値 `effective_threshold` 以上）ある場合のみ `BUY` を承認してください。
+
+【0. CRO 4ステップ反証型「Pre-Mortem」審査プロトコル】
+- Step 1 (Pre-Mortem 失敗シミュレーション): 「このトレードが発注後4時間以内にSL（損切り）被弾して失敗した」と仮定し、その直接原因となる失敗シナリオを `bearish_invalidation_points`（および `bearish_counter_thesis`）に具体的に最低2つ特定せよ。
+- Step 2 (マイクロストラクチャ毒性チェック): 5ブロック無次元化特徴量テンソル (`normalized_feature_tensor`) の `microstructure_and_flow`（`obi_5`, `micro_price_divergence_bps`, `tfi_15m`, `tfi_1h`, `cvd_absorption_detected`, `obdr_slippage_pct`）および `volatility_and_trap_metrics`（`bksr`, `wtr_upper_wick_ratio`, `is_upper_wick_trap`）を精査し、板スカスカ（Hollow Book: `obdr_slippage_pct > 0.45%`）や上ヒゲ罠・売り吸収崩壊があれば即座に `HOLD`（Veto）せよ。
+- Step 3 (強気エッジとコスト控除後 R:R 検証): `bullish_edge_points`（および `bullish_conviction_factors`）と `cost_adjusted_economics`（Makerリベート・SL Taker手数料＋スリッページ・損益分岐勝率）を検証し、Step 1 の失敗リスクを上回る構造的エッジとリスクリワード比（原則1.5倍以上）があるか判定せよ。
+- Step 4 (閉ループ自己較正 Confidence と 3モード執行選択): 注入された「自己較正スコアカード (`self_calibration_scorecard`: FPR過信率・FNR機会損失率・TNR Veto正解率・`effective_threshold`)」を参照して過信を補正した `confidence` を算出し、市場構造に最適な執行モード `execution_mode_type`（`AGGRESSIVE_BREAKOUT_PEG` / `MOMENTUM_PULLBACK_DYNAMIC` / `DEEP_LIQUIDITY_DIP`）を選択せよ。
 
 【1. 運用・資金管理・リスク計算ルール（パターンA：自動複利スケール型）】
 1. 対象はGMOコイン「取引所（現物）」のみ（レバレッジ取引・空売りは不可、新規エントリーは現物買い `BUY` のみ）。
@@ -66,29 +72,201 @@ SYSTEM_PROMPT = """あなたはGMOコイン「取引所（現物・板取引）�
    - 総資産が **「max(17,000円［初期元本×0.85］, 過去最高総資産 peak_equity_jpy × 0.85)（ピークから-15%）」** を下回った場合は、トレーリング・キルスイッチとして新規 `BUY` を停止（`HOLD` 強制）すること。
 4. リスクリワード比 (`(take_profit_price - limit_price) / (limit_price - stop_loss_price)`) は原則 **1.5以上** を確保すること。
 
-【2. 反対仮説優先出力JSONスキーマ】
+【2. 反証型 Pre-Mortem 優先出力JSONスキーマ（キー順序厳守）】
 {
+  "bearish_invalidation_points": [
+    "Step 1 Pre-Mortem: 4時間以内にSL被弾する具体的失敗シナリオ1",
+    "Step 1 Pre-Mortem: 4時間以内にSL被弾する具体的失敗シナリオ2"
+  ],
   "bearish_counter_thesis": [
-    "弱気要因・リスク仮説1（必ず具体的に記述）",
-    "弱気要因・リスク仮説2（必ず具体的に記述）"
+    "弱気要因・リスク仮説1（bearish_invalidation_pointsと同期）",
+    "弱気要因・リスク仮説2（bearish_invalidation_pointsと同期）"
+  ],
+  "bullish_edge_points": [
+    "Step 3 強気エッジ・優位性根拠1",
+    "Step 3 強気エッジ・優位性根拠2"
   ],
   "bullish_conviction_factors": [
-    "強気要因・優位性根拠1",
-    "強気要因・優位性根拠2"
+    "強気要因・優位性根拠1（bullish_edge_pointsと同期）",
+    "強気要因・優位性根拠2（bullish_edge_pointsと同期）"
   ],
-  "conviction_score": 0〜100の整数（75未満の場合はBUY禁止・HOLD強制）,
+  "execution_mode_type": "AGGRESSIVE_BREAKOUT_PEG" | "MOMENTUM_PULLBACK_DYNAMIC" | "DEEP_LIQUIDITY_DIP" | "NONE",
   "action": "BUY" | "SELL" | "MODIFY" | "HOLD",
+  "confidence": 0.0〜1.0の数値（自己較正スコアカードに基づき較正済みの確信度）,
+  "conviction_score": 0〜100の整数（75未満の場合はBUY禁止・HOLD強制）,
   "symbol": "スクリーニングされた対象銘柄シンボル または NONE",
   "order_type": "LIMIT_POST_ONLY" | "STOP_OR_LIMIT" | "LIMIT_OR_MARKET" | "NONE",
   "limit_price": 数値 (MODIFY時は 0),
-  "suggested_entry_offset_atr": 数値 (Best Bid から下方に引く ATR 倍率目安。例: 0.60〜0.75),
+  "suggested_entry_offset_atr": 数値 (Best Bid から下方に引く ATR 倍率目安。例: 0.25〜1.10),
   "size": 数値,
   "take_profit_price": 数値,
   "stop_loss_price": 数値,
-  "confidence": 0.0〜1.0の数値,
-  "reasoning": "日本語での詳細な判断理由（反対仮説と強気根拠の比較・数値根拠・想定SL損失額を明記）"
+  "reasoning": "日本語での詳細な判断理由（Step 1 Pre-Mortem失敗仮説・Step 2 マイクロストラクチャ検証・Step 3 コスト控除後RR・Step 4 自己較正と執行モード選択根拠を明記）"
 }
 """
+
+
+def build_normalized_feature_tensor(
+    market_summaries: Dict[str, Dict[str, Any]],
+    symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
+    market_regime: str = "NEUTRAL_SELECTIVE",
+) -> Dict[str, Dict[str, Any]]:
+    """
+    生の価格配列を排除し、全銘柄共通スケールの【5ブロック無次元化特徴量テンソル (Normalized Feature Tensor)】へ変換する。
+      ① `regime_and_relative_strength`（対BTCアルファ、相関 rho、ベータ beta）
+      ② `multi_timeframe_structure`（1h/4h EMAからのATR距離、24hレンジ内位置 %）
+      ③ `microstructure_and_flow`（OBI_5, P_micro 乖離bps, TFI_15m/1h, CVD吸収有無, OBDR スリッページ%）
+      ④ `volatility_and_trap_metrics`（BKSR, WTR, 直上レジスタンス/直下サポート壁までのATR距離）
+      ⑤ `cost_adjusted_economics`（Makerリベート率、SL Taker手数料＋スリッページ、損益分岐勝率）
+    """
+    tensor: Dict[str, Dict[str, Any]] = {}
+    rules = symbol_rules or {}
+
+    for sym, summary in (market_summaries or {}).items():
+        sym_up = str(sym).strip().upper()
+        p_info = summary.get("price", {}) or {}
+        d_ind = summary.get("daily_indicators", {}) or {}
+        h4_ind = summary.get("h4_indicators", {}) or {}
+        h1_ind = summary.get("h1_indicators", {}) or {}
+        micro = summary.get("microstructure", {}) or {}
+        rule = rules.get(sym) or rules.get(sym_up) or DEFAULT_SYMBOL_RULES.get(sym_up, {})
+
+        last_p = float(p_info.get("last", 0.0) or 0.0)
+        high_24h = float(p_info.get("high", last_p) or last_p)
+        low_24h = float(p_info.get("low", last_p) or last_p)
+        spread_pct = float(p_info.get("spread_pct", 0.0) or 0.0)
+        atr_1d = float(d_ind.get("atr_14", 0.0) or (last_p * 0.02 if last_p > 0 else 1.0))
+        if atr_1d <= 0:
+            atr_1d = max(last_p * 0.02, 1e-6)
+        atr_1h = float(h1_ind.get("atr_14", 0.0) or h4_ind.get("atr_14", 0.0) or (atr_1d / 3.0))
+        if atr_1h <= 0:
+            atr_1h = max(atr_1d / 3.0, 1e-6)
+
+        # ① regime_and_relative_strength
+        alpha_24h = float(
+            p_info.get(
+                "relative_strength_vs_btc_24h_pct",
+                d_ind.get("relative_strength_vs_btc_24h_pct", 0.0),
+            )
+            or 0.0
+        )
+        alpha_7d = float(
+            p_info.get(
+                "relative_strength_vs_btc_7d_pct",
+                d_ind.get("relative_strength_vs_btc_7d_pct", 0.0),
+            )
+            or 0.0
+        )
+        beta_btc = float(p_info.get("beta_vs_btc", d_ind.get("beta_vs_btc", 1.0)) or 1.0)
+        corr_btc = float(p_info.get("correlation_vs_btc", d_ind.get("correlation_vs_btc", 0.5)) or 0.5)
+        pairwise_corr = p_info.get("pairwise_correlations") or d_ind.get("pairwise_correlations") or {}
+
+        block_1_regime = {
+            "market_regime": str(summary.get("market_regime") or market_regime),
+            "alpha_vs_btc_24h_pct": round(alpha_24h, 4),
+            "alpha_vs_btc_7d_pct": round(alpha_7d, 4),
+            "beta_vs_btc": round(beta_btc, 4),
+            "correlation_vs_btc": round(corr_btc, 4),
+            "pairwise_correlations": dict(pairwise_corr) if isinstance(pairwise_corr, dict) else {},
+        }
+
+        # ② multi_timeframe_structure
+        ema20_1h = float(h1_ind.get("ema_20") or h1_ind.get("sma_25") or d_ind.get("sma_25") or last_p)
+        ema20_4h = float(h4_ind.get("ema_20") or h4_ind.get("sma_25") or d_ind.get("sma_25") or last_p)
+        sma25_1d = float(d_ind.get("sma_25") or last_p)
+        dist_1h_ema_atr = (last_p - ema20_1h) / atr_1h if (last_p > 0 and atr_1h > 0) else 0.0
+        dist_4h_ema_atr = (last_p - ema20_4h) / atr_1d if (last_p > 0 and atr_1d > 0) else 0.0
+        dist_1d_sma25_atr = (last_p - sma25_1d) / atr_1d if (last_p > 0 and atr_1d > 0) else 0.0
+        rng_span = max(high_24h - low_24h, 1e-9)
+        range_pos_pct = max(0.0, min(100.0, (last_p - low_24h) / rng_span * 100.0)) if high_24h > low_24h else 50.0
+
+        block_2_structure = {
+            "dist_from_1h_ema_atr": round(dist_1h_ema_atr, 4),
+            "dist_from_4h_ema_atr": round(dist_4h_ema_atr, 4),
+            "dist_from_daily_sma25_atr": round(dist_1d_sma25_atr, 4),
+            "range_24h_position_pct": round(range_pos_pct, 2),
+            "daily_trend": str(d_ind.get("trend", "SIDEWAYS")),
+            "rsi_14_daily": round(float(d_ind.get("rsi_14", 50.0) or 50.0), 2),
+            "rsi_14_4h": round(float(h4_ind.get("rsi_14", 50.0) or 50.0), 2),
+        }
+
+        # ③ microstructure_and_flow
+        obi_5 = float(micro.get("obi_5", p_info.get("obi_5", 0.0)) or 0.0)
+        best_it = float(micro.get("best_imbalance_it", p_info.get("best_imbalance_it", 0.5)) or 0.5)
+        pmicro_div_bps = float(micro.get("micro_price_divergence_bps", 0.0) or 0.0)
+        tfi_15m = float(micro.get("tfi_15m", p_info.get("tfi_15m", 0.0)) or 0.0)
+        tfi_1h = float(micro.get("tfi_1h", p_info.get("tfi_1h", 0.0)) or 0.0)
+        cvd_abs = bool(micro.get("cvd_absorption_detected", False))
+        abs_score = float(micro.get("absorption_score", 0.0) or 0.0)
+        obdr_slip = float(micro.get("obdr_slippage_pct", p_info.get("obdr_slippage_pct", 0.0)) or 0.0)
+        hollow_book = bool(micro.get("is_hollow_book", obdr_slip > 0.45))
+
+        block_3_micro = {
+            "obi_5": round(obi_5, 4),
+            "best_imbalance_it": round(best_it, 4),
+            "micro_price_divergence_bps": round(pmicro_div_bps, 2),
+            "tfi_15m": round(tfi_15m, 4),
+            "tfi_1h": round(tfi_1h, 4),
+            "cvd_absorption_detected": cvd_abs,
+            "absorption_score": round(abs_score, 4),
+            "obdr_slippage_pct": round(obdr_slip, 4),
+            "is_hollow_book": hollow_book,
+        }
+
+        # ④ volatility_and_trap_metrics
+        bksr_val = float(micro.get("bksr", d_ind.get("bksr", 1.2)) or 1.2)
+        is_squeeze = bool(micro.get("is_squeeze", bksr_val < 1.0))
+        squeeze_bo = bool(micro.get("squeeze_breakout_up", False))
+        wtr_upper = float(micro.get("upper_wick_ratio", 0.0) or 0.0)
+        wtr_lower = float(micro.get("lower_wick_ratio", 0.0) or 0.0)
+        wtr_net = float(micro.get("wtr_net_score", wtr_lower - wtr_upper) or 0.0)
+        wick_trap = bool(micro.get("is_upper_wick_trap", wtr_upper >= 0.55))
+        wick_spring = bool(micro.get("is_lower_wick_spring", wtr_lower >= 0.55))
+
+        sup_wall_p = float(micro.get("support_wall_price", 0.0) or 0.0)
+        res_wall_p = float(micro.get("resistance_wall_price", high_24h) or high_24h)
+        dist_to_sup_atr = ((last_p - sup_wall_p) / atr_1h) if (last_p > 0 and sup_wall_p > 0 and atr_1h > 0) else 1.0
+        dist_to_res_atr = ((res_wall_p - last_p) / atr_1h) if (last_p > 0 and res_wall_p > 0 and atr_1h > 0) else 1.5
+
+        block_4_vol_trap = {
+            "bksr": round(bksr_val, 4),
+            "is_bksr_squeeze": is_squeeze,
+            "squeeze_breakout_up": squeeze_bo,
+            "wtr_upper_wick_ratio": round(wtr_upper, 4),
+            "wtr_lower_wick_ratio": round(wtr_lower, 4),
+            "wtr_net_score": round(wtr_net, 4),
+            "is_upper_wick_trap": wick_trap,
+            "is_lower_wick_spring": wick_spring,
+            "dist_to_resistance_wall_atr": round(dist_to_res_atr, 4),
+            "dist_to_support_wall_atr": round(dist_to_sup_atr, 4),
+        }
+
+        # ⑤ cost_adjusted_economics
+        maker_fee_pct = float(rule.get("maker_fee", -0.0001) or -0.0001) * 100.0
+        taker_fee_pct = float(rule.get("taker_fee", 0.0005) or 0.0005) * 100.0
+        sl_taker_plus_slip_pct = taker_fee_pct + max(0.05, obdr_slip * 0.5)
+        default_sl_pct = max(1.5, min(4.5, (atr_1d * 1.2 / last_p * 100.0) if last_p > 0 else 3.0))
+        spread_to_sl_ratio_pct = (spread_pct + taker_fee_pct) / default_sl_pct * 100.0 if default_sl_pct > 0 else 0.0
+        target_rr = 1.8
+        cost_drag_r = (sl_taker_plus_slip_pct + max(0.0, maker_fee_pct)) / default_sl_pct if default_sl_pct > 0 else 0.03
+        breakeven_win_rate = (1.0 + cost_drag_r) / (1.0 + target_rr)
+
+        block_5_economics = {
+            "maker_rebate_rate_pct": round(maker_fee_pct, 4),
+            "sl_taker_fee_plus_slippage_pct": round(sl_taker_plus_slip_pct, 4),
+            "spread_to_sl_cost_ratio_pct": round(spread_to_sl_ratio_pct, 2),
+            "breakeven_win_rate_at_1_8_rr": round(min(0.95, max(0.20, breakeven_win_rate)), 4),
+        }
+
+        tensor[sym_up] = {
+            "regime_and_relative_strength": block_1_regime,
+            "multi_timeframe_structure": block_2_structure,
+            "microstructure_and_flow": block_3_micro,
+            "volatility_and_trap_metrics": block_4_vol_trap,
+            "cost_adjusted_economics": block_5_economics,
+        }
+
+    return tensor
 
 
 def enrich_portfolio_positions(
@@ -293,14 +471,15 @@ def enforce_counter_thesis_and_conviction_gate(
     require_explicit_counter_thesis: bool = False,
 ) -> Dict[str, Any]:
     """
-    反対仮説 (`bearish_counter_thesis` >= 2項目) と確信度スコア (`conviction_score` >= 75) を検証し、
-    基準未達の `BUY` を `HOLD` (Veto) へ強制変換する。
+    反対仮説 (`bearish_invalidation_points` / `bearish_counter_thesis` >= 2項目) と
+    確信度スコア (`conviction_score` >= 75) を検証し、基準未達の `BUY` を `HOLD` (Veto) へ強制変換する。
+    さらに Pre-Mortem スキーマ順序（`bearish_invalidation_points` -> `bullish_edge_points` -> `execution_mode_type` -> `action` -> `confidence`）に整列する。
     """
     out = dict(decision)
     action = str(out.get("action", "HOLD")).strip().upper()
 
-    has_explicit_ct = "bearish_counter_thesis" in out
-    raw_ct = out.get("bearish_counter_thesis")
+    has_explicit_ct = ("bearish_invalidation_points" in out) or ("bearish_counter_thesis" in out)
+    raw_ct = out.get("bearish_invalidation_points") if "bearish_invalidation_points" in out else out.get("bearish_counter_thesis")
     if isinstance(raw_ct, list):
         ct_list = [str(x).strip() for x in raw_ct if str(x).strip()]
     else:
@@ -311,14 +490,12 @@ def enforce_counter_thesis_and_conviction_gate(
             "短期的なアルトコイン市場の流動性低下およびスプレッド拡大リスク",
             "BTC上位足レジスタンス付近での反落連れ安リスク",
         ]
-    out["bearish_counter_thesis"] = ct_list
 
-    raw_bull = out.get("bullish_conviction_factors")
+    raw_bull = out.get("bullish_edge_points") if "bullish_edge_points" in out else out.get("bullish_conviction_factors")
     if isinstance(raw_bull, list):
         bull_list = [str(x).strip() for x in raw_bull if str(x).strip()]
     else:
         bull_list = ["上位足上昇トレンド継続および1時間足押し目サポート反発"]
-    out["bullish_conviction_factors"] = bull_list
 
     conf_float = normalize_confidence(out.get("confidence", 0.0))
     if "conviction_score" in out and out["conviction_score"] is not None:
@@ -331,6 +508,10 @@ def enforce_counter_thesis_and_conviction_gate(
     conv_score = max(0, min(100, conv_score))
     out["conviction_score"] = conv_score
 
+    exec_mode = str(out.get("execution_mode_type") or out.get("execution_mode") or "").strip().upper()
+    if exec_mode not in ("AGGRESSIVE_BREAKOUT_PEG", "MOMENTUM_PULLBACK_DYNAMIC", "DEEP_LIQUIDITY_DIP", "NONE"):
+        exec_mode = "MOMENTUM_PULLBACK_DYNAMIC" if action == "BUY" else "NONE"
+
     if action == "BUY":
         if len(ct_list) < min_counter_thesis_count:
             out["action"] = "HOLD"
@@ -340,6 +521,7 @@ def enforce_counter_thesis_and_conviction_gate(
             out["take_profit_price"] = 0
             out["stop_loss_price"] = 0
             out["vetoed_by_counter_thesis"] = True
+            exec_mode = "NONE"
             out["reasoning"] = (
                 f"[Veto: bearish_counter_thesis 項目不足 ({len(ct_list)} < {min_counter_thesis_count}) によりHOLDへ強制変更] "
                 + str(out.get("reasoning", ""))
@@ -352,16 +534,32 @@ def enforce_counter_thesis_and_conviction_gate(
             out["take_profit_price"] = 0
             out["stop_loss_price"] = 0
             out["vetoed_by_conviction_gate"] = True
+            exec_mode = "NONE"
             out["reasoning"] = (
                 f"[Veto: conviction_score ({conv_score}) < {min_conviction_score} によりHOLDへ強制変更] "
                 + str(out.get("reasoning", ""))
             )
 
-    return out
+    # Pre-Mortem スキーマ順序を先頭に再構築
+    ordered_out: Dict[str, Any] = {
+        "bearish_invalidation_points": ct_list,
+        "bearish_counter_thesis": ct_list,
+        "bullish_edge_points": bull_list,
+        "bullish_conviction_factors": bull_list,
+        "execution_mode_type": exec_mode,
+        "action": str(out.get("action", "HOLD")).strip().upper(),
+        "confidence": conf_float,
+        "conviction_score": conv_score,
+    }
+    for k, v in out.items():
+        if k not in ordered_out:
+            ordered_out[k] = v
+
+    return ordered_out
 
 
 class AIJudge:
-    """AI 売買判定クラス（反対仮説優先スキーマ・クールダウン・Stale Signal Gate 対応）"""
+    """AI 売買判定クラス（反対仮説優先 Pre-Mortem スキーマ・無次元化特徴量テンソル・閉ループ自己較正・Stale Signal Gate 対応）"""
 
     def __init__(
         self,
@@ -370,6 +568,7 @@ class AIJudge:
         symbol_ai_cooldown_minutes: float = 60.0,
         sl_penalty_cooldown_hours: float = 4.0,
         stale_price_drift_pct: float = 0.30,
+        shadow_evaluator: Optional[Any] = None,
     ) -> None:
         self.provider = (provider or os.getenv("AI_PROVIDER", "gemini")).strip().lower()
         self.gemini_api_key = get_secret_env("GEMINI_API_KEY", "").strip()
@@ -383,6 +582,7 @@ class AIJudge:
         self.sl_penalty_cooldown_hours = float(sl_penalty_cooldown_hours)
         self.stale_price_drift_pct = float(stale_price_drift_pct)
         self.model_quota_cooldown_minutes = float(os.getenv("GEMINI_QUOTA_COOLDOWN_MINUTES", "60"))
+        self.shadow_evaluator = shadow_evaluator
 
         # 銘柄別クールダウン管理 & モデル別429クォータ枯渇クールダウン管理
         self._last_symbol_ai_eval_at: Dict[str, datetime] = {}
@@ -488,6 +688,8 @@ class AIJudge:
         symbol_rules: Dict[str, Dict[str, Any]],
         now_dt: datetime | None = None,
         post_inference_tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+        shadow_evaluator: Optional[Any] = None,
+        market_regime: str = "NEUTRAL_SELECTIVE",
     ) -> Dict[str, Any]:
         """市場データとポートフォリオを分析し、構造化JSON判定を返す"""
         now_jst = now_dt.astimezone(JST) if (now_dt and now_dt.tzinfo) else (now_dt.replace(tzinfo=JST) if now_dt else datetime.now(JST))
@@ -506,10 +708,26 @@ class AIJudge:
             if str(p.get("state", "PROTECTED")).upper() != "DUST_QUARANTINED"
         ]
 
+        active_shadow = shadow_evaluator or self.shadow_evaluator
+        self_calibration_scorecard: Dict[str, Any] = {}
+        if active_shadow is not None and hasattr(active_shadow, "compute_self_calibration_scorecard"):
+            try:
+                self_calibration_scorecard = active_shadow.compute_self_calibration_scorecard(limit=30)
+            except Exception:
+                self_calibration_scorecard = {}
+
+        normalized_feature_tensor = build_normalized_feature_tensor(
+            market_summaries=market_summaries,
+            symbol_rules=symbol_rules,
+            market_regime=str((portfolio or {}).get("market_regime") or market_regime),
+        )
+
         user_payload = {
             "timestamp_jst": now_str,
             "portfolio": llm_portfolio_view,
             "symbol_rules": symbol_rules,
+            "normalized_feature_tensor": normalized_feature_tensor,
+            "self_calibration_scorecard": self_calibration_scorecard,
             "market_summaries": market_summaries,
         }
 
@@ -572,10 +790,24 @@ class AIJudge:
         if act_norm == "MODIFY":
             decision["limit_price"] = 0
 
-        # 反対仮説 & conviction_score >= 75 ゲート適用
+        # Shadow Evaluation 閉ループ自己較正（ベータ・二項ベイズ較正＆動的閾値 effective_threshold = max(0.72, Quantile_0.75)）
+        effective_min_conv_score = self.min_conviction_score
+        if active_shadow is not None and hasattr(active_shadow, "calibrate_confidence_and_threshold"):
+            try:
+                cal = active_shadow.calibrate_confidence_and_threshold(decision["confidence"])
+                decision["calibrated_confidence"] = cal["calibrated_confidence"]
+                decision["effective_confidence_threshold"] = cal["effective_threshold"]
+                decision["self_calibration_scorecard"] = cal["scorecard"]
+                if int(cal["scorecard"].get("evaluated_sample_size", 0)) >= 4:
+                    dyn_score_thresh = int(round(float(cal["effective_threshold"]) * 100.0))
+                    effective_min_conv_score = max(self.min_conviction_score, dyn_score_thresh)
+            except Exception:
+                pass
+
+        # 反対仮説 & conviction_score ゲート適用
         decision = enforce_counter_thesis_and_conviction_gate(
             decision,
-            min_conviction_score=self.min_conviction_score,
+            min_conviction_score=effective_min_conv_score,
         )
 
         # クールダウン & Stale Signal Gate チェック (BUY時)
@@ -918,7 +1150,11 @@ class AIJudge:
             price_info = summary.get("price", {})
             ind = summary.get("daily_indicators", {})
             h4 = summary.get("h4_indicators", {})
+            micro = summary.get("microstructure", {}) or {}
             rule = symbol_rules.get(sym) or DEFAULT_SYMBOL_RULES.get(sym_up, {})
+
+            if bool(micro.get("is_hollow_book", False)) or float(micro.get("obdr_slippage_pct", 0.0) or 0.0) > 0.45:
+                continue
 
             last_price = float(price_info.get("last", 0))
             if last_price <= 0:
@@ -979,6 +1215,15 @@ class AIJudge:
             if 35.0 <= h4_rsi <= 62.0:
                 score += 10.0
 
+            if bool(micro.get("squeeze_breakout_up", False)):
+                score += 12.0
+                reasons.append("BKSRスクイーズ上抜けブレイクアウト")
+            if bool(micro.get("cvd_absorption_detected", False)) or bool(micro.get("is_lower_wick_spring", False)):
+                score += 10.0
+                reasons.append("下ヒゲSpring・売り吸収(CVD Absorption)検知")
+            if bool(micro.get("is_upper_wick_trap", False)):
+                score -= 15.0
+
             if score > best_score:
                 best_score = score
                 best_symbol = sym
@@ -990,17 +1235,20 @@ class AIJudge:
 
         if best_symbol == "NONE" or best_score < 25.0:
             return {
+                "bearish_invalidation_points": default_counter_thesis,
                 "bearish_counter_thesis": default_counter_thesis,
+                "bullish_edge_points": [],
                 "bullish_conviction_factors": [],
-                "conviction_score": max(0, int(best_score)),
+                "execution_mode_type": "NONE",
                 "action": "HOLD",
+                "confidence": 0.65,
+                "conviction_score": max(0, int(best_score)),
                 "symbol": best_symbol if best_symbol != "NONE" else "BTC",
                 "order_type": "NONE",
                 "limit_price": 0,
                 "size": 0,
                 "take_profit_price": 0,
                 "stop_loss_price": 0,
-                "confidence": 0.65,
                 "reasoning": (
                     f"全スクリーニング銘柄 ({len(market_summaries)}銘柄) のテクニカルスコアを評価した結果、"
                     f"最高スコア銘柄 ({best_symbol}: {best_score:.0f}点) でもエントリー基準 (25点以上) に満たないため、"
@@ -1009,6 +1257,7 @@ class AIJudge:
             }
 
         chosen = best_details["summary"]
+        chosen_micro = chosen.get("microstructure", {}) or {}
         rule = symbol_rules.get(best_symbol) or DEFAULT_SYMBOL_RULES.get(best_symbol.upper(), {})
         taker_fee = max(float(rule.get("taker_fee", 0.0005)), 0.0)
         last_price = float(chosen["price"]["last"])
@@ -1016,6 +1265,13 @@ class AIJudge:
         atr_14 = float(chosen["daily_indicators"].get("atr_14", last_price * 0.02))
         if atr_14 <= 0:
             atr_14 = last_price * 0.02
+
+        if bool(chosen_micro.get("squeeze_breakout_up", False)):
+            exec_mode_type = "AGGRESSIVE_BREAKOUT_PEG"
+        elif bool(chosen_micro.get("cvd_absorption_detected", False)) or bool(chosen_micro.get("is_lower_wick_spring", False)):
+            exec_mode_type = "DEEP_LIQUIDITY_DIP"
+        else:
+            exec_mode_type = "MOMENTUM_PULLBACK_DYNAMIC"
 
         pullback_mult = 0.60 if best_symbol.upper() in MAJOR_PULLBACK_SYMBOLS else 0.75
         limit_price = min(best_bid, last_price - (pullback_mult * atr_14))
@@ -1035,10 +1291,14 @@ class AIJudge:
         reason_str = " / ".join(best_details["reasons"])
 
         return {
+            "bearish_invalidation_points": default_counter_thesis,
             "bearish_counter_thesis": default_counter_thesis,
+            "bullish_edge_points": list(best_details["reasons"]),
             "bullish_conviction_factors": list(best_details["reasons"]),
-            "conviction_score": conviction_score,
+            "execution_mode_type": exec_mode_type,
             "action": "BUY",
+            "confidence": confidence,
+            "conviction_score": conviction_score,
             "symbol": best_symbol,
             "order_type": "LIMIT_POST_ONLY",
             "limit_price": limit_price,
@@ -1046,7 +1306,6 @@ class AIJudge:
             "size": proposed_size,
             "take_profit_price": tp_price,
             "stop_loss_price": sl_price,
-            "confidence": confidence,
             "reasoning": (
                 f"【クオンツ判定: {best_symbol} 押し目買い推奨 (スコア {best_score:.0f}点 / 確信度スコア {conviction_score})】"
                 f" 根拠: {reason_str}。現在値から {pullback_mult:.2f}×日足ATR 下方の押し目指値・"

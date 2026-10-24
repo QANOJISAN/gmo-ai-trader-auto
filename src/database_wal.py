@@ -1508,6 +1508,8 @@ class DatabaseWAL:
         tp_price: Union[str, float] = 0.0,
         sl_price: Union[str, float] = 0.0,
         radar_score: float = 0.0,
+        bearish_counter_thesis: str = "",
+        bullish_conviction_factors: str = "",
         evaluated_at: Optional[datetime] = None,
     ) -> None:
         dt = evaluated_at or datetime.now(JST)
@@ -1519,8 +1521,19 @@ class DatabaseWAL:
             entry_price=float(entry_price or 0.0),
             stop_loss_price=float(sl_price or 0.0),
             take_profit_price=float(tp_price or 0.0),
+            bearish_counter_thesis=bearish_counter_thesis,
+            bullish_conviction_factors=bullish_conviction_factors,
             now_ts_ms=int(dt.timestamp() * 1000),
         )
+
+    def fetch_recent_shadow_evaluations(self, limit: int = 30) -> List[Dict[str, Any]]:
+        """直近 N 件のシャドー評価レコードを取得する（閉ループ自己較正スコアカード用）"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM llm_shadow_evaluations ORDER BY created_ts_ms DESC, id DESC LIMIT ?",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def update_shadow_evaluation_metrics(
         self,

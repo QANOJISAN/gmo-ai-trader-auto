@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["sma_75"] = close.rolling(window=75, min_periods=1).mean()
     out["ema_12"] = close.ewm(span=12, adjust=False).mean()
     out["ema_26"] = close.ewm(span=26, adjust=False).mean()
+    out["ema_50"] = close.ewm(span=50, adjust=False).mean()
 
     # 2. MACD (12, 26, 9)
     out["macd"] = out["ema_12"] - out["ema_26"]
@@ -87,13 +89,36 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
         0.0,
     )
 
-    # 5. ATR (Average True Range, 14期間)
+    # 5. ATR (Average True Range, 14期間 & 20期間) & ADX(14) & BKSR
     prev_close = close.shift(1)
     tr1 = high - low
     tr2 = (high - prev_close).abs()
     tr3 = (low - prev_close).abs()
     true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     out["atr_14"] = true_range.ewm(alpha=1.0 / 14.0, min_periods=1, adjust=False).mean()
+    out["atr_20"] = true_range.ewm(alpha=1.0 / 20.0, min_periods=1, adjust=False).mean()
+    out["bksr"] = np.where(
+        out["atr_20"] > 0,
+        (4.0 * bb_std) / (3.0 * out["atr_20"]),
+        1.0,
+    )
+
+    up_move = high.diff().fillna(0.0)
+    down_move = (-low.diff()).fillna(0.0)
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0),
+        index=out.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0),
+        index=out.index,
+    )
+    atr_safe = out["atr_14"].replace(0.0, np.nan)
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / 14.0, min_periods=1, adjust=False).mean() / atr_safe).fillna(0.0)
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / 14.0, min_periods=1, adjust=False).mean() / atr_safe).fillna(0.0)
+    di_sum = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = (100.0 * (plus_di - minus_di).abs() / di_sum).fillna(20.0)
+    out["adx_14"] = dx.ewm(alpha=1.0 / 14.0, min_periods=1, adjust=False).mean()
 
     # 6. 出来高移動平均・変化率（直前までの確定足20本平均を基準とする）
     prev_vol_sma_20 = volume.shift(1).rolling(window=20, min_periods=1).mean()
@@ -102,6 +127,563 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     out["volume_ratio_20"] = np.where(vol_sma_20 > 0, volume / vol_sma_20, 1.0)
 
     return out
+
+
+def compute_orderbook_microstructure(
+    orderbook: Optional[Dict[str, Any]],
+    last_price: float = 0.0,
+    tick_size: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    テーマ2-(1)-①: 5段階指数減衰加重板不均衡 (OBI_5 = sum_{i=1}^5 e^{-0.5(i-1)} Q_bid,i vs ask in [-1.0, +1.0])
+    および Stoikov Micro-Price (P_micro = I_t * P_a + (1 - I_t) * P_b, I_t = Q_b / (Q_b + Q_a))、
+    上位5〜10気配の最大買い壁 (support_wall_price, support_wall_front_run_price) を算出する。
+    """
+    if not orderbook or not isinstance(orderbook, dict):
+        return {
+            "obi_5": 0.0,
+            "best_imbalance_it": 0.5,
+            "micro_price": float(last_price or 0.0),
+            "mid_price": float(last_price or 0.0),
+            "micro_price_divergence_bps": 0.0,
+            "support_wall_price": float(last_price or 0.0),
+            "support_wall_size": 0.0,
+            "support_wall_front_run_price": float(last_price or 0.0),
+            "resistance_wall_price": float(last_price or 0.0),
+            "resistance_wall_size": 0.0,
+        }
+
+    raw_bids = orderbook.get("bids") or []
+    raw_asks = orderbook.get("asks") or []
+
+    parsed_bids: List[tuple[float, float]] = []
+    for b in raw_bids[:10]:
+        try:
+            p = float(b.get("price", 0.0) if isinstance(b, dict) else b[0])
+            s = float(b.get("size", 0.0) if isinstance(b, dict) else b[1])
+            if p > 0 and s > 0:
+                parsed_bids.append((p, s))
+        except Exception:
+            continue
+
+    parsed_asks: List[tuple[float, float]] = []
+    for a in raw_asks[:10]:
+        try:
+            p = float(a.get("price", 0.0) if isinstance(a, dict) else a[0])
+            s = float(a.get("size", 0.0) if isinstance(a, dict) else a[1])
+            if p > 0 and s > 0:
+                parsed_asks.append((p, s))
+        except Exception:
+            continue
+
+    parsed_bids.sort(key=lambda x: x[0], reverse=True)
+    parsed_asks.sort(key=lambda x: x[0])
+
+    if not parsed_bids and not parsed_asks:
+        fallback_ob_imb = float(orderbook.get("orderbook_imbalance", 0.0) or 0.0)
+        it_fallback = max(0.0, min(1.0, 0.5 * (fallback_ob_imb + 1.0)))
+        return {
+            "obi_5": round(max(-1.0, min(1.0, fallback_ob_imb)), 4),
+            "best_imbalance_it": round(it_fallback, 4),
+            "micro_price": float(last_price or 0.0),
+            "mid_price": float(last_price or 0.0),
+            "micro_price_divergence_bps": 0.0,
+            "support_wall_price": float(last_price or 0.0),
+            "support_wall_size": 0.0,
+            "support_wall_front_run_price": float(last_price or 0.0),
+            "resistance_wall_price": float(last_price or 0.0),
+            "resistance_wall_size": 0.0,
+        }
+
+    best_bid_p, best_bid_q = parsed_bids[0] if parsed_bids else (float(last_price or 0.0), 0.0)
+    best_ask_p, best_ask_q = parsed_asks[0] if parsed_asks else (float(last_price or 0.0), 0.0)
+    mid_price = (
+        0.5 * (best_bid_p + best_ask_p)
+        if (best_bid_p > 0 and best_ask_p > 0)
+        else (best_bid_p or best_ask_p or float(last_price or 0.0))
+    )
+
+    # 最良気配インバランス I_t = Q_b / (Q_b + Q_a) と Stoikov Micro-Price P_micro
+    denom_top = best_bid_q + best_ask_q
+    best_it = (best_bid_q / denom_top) if denom_top > 0 else 0.5
+    micro_price = (
+        best_it * best_ask_p + (1.0 - best_it) * best_bid_p
+        if (best_bid_p > 0 and best_ask_p > 0)
+        else mid_price
+    )
+    micro_div_bps = ((micro_price - mid_price) / mid_price * 10000.0) if mid_price > 0 else 0.0
+
+    # 5段階指数減衰加重板不均衡 OBI_5 = (W_bid - W_ask) / (W_bid + W_ask)
+    w_bid = 0.0
+    for idx, (_, q_b) in enumerate(parsed_bids[:5]):
+        w_bid += math.exp(-0.5 * idx) * q_b
+    w_ask = 0.0
+    for idx, (_, q_a) in enumerate(parsed_asks[:5]):
+        w_ask += math.exp(-0.5 * idx) * q_a
+    obi_5 = ((w_bid - w_ask) / (w_bid + w_ask)) if (w_bid + w_ask) > 0 else 0.0
+    obi_5 = max(-1.0, min(1.0, obi_5))
+
+    # 上位5〜10気配で最大の買い板厚を持つサポート壁と、その1ティック上 (Front-running tick)
+    inferred_tick = tick_size if tick_size > 0 else (1.0 if mid_price >= 50.0 else 0.001)
+    if parsed_bids:
+        wall_p, wall_q = max(parsed_bids[:10], key=lambda item: item[1])
+        front_run_p = wall_p + inferred_tick
+        if best_ask_p > 0 and front_run_p >= best_ask_p:
+            front_run_p = max(wall_p, best_ask_p - inferred_tick)
+    else:
+        wall_p, wall_q, front_run_p = mid_price, 0.0, mid_price
+
+    if parsed_asks:
+        res_p, res_q = max(parsed_asks[:10], key=lambda item: item[1])
+    else:
+        res_p, res_q = mid_price, 0.0
+
+    return {
+        "obi_5": round(obi_5, 4),
+        "best_imbalance_it": round(best_it, 4),
+        "micro_price": round(micro_price, 6),
+        "mid_price": round(mid_price, 6),
+        "micro_price_divergence_bps": round(micro_div_bps, 3),
+        "support_wall_price": round(wall_p, 6),
+        "support_wall_size": round(wall_q, 6),
+        "support_wall_front_run_price": round(front_run_p, 6),
+        "resistance_wall_price": round(res_p, 6),
+        "resistance_wall_size": round(res_q, 6),
+    }
+
+
+def compute_trade_flow_and_absorption(
+    trades: Optional[List[Dict[str, Any]]] = None,
+    df_1h: Optional[Any] = None,
+    now_ms: Optional[float] = None,
+    klines_15m: Optional[Any] = None,
+    atr_15m: Optional[float] = None,
+    now_ts_ms: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    テーマ2-(1)-②: 正規化トレード・フロー不均衡 (TFI_15m, TFI_1h in [-1.0, +1.0])
+    および CVD吸収スコア (成行売りが優勢でも価格下落幅が圧縮されている「売り吸収 = 底打ちサイン」の検出)。
+    約定履歴リスト `trades` が無い場合は 1時間足ローソク足のクローズ位置・出来高から近似推定する。
+    """
+    if now_ms is None and now_ts_ms is not None:
+        now_ms = float(now_ts_ms)
+    if df_1h is None and klines_15m is not None:
+        df_1h = klines_15m
+    if isinstance(df_1h, list):
+        df_1h = pd.DataFrame(df_1h)
+    tfi_15m = 0.0
+    tfi_1h = 0.0
+    buy_notional_1h = 0.0
+    sell_notional_1h = 0.0
+    price_change_15m_pct = 0.0
+
+    if trades and isinstance(trades, list) and len(trades) > 0:
+        parsed_rows: List[tuple[float, str, float, float]] = []
+        for idx, t in enumerate(trades):
+            if not isinstance(t, dict):
+                continue
+            side = str(t.get("side", "")).upper()
+            try:
+                price = float(t.get("price", 0.0) or 0.0)
+                size = float(t.get("size", 0.0) or 0.0)
+            except Exception:
+                continue
+            if price <= 0 or size <= 0:
+                continue
+            ts_ms = 0.0
+            raw_ts = t.get("timestamp") or t.get("time") or t.get("executed_at")
+            if isinstance(raw_ts, (int, float)):
+                ts_ms = float(raw_ts) if raw_ts > 1e11 else float(raw_ts) * 1000.0
+            elif isinstance(raw_ts, str) and raw_ts:
+                try:
+                    ts_ms = pd.Timestamp(raw_ts).timestamp() * 1000.0
+                except Exception:
+                    ts_ms = 0.0
+            parsed_rows.append((ts_ms, side, price, size))
+
+        if parsed_rows:
+            max_ts = max(r[0] for r in parsed_rows)
+            ref_now = float(now_ms) if (now_ms and now_ms > 0) else max_ts
+            buy_15m = 0.0
+            sell_15m = 0.0
+            prices_15m: List[float] = []
+            total_n = len(parsed_rows)
+            for i, (ts_ms, side, price, size) in enumerate(parsed_rows):
+                notional = price * size
+                in_1h = (ref_now - ts_ms <= 3600_000.0) if ref_now > 0 and ts_ms > 0 else True
+                in_15m = (
+                    (ref_now - ts_ms <= 900_000.0)
+                    if (ref_now > 0 and ts_ms > 0)
+                    else (i >= max(0, total_n - max(1, total_n // 3)))
+                )
+                if in_1h:
+                    if side == "BUY":
+                        buy_notional_1h += notional
+                    elif side == "SELL":
+                        sell_notional_1h += notional
+                if in_15m:
+                    prices_15m.append(price)
+                    if side == "BUY":
+                        buy_15m += notional
+                    elif side == "SELL":
+                        sell_15m += notional
+
+            if (buy_15m + sell_15m) > 0:
+                tfi_15m = (buy_15m - sell_15m) / (buy_15m + sell_15m)
+            if (buy_notional_1h + sell_notional_1h) > 0:
+                tfi_1h = (buy_notional_1h - sell_notional_1h) / (buy_notional_1h + sell_notional_1h)
+            if len(prices_15m) >= 2 and prices_15m[0] > 0:
+                price_change_15m_pct = (prices_15m[-1] - prices_15m[0]) / prices_15m[0] * 100.0
+
+    # ローソク足からのフォールバックまたは補完
+    price_change_1h_pct = 0.0
+    lower_wick_cur = 0.0
+    atr_pct_1h = 0.8
+    if df_1h is not None and not df_1h.empty:
+        row = df_1h.iloc[-1]
+        prev_row = df_1h.iloc[-2] if len(df_1h) >= 2 else row
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+        prev_c = float(prev_row["close"])
+        rng = max(1e-9, h - l)
+        clv = ((c - l) - (h - c)) / rng  # [-1.0, +1.0] Close Location Value
+        lower_wick_cur = (min(o, c) - l) / rng
+        price_change_1h_pct = ((c - prev_c) / prev_c * 100.0) if prev_c > 0 else 0.0
+        atr_pct_1h = max(0.15, (rng / c * 100.0) if c > 0 else 0.8)
+        if not trades:
+            tfi_15m = max(-1.0, min(1.0, clv))
+            if len(df_1h) >= 2:
+                prev_rng = max(1e-9, float(prev_row["high"]) - float(prev_row["low"]))
+                prev_clv = (
+                    (float(prev_row["close"]) - float(prev_row["low"]))
+                    - (float(prev_row["high"]) - float(prev_row["close"]))
+                ) / prev_rng
+                tfi_1h = max(-1.0, min(1.0, 0.65 * clv + 0.35 * prev_clv))
+            else:
+                tfi_1h = tfi_15m
+            price_change_15m_pct = price_change_1h_pct * 0.5
+
+    # CVD吸収スコア: 成行売りが優勢 (TFI < -0.12) なのに価格下落幅が圧縮されている (または下ヒゲ吸収)
+    sell_pressure = max(0.0, -min(tfi_15m, tfi_1h))
+    effective_drop_pct = max(0.0, -min(price_change_15m_pct, price_change_1h_pct))
+    drop_compression_ratio = max(0.0, 1.0 - (effective_drop_pct / max(0.25, atr_pct_1h)))
+    absorption_score = sell_pressure * drop_compression_ratio
+    if lower_wick_cur >= 0.45 and sell_pressure > 0.10:
+        absorption_score = min(1.0, absorption_score + 0.25 * lower_wick_cur)
+    cvd_absorption_detected = bool(
+        (sell_pressure >= 0.15 and effective_drop_pct <= max(0.25, 0.35 * atr_pct_1h))
+        or absorption_score >= 0.22
+    )
+
+    return {
+        "tfi_15m": round(max(-1.0, min(1.0, tfi_15m)), 4),
+        "tfi_1h": round(max(-1.0, min(1.0, tfi_1h)), 4),
+        "buy_notional_1h_jpy": round(buy_notional_1h, 2),
+        "sell_notional_1h_jpy": round(sell_notional_1h, 2),
+        "absorption_score": round(min(1.0, absorption_score), 4),
+        "cvd_absorption_detected": cvd_absorption_detected,
+    }
+
+
+def compute_bksr_squeeze(df: Optional[Any]) -> Dict[str, Any]:
+    """
+    テーマ2-(1)-③: ボリンジャー・ケルトナー圧縮比 (BKSR = 4.0 * sigma_20 / (3.0 * ATR_20))
+    BKSR < 1.0 でエネルギー充填（スクイーズ状態）、1.0を上抜けかつ close > BB_upper または直近スクイーズからの上放れを検知。
+    """
+    if isinstance(df, list):
+        df = pd.DataFrame(df)
+    if df is None or df.empty:
+        return {
+            "bksr": 1.0,
+            "is_squeeze": False,
+            "recent_squeeze": False,
+            "squeeze_breakout_up": False,
+        }
+    ind = calculate_indicators(df) if "bksr" not in df.columns else df
+    latest = ind.iloc[-1]
+    bksr_val = float(latest.get("bksr", 1.0) or 1.0)
+    is_squeeze = bool(bksr_val < 1.0)
+    tail_bksr = ind["bksr"].tail(5).astype(float)
+    recent_squeeze = bool((tail_bksr < 1.05).any())
+    close_p = float(latest["close"])
+    bb_upper = float(latest["bb_upper"])
+    bb_mid = float(latest["bb_mid"])
+    prev_close = float(ind.iloc[-2]["close"]) if len(ind) >= 2 else close_p
+    squeeze_breakout_up = bool(
+        recent_squeeze
+        and close_p > prev_close
+        and (close_p >= bb_upper * 0.998 or (bksr_val >= 1.0 and close_p > bb_mid))
+    )
+    return {
+        "bksr": round(bksr_val, 4),
+        "is_squeeze": is_squeeze,
+        "recent_squeeze": recent_squeeze,
+        "squeeze_breakout_up": squeeze_breakout_up,
+    }
+
+
+def compute_wick_toxicity_ratio(
+    df: Optional[Any],
+    tfi_15m: float = 0.0,
+    lookback: int = 3,
+) -> Dict[str, Any]:
+    """
+    テーマ2-(1)-④: ストップ狩り・ヒゲ毒性比率 (WTR: Wick Toxicity Ratio)
+    直近3本において:
+    - UpperWickRatio = (High - max(Open, Close)) / (High - Low) > 0.55 かつ出来高増を「上値追い罠（減点）」
+    - LowerWickRatio = (min(Open, Close) - Low) / (High - Low) > 0.60 かつ TFI > +0.15 を「ストップ狩り吸収完了のSpringシグナル（加点）」
+    """
+    if isinstance(df, list):
+        df = pd.DataFrame(df)
+    if df is None or df.empty:
+        return {
+            "upper_wick_ratio": 0.0,
+            "lower_wick_ratio": 0.0,
+            "upper_wick_trap_penalty": 0.0,
+            "lower_wick_spring_bonus": 0.0,
+            "wtr_net_score": 0.0,
+            "is_upper_wick_trap": False,
+            "is_lower_wick_spring": False,
+        }
+    ind = calculate_indicators(df) if "volume_ratio_20" not in df.columns else df
+    window = ind.tail(max(1, int(lookback)))
+    max_upper_ratio = 0.0
+    max_lower_ratio = 0.0
+    upper_trap = False
+    lower_spring = False
+
+    for _, row in window.iterrows():
+        o = float(row["open"])
+        h = float(row["high"])
+        l = float(row["low"])
+        c = float(row["close"])
+        v_ratio_raw = row.get("volume_ratio_20", 1.0)
+        v_ratio = 1.2 if (v_ratio_raw is None or pd.isna(v_ratio_raw) or float(v_ratio_raw) == 0.0) else float(v_ratio_raw)
+        rng = h - l
+        if rng <= 0:
+            continue
+        u_ratio = (h - max(o, c)) / rng
+        l_ratio = (min(o, c) - l) / rng
+        max_upper_ratio = max(max_upper_ratio, u_ratio)
+        max_lower_ratio = max(max_lower_ratio, l_ratio)
+        if u_ratio > 0.55 and v_ratio >= 1.0:
+            upper_trap = True
+        if l_ratio > 0.60 and (tfi_15m >= 0.0 or c >= o):
+            lower_spring = True
+
+    penalty = -0.15 if upper_trap else (-0.05 if max_upper_ratio > 0.55 else 0.0)
+    bonus = 0.15 if (max_lower_ratio > 0.60 and tfi_15m > 0.15) else (0.08 if lower_spring else 0.0)
+    return {
+        "upper_wick_ratio": round(max_upper_ratio, 4),
+        "lower_wick_ratio": round(max_lower_ratio, 4),
+        "upper_wick_trap_penalty": round(penalty, 4),
+        "lower_wick_spring_bonus": round(bonus, 4),
+        "wtr_net_score": round(bonus + penalty, 4),
+        "is_upper_wick_trap": bool(upper_trap),
+        "is_lower_wick_spring": bool(lower_spring or (max_lower_ratio > 0.60 and tfi_15m > 0.15)),
+    }
+
+
+def compute_obdr_slippage(
+    orderbook: Optional[Dict[str, Any]],
+    order_notional_jpy: float = 9_011.0,
+    max_slippage_pct: float = 0.45,
+    target_notional_jpy: Optional[float] = None,
+) -> Dict[str, Any]:
+    """
+    テーマ2-(1)-⑤: 板厚スリッページ耐性 (OBDR: Order Book Depth Resilience)
+    1枠の標準投下資金 (9,011円) を現在板の bids に対して成行売却シミュレーションした際の
+    加重平均約定価格と仲値の乖離率を算出し、0.45% を超える「中抜き板（Hollow Book）」を検知する。
+    """
+    if target_notional_jpy is not None:
+        order_notional_jpy = float(target_notional_jpy)
+    if not orderbook or not isinstance(orderbook, dict):
+        return {
+            "order_notional_jpy": round(float(order_notional_jpy), 2),
+            "vwap_fill_price": 0.0,
+            "mid_price": 0.0,
+            "obdr_slippage_pct": 0.0,
+            "filled_ratio": 1.0,
+            "is_hollow_book": False,
+            "has_orderbook": False,
+        }
+
+    if "obdr_slippage_pct" in orderbook and not orderbook.get("bids"):
+        slip = float(orderbook.get("obdr_slippage_pct", 0.0) or 0.0)
+        return {
+            "order_notional_jpy": round(float(order_notional_jpy), 2),
+            "vwap_fill_price": 0.0,
+            "mid_price": 0.0,
+            "obdr_slippage_pct": round(slip, 4),
+            "filled_ratio": 1.0,
+            "is_hollow_book": bool(slip > max_slippage_pct),
+            "has_orderbook": True,
+        }
+
+    raw_bids = orderbook.get("bids") or []
+    raw_asks = orderbook.get("asks") or []
+    if not raw_bids:
+        return {
+            "order_notional_jpy": round(float(order_notional_jpy), 2),
+            "vwap_fill_price": 0.0,
+            "mid_price": 0.0,
+            "obdr_slippage_pct": 0.0,
+            "filled_ratio": 1.0,
+            "is_hollow_book": False,
+            "has_orderbook": False,
+        }
+
+    bids: List[tuple[float, float]] = []
+    for b in raw_bids:
+        try:
+            p = float(b.get("price", 0.0) if isinstance(b, dict) else b[0])
+            s = float(b.get("size", 0.0) if isinstance(b, dict) else b[1])
+            if p > 0 and s > 0:
+                bids.append((p, s))
+        except Exception:
+            continue
+    bids.sort(key=lambda x: x[0], reverse=True)
+
+    asks: List[tuple[float, float]] = []
+    for a in raw_asks:
+        try:
+            p = float(a.get("price", 0.0) if isinstance(a, dict) else a[0])
+            s = float(a.get("size", 0.0) if isinstance(a, dict) else a[1])
+            if p > 0 and s > 0:
+                asks.append((p, s))
+        except Exception:
+            continue
+    asks.sort(key=lambda x: x[0])
+
+    if not bids:
+        return {
+            "order_notional_jpy": round(float(order_notional_jpy), 2),
+            "vwap_fill_price": 0.0,
+            "mid_price": 0.0,
+            "obdr_slippage_pct": 99.9,
+            "filled_ratio": 0.0,
+            "is_hollow_book": True,
+            "has_orderbook": True,
+        }
+
+    best_bid = bids[0][0]
+    best_ask = asks[0][0] if asks else best_bid
+    mid_price = 0.5 * (best_bid + best_ask) if best_ask > 0 else best_bid
+
+    remaining_jpy = max(1.0, float(order_notional_jpy))
+    total_qty = 0.0
+    total_proceeds_jpy = 0.0
+
+    for bid_p, bid_sz in bids:
+        level_jpy = bid_p * bid_sz
+        take_jpy = min(remaining_jpy, level_jpy)
+        take_qty = take_jpy / bid_p
+        total_qty += take_qty
+        total_proceeds_jpy += take_jpy
+        remaining_jpy -= take_jpy
+        if remaining_jpy <= 1e-6:
+            break
+
+    # 板をすべて食い尽くしてもまだ約定しきれない場合は最下段のさらに1.0%下で残り約定とみなすペナルティ
+    if remaining_jpy > 1e-6:
+        worst_p = bids[-1][0] * 0.99
+        if worst_p > 0:
+            total_qty += remaining_jpy / worst_p
+            total_proceeds_jpy += remaining_jpy
+
+    vwap_price = (float(order_notional_jpy) / total_qty) if total_qty > 0 else 0.0
+    slippage_pct = ((mid_price - vwap_price) / mid_price * 100.0) if (mid_price > 0 and vwap_price > 0) else 99.9
+    slippage_pct = max(0.0, slippage_pct)
+    filled_ratio = min(1.0, (float(order_notional_jpy) - max(0.0, remaining_jpy)) / max(1.0, float(order_notional_jpy)))
+
+    return {
+        "order_notional_jpy": round(float(order_notional_jpy), 2),
+        "vwap_fill_price": round(vwap_price, 6),
+        "mid_price": round(mid_price, 6),
+        "obdr_slippage_pct": round(slippage_pct, 4),
+        "filled_ratio": round(filled_ratio, 4),
+        "is_hollow_book": bool(slippage_pct > float(max_slippage_pct)),
+        "has_orderbook": True,
+    }
+
+
+def compute_btc_beta_and_correlation_matrix(
+    market_summaries: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    テーマ5-(1): 1時間足リターン系列 (`h1_indicators.returns_1h`) から
+    対BTCベータ値 beta_i = Cov(r_i, r_BTC) / Var(r_BTC) および
+    銘柄間ペアワイズ相関係数 rho_{A, B} を算出する。
+    """
+    returns_map: Dict[str, List[float]] = {}
+    for sym, summary in (market_summaries or {}).items():
+        if not isinstance(summary, dict):
+            continue
+        h1 = summary.get("h1_indicators") or {}
+        rets = h1.get("returns_1h") or summary.get("returns_1h") or []
+        if isinstance(rets, list) and len(rets) >= 3:
+            returns_map[sym.upper()] = [float(x) for x in rets]
+
+    btc_rets = returns_map.get("BTC", [])
+    betas: Dict[str, float] = {}
+    corr_vs_btc: Dict[str, float] = {}
+    pairwise_corr: Dict[str, Dict[str, float]] = {}
+
+    for sym_u in (market_summaries or {}).keys():
+        su = sym_u.upper()
+        pairwise_corr[su] = {su: 1.0}
+        if su == "BTC":
+            betas[su] = 1.0
+            corr_vs_btc[su] = 1.0
+            continue
+        r_i = returns_map.get(su, [])
+        n = min(len(r_i), len(btc_rets))
+        if n >= 3:
+            a = np.array(r_i[-n:], dtype=float)
+            b = np.array(btc_rets[-n:], dtype=float)
+            var_b = float(np.var(b))
+            std_a = float(np.std(a))
+            std_b = float(np.std(b))
+            if var_b > 1e-12:
+                cov_ab = float(np.mean((a - np.mean(a)) * (b - np.mean(b))))
+                betas[su] = round(max(-3.0, min(5.0, cov_ab / var_b)), 4)
+            else:
+                betas[su] = 1.0
+            if std_a > 1e-12 and std_b > 1e-12:
+                rho = float(np.corrcoef(a, b)[0, 1])
+                corr_vs_btc[su] = round(max(-1.0, min(1.0, rho)), 4)
+            else:
+                corr_vs_btc[su] = 0.5
+        else:
+            betas[su] = float((market_summaries.get(sym_u) or {}).get("beta_vs_btc", 1.1) or 1.1)
+            corr_vs_btc[su] = float((market_summaries.get(sym_u) or {}).get("corr_vs_btc", 0.6) or 0.6)
+
+    syms = [k.upper() for k in (market_summaries or {}).keys()]
+    for i, s1 in enumerate(syms):
+        for s2 in syms[i + 1 :]:
+            r1 = returns_map.get(s1, [])
+            r2 = returns_map.get(s2, [])
+            n = min(len(r1), len(r2))
+            if n >= 3:
+                a1 = np.array(r1[-n:], dtype=float)
+                a2 = np.array(r2[-n:], dtype=float)
+                if float(np.std(a1)) > 1e-12 and float(np.std(a2)) > 1e-12:
+                    rho_12 = float(np.corrcoef(a1, a2)[0, 1])
+                    rho_val = round(max(-1.0, min(1.0, rho_12)), 4)
+                else:
+                    rho_val = 0.5
+            else:
+                rho_val = round(min(0.95, max(0.0, corr_vs_btc.get(s1, 0.6) * corr_vs_btc.get(s2, 0.6))), 4)
+            pairwise_corr.setdefault(s1, {})[s2] = rho_val
+            pairwise_corr.setdefault(s2, {})[s1] = rho_val
+
+    return {
+        "betas_vs_btc": betas,
+        "corr_vs_btc": corr_vs_btc,
+        "pairwise_corr": pairwise_corr,
+    }
 
 
 def summarize_1h_indicators(df_1h: pd.DataFrame | None) -> Dict[str, Any]:
@@ -136,7 +718,19 @@ def summarize_1h_indicators(df_1h: pd.DataFrame | None) -> Dict[str, Any]:
     macd_hist = float(latest["macd_hist"])
     prev_macd_hist = float(prev["macd_hist"])
     atr_14 = max(float(confirmed["atr_14"]), float(latest["atr_14"]))
+    atr_20 = max(float(confirmed.get("atr_20", atr_14)), float(latest.get("atr_20", atr_14)))
+    adx_14 = float(latest.get("adx_14", 20.0))
+    bksr = float(latest.get("bksr", 1.0))
+    ema_50 = float(latest.get("ema_50", sma_25))
     vol_ratio = max(float(confirmed["volume_ratio_20"]), float(latest["volume_ratio_20"]))
+
+    bksr_info = compute_bksr_squeeze(df_1h)
+    wtr_info = compute_wick_toxicity_ratio(df_1h)
+    returns_1h = (
+        h1_ind["close"].astype(float).pct_change().dropna().tail(24).round(6).tolist()
+        if len(h1_ind) >= 2
+        else []
+    )
 
     window_24 = h1_ind.iloc[-24:]
     high_24h = float(window_24["high"].max())
@@ -170,6 +764,7 @@ def summarize_1h_indicators(df_1h: pd.DataFrame | None) -> Dict[str, Any]:
             "prev_rsi_14": round(prev_rsi_14, 2),
             "ema_12": round(ema_12, 6),
             "ema_26": round(ema_26, 6),
+            "ema_50": round(ema_50, 6),
             "sma_25": round(sma_25, 6),
             "bb_upper": round(bb_upper, 6),
             "bb_mid": round(bb_mid, 6),
@@ -177,6 +772,15 @@ def summarize_1h_indicators(df_1h: pd.DataFrame | None) -> Dict[str, Any]:
             "macd_hist": round(macd_hist, 6),
             "macd_hist_rising": bool(macd_hist > prev_macd_hist),
             "atr_14": round(atr_14, 6),
+            "atr_20": round(atr_20, 6),
+            "adx_14": round(adx_14, 2),
+            "bksr": round(bksr, 4),
+            "is_squeeze": bool(bksr_info["is_squeeze"]),
+            "squeeze_breakout_up": bool(bksr_info["squeeze_breakout_up"]),
+            "upper_wick_ratio": wtr_info["upper_wick_ratio"],
+            "lower_wick_ratio": wtr_info["lower_wick_ratio"],
+            "wtr_net_score": wtr_info["wtr_net_score"],
+            "returns_1h": returns_1h,
             "volume_ratio_20": round(vol_ratio, 2),
             "pullback_from_24h_high_pct": round(pullback_from_high_pct, 2),
             "rsi_rebound": rsi_rebound,
@@ -462,6 +1066,22 @@ def summarize_indicators(
     bid_depth_1pct_jpy = float(orderbook.get("bid_depth_1pct_jpy", 0.0)) if orderbook else 0.0
     ask_depth_1pct_jpy = float(orderbook.get("ask_depth_1pct_jpy", 0.0)) if orderbook else 0.0
 
+    h1_summary = summarize_1h_indicators(df_1h)
+    ob_micro = compute_orderbook_microstructure(orderbook, last_price=last_price)
+    trades_list = (orderbook or {}).get("trades") if isinstance(orderbook, dict) else None
+    tfi_info = compute_trade_flow_and_absorption(trades=trades_list, df_1h=df_1h)
+    bksr_source_df = df_1h if (df_1h is not None and not df_1h.empty) else (df_4h if (df_4h is not None and not df_4h.empty) else df_daily)
+    bksr_info = compute_bksr_squeeze(bksr_source_df)
+    wtr_info = compute_wick_toxicity_ratio(bksr_source_df, tfi_15m=float(tfi_info["tfi_15m"]))
+    obdr_info = compute_obdr_slippage(orderbook, order_notional_jpy=9_011.0)
+    microstructure = {
+        **ob_micro,
+        **tfi_info,
+        **bksr_info,
+        **wtr_info,
+        **obdr_info,
+    }
+
     # M-7: NaN / Infinity が latest_decision.json へ伝播してブラウザの JSON.parse が壊れないよう再帰サニタイズ
     return sanitize_json_value({
         "symbol": symbol,
@@ -504,18 +1124,24 @@ def summarize_indicators(
             "climax_sell_warning": bool(climax_sell_warning),
         },
         "h4_indicators": h4_summary,
-        "h1_indicators": summarize_1h_indicators(df_1h),
+        "h1_indicators": h1_summary,
+        "microstructure": microstructure,
         "orderbook": {
-            "asks": list((orderbook or {}).get("asks", [])[:5]),
-            "bids": list((orderbook or {}).get("bids", [])[:5]),
+            "asks": list((orderbook or {}).get("asks", [])[:10]),
+            "bids": list((orderbook or {}).get("bids", [])[:10]),
         },
         "orderbook_liquidity": {
             "bid_depth_1pct_jpy": round(bid_depth_1pct_jpy, 0),
             "ask_depth_1pct_jpy": round(ask_depth_1pct_jpy, 0),
             "imbalance_snapshot": ob_imbalance,
+            "obi_5": microstructure["obi_5"],
+            "obdr_slippage_pct": microstructure["obdr_slippage_pct"],
+            "is_hollow_book": microstructure["is_hollow_book"],
+            "support_wall_price": microstructure["support_wall_price"],
+            "support_wall_front_run_price": microstructure["support_wall_front_run_price"],
             "note": (
-                "板インバランスは17時時点の一瞬のスナップショットであり見せ板ノイズを含むため、"
-                "方向予測の主根拠にせず「±1%圏内の板の厚み（流動性・スリッページ確認）」として扱うこと。"
+                "板インバランスは5段階指数減衰加重(OBI_5)およびOBDRスリッページ耐性(9,011円成行売却時の仲値乖離率)と"
+                "併せて評価し、0.45%超の中抜き板(Hollow Book)は排除すること。"
             ),
         },
         "orderbook_imbalance": ob_imbalance,
@@ -525,7 +1151,8 @@ def summarize_indicators(
 def enrich_relative_strength_vs_btc(market_summaries: Dict[str, Dict[str, Any]]) -> None:
     """
     全銘柄の要約データに対し、BTCの7日間リターンを基準とした
-    「対BTCの7日間相対強度（銘柄7d騰落率 - BTC7d騰落率）」を一括計算・反映する。
+    「対BTCの7日間相対強度（銘柄7d騰落率 - BTC7d騰落率）」および
+    1時間足リターンに基づく「対BTCベータ値・相関係数マトリクス」を一括計算・反映する。
     """
     if not market_summaries or "BTC" not in market_summaries:
         return
@@ -537,13 +1164,24 @@ def enrich_relative_strength_vs_btc(market_summaries: Dict[str, Dict[str, Any]])
         )
         or 0.0
     )
+    beta_corr_info = compute_btc_beta_and_correlation_matrix(market_summaries)
+    betas_map = beta_corr_info.get("betas_vs_btc", {})
+    corr_btc_map = beta_corr_info.get("corr_vs_btc", {})
+    pairwise_map = beta_corr_info.get("pairwise_corr", {})
+
     for sym, summary in market_summaries.items():
+        if not isinstance(summary, dict):
+            continue
+        su = sym.upper()
         p_info = summary.get("price") or {}
         d_info = summary.get("daily_indicators") or {}
         sym_7d = float(p_info.get("return_7d_pct", d_info.get("return_7d_pct", 0.0)) or 0.0)
-        rel_val = 0.0 if sym.upper() == "BTC" else round(sym_7d - btc_7d, 2)
+        rel_val = 0.0 if su == "BTC" else round(sym_7d - btc_7d, 2)
         if "price" in summary and isinstance(summary["price"], dict):
             summary["price"]["relative_strength_vs_btc_7d_pct"] = rel_val
         if "daily_indicators" in summary and isinstance(summary["daily_indicators"], dict):
             summary["daily_indicators"]["relative_strength_vs_btc_7d_pct"] = rel_val
         summary["relative_strength_vs_btc_7d_pct"] = rel_val
+        summary["beta_vs_btc"] = float(betas_map.get(su, 1.0))
+        summary["corr_vs_btc"] = float(corr_btc_map.get(su, 1.0 if su == "BTC" else 0.6))
+        summary["pairwise_corr"] = dict(pairwise_map.get(su, {su: 1.0}))

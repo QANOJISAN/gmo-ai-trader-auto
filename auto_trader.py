@@ -287,6 +287,8 @@ class AutoTraderDaemon:
         )
         self.adverse_guard = AdverseSelectionGuard()
         self.shadow_evaluator = LLMShadowEvaluator(db_wal=self.db_wal)
+        if getattr(self.ai_judge, "shadow_evaluator", None) is None:
+            self.ai_judge.shadow_evaluator = self.shadow_evaluator
         self.notification_dispatcher = TieredNotificationDispatcher(
             notifier=self.notifier,
             dry_run=self.dry_run_notify,

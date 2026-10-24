@@ -28,7 +28,16 @@ from typing import Any, Dict, List, Optional
 
 from src.ai_judge import enrich_portfolio_positions
 from src.gmo_client import EXCLUDED_SPOT_SYMBOLS, GMOPublicClient
-from src.indicators import enrich_relative_strength_vs_btc, summarize_indicators
+from src.indicators import (
+    compute_bksr_squeeze,
+    compute_btc_beta_and_correlation_matrix,
+    compute_obdr_slippage,
+    compute_orderbook_microstructure,
+    compute_trade_flow_and_absorption,
+    compute_wick_toxicity_ratio,
+    enrich_relative_strength_vs_btc,
+    summarize_indicators,
+)
 from src.regime_filter import MarketRegimeFilter
 from src.validator import (
     DEFAULT_SYMBOL_RULES,
@@ -135,9 +144,10 @@ class TechnicalRadar:
         symbol_rule: Dict[str, Any],
         atr_1h: Optional[Any] = None,
         equity_jpy: Optional[Any] = None,
+        orderbook: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        単一銘柄について Gate 0 〜 Gate 3 の合否を厳密判定する。
+        単一銘柄について Gate 0 〜 Gate 3 (+ OBDR 中抜き板フィルタ) の合否を厳密判定する。
         `equity_jpy` が指定された場合はパターンA（動的複利スケール）に基づき
         最小注文額上限（`max(2500, equity * 0.25)`）と許容SLリスク予算（`max(150, equity * 0.015)`）を自動スケールする。
         """
@@ -152,6 +162,11 @@ class TechnicalRadar:
             max(self.target_risk_jpy, eq_dec * DYNAMIC_TARGET_RISK_PCT)
             if eq_dec > Decimal("0")
             else self.target_risk_jpy
+        )
+        standard_slot_notional_jpy = (
+            float(max(Decimal("9011"), eq_dec * MAX_POSITION_ALLOCATION_PCT))
+            if eq_dec > Decimal("0")
+            else 9_011.0
         )
 
         # Gate 0: 固定除外リスト & レバレッジ銘柄 (`*_JPY`)
@@ -175,7 +190,7 @@ class TechnicalRadar:
                 "reason": f"Gate 1 取引ルール不正 (min={min_size_dec}, step={step_dec}, tick={tick_dec})",
             }
 
-        # Gate 2: 24h売買代金 = Decimal(volume) * Decimal(last) >= 30,000,000円 & スプレッド <= 0.35%
+        # Gate 2: 24h売買代金 = Decimal(volume) * Decimal(last) >= 30,000,000円 & スプレッド <= 0.35% & OBDR <= 0.45%
         last_dec = _to_decimal(ticker.get("last", 0))
         bid_dec = _to_decimal(ticker.get("bid", last_dec))
         ask_dec = _to_decimal(ticker.get("ask", last_dec))
@@ -207,6 +222,31 @@ class TechnicalRadar:
                 "reason": f"Gate 2 スプレッド超過 ({float(spread_pct_dec):.3f}% > {float(self.max_spread_pct):.2f}%)",
                 "spread_pct": float(spread_pct_dec),
             }
+
+        # テーマ2-(1)-⑤: 板厚スリッページ耐性 (OBDR > 0.45% 中抜き板 Hollow Book 即時除外)
+        eff_ob = orderbook or ticker.get("orderbook")
+        if eff_ob is None and ("bids" in ticker or "obdr_slippage_pct" in ticker):
+            eff_ob = ticker
+        obdr_slippage_pct = 0.0
+        if eff_ob is not None:
+            obdr_res = compute_obdr_slippage(
+                eff_ob,
+                order_notional_jpy=standard_slot_notional_jpy,
+                max_slippage_pct=0.45,
+            )
+            obdr_slippage_pct = float(obdr_res.get("obdr_slippage_pct", 0.0) or 0.0)
+            if obdr_res.get("has_orderbook") and obdr_res.get("is_hollow_book"):
+                return {
+                    "symbol": sym_up,
+                    "passed": False,
+                    "failed_gate": "GATE_2_HOLLOW_BOOK_OBDR",
+                    "reason": (
+                        f"Gate 2 中抜き板(Hollow Book)除外: 1枠({standard_slot_notional_jpy:,.0f}円)成行売却時の"
+                        f"OBDRスリッページ {obdr_slippage_pct:.3f}% > 0.45%"
+                    ),
+                    "spread_pct": float(spread_pct_dec),
+                    "obdr_slippage_pct": obdr_slippage_pct,
+                }
 
         # Gate 3: 最小注文額 minOrderSize * last <= effective_max_min_notional かつ effective_target_risk / minOrderSize >= 1.5 * ATR_1h
         min_notional_jpy = min_size_dec * last_dec
@@ -243,6 +283,7 @@ class TechnicalRadar:
             "failed_gate": None,
             "trading_value_24h_jpy": float(trading_val_24h),
             "spread_pct": float(spread_pct_dec),
+            "obdr_slippage_pct": round(obdr_slippage_pct, 4),
             "min_notional_jpy": float(min_notional_jpy),
         }
 
@@ -251,10 +292,13 @@ class TechnicalRadar:
         tickers: Dict[str, Dict[str, Any]],
         symbol_rules: Optional[Dict[str, Dict[str, Any]]] = None,
         atr_1h_by_symbol: Optional[Dict[str, Any]] = None,
+        orderbooks_by_symbol: Optional[Dict[str, Dict[str, Any]]] = None,
+        equity_jpy: Optional[Any] = None,
     ) -> Dict[str, Any]:
-        """全銘柄に対して Gate 0 〜 Gate 3 を一括評価し、通過銘柄（24h売買代金降順）と除外理由一覧を返す"""
+        """全銘柄に対して Gate 0 〜 Gate 3 (+ OBDR 中抜き板フィルタ) を一括評価し、通過銘柄（24h売買代金降順）と除外理由一覧を返す"""
         rules = {**DEFAULT_SYMBOL_RULES, **(symbol_rules or {})}
         atr_map = atr_1h_by_symbol or {}
+        ob_map = orderbooks_by_symbol or {}
         passed_list: List[Dict[str, Any]] = []
         rejected_list: List[Dict[str, Any]] = []
 
@@ -267,6 +311,8 @@ class TechnicalRadar:
                 ticker=t_info,
                 symbol_rule=r_info,
                 atr_1h=atr_map.get(sym),
+                equity_jpy=equity_jpy,
+                orderbook=ob_map.get(sym),
             )
             if res["passed"]:
                 passed_list.append(res)
@@ -332,7 +378,7 @@ class TechnicalRadar:
                     continue
                 df_4h = public_client.get_klines(sym, interval="4hour", limit=60, reference_dt=reference_dt)
                 df_1h = public_client.get_klines(sym, interval="1hour", limit=48, reference_dt=reference_dt)
-                ob = public_client.get_orderbook(sym, depth=5)
+                ob = public_client.get_orderbook(sym, depth=10)
                 t_info = all_tickers.get(sym, {})
                 market_summaries[sym] = summarize_indicators(
                     symbol=sym,
@@ -450,6 +496,7 @@ class TechnicalRadar:
                     has_rotatable_slot = True
                     break
         if (has_open_slot or has_rotatable_slot) and not kill_switch_active and not cb_triggered and regime_info["allow_new_buy"]:
+            sym_filter_mode = str(regime_info.get("allowed_symbol_filter", "ALL"))
             for sym, summary in market_summaries.items():
                 sym_up = sym.strip().upper()
                 if sym_up in held_or_pending_symbols or sym_up in GATE0_EXCLUDED_SYMBOLS or sym_up in cd_syms:
@@ -458,8 +505,25 @@ class TechnicalRadar:
                 daily = summary.get("daily_indicators", {}) or {}
                 h4 = summary.get("h4_indicators", {}) or {}
                 h1 = summary.get("h1_indicators", {}) or {}
+                micro = summary.get("microstructure", {}) or {}
                 price_info = summary.get("price", {}) or {}
                 rule = rules.get(sym_up, {})
+
+                # テーマ2-(1)-⑤: OBDR 中抜き板 (>0.45%) は Tier 1 で即座に除外
+                if micro.get("has_orderbook") and micro.get("is_hollow_book"):
+                    gate3_skipped_symbols.append(sym_up)
+                    continue
+
+                # テーマ2-(2): BTC_DOMINANCE_DRAIN 時は BTC / ETH または対BTC相対強度上位のみに限定
+                rel_7d = float(
+                    price_info.get(
+                        "relative_strength_vs_btc_7d_pct",
+                        daily.get("relative_strength_vs_btc_7d_pct", 0.0),
+                    )
+                    or 0.0
+                )
+                if sym_filter_mode == "BTC_ETH_TOP_RS_ONLY" and sym_up not in ("BTC", "ETH") and rel_7d < 0.0:
+                    continue
 
                 # Gate 3 チェック (パターンA複利対応): 最小注文額 <= max(2500円, 総資産*25%) & 許容SLリスク / minOrderSize >= 1.5 * ATR_1h
                 last_p = _to_decimal(price_info.get("last", 0))
@@ -496,6 +560,9 @@ class TechnicalRadar:
                         or h1.get("ema_support_bounce")
                         or h1.get("bb_lower_bounce")
                         or h1.get("volume_surge")
+                        or h1.get("squeeze_breakout_up")
+                        or micro.get("is_lower_wick_spring")
+                        or micro.get("cvd_absorption_detected")
                         or (32.0 <= h1_rsi <= 52.0 and h1.get("macd_hist_rising"))
                     )
                 else:
@@ -576,3 +643,35 @@ class TechnicalRadar:
             "hours_since_last_ai": round(hours_since_last_ai, 2) if hours_since_last_ai is not None else None,
             "reason_summary": reason_summary,
         }
+
+
+def evaluate_symbol_gates(
+    symbol: str,
+    ticker: Dict[str, Any],
+    symbol_rule: Optional[Dict[str, Any]] = None,
+    atr_1h: Optional[Any] = None,
+    equity_jpy: Optional[Any] = None,
+    orderbook: Optional[Dict[str, Any]] = None,
+    klines_1h: Optional[List[Dict[str, Any]]] = None,
+    max_spread_pct: float = 0.35,
+    max_obdr_slippage_pct: float = 0.45,
+) -> Dict[str, Any]:
+    """モジュールレベル Gate 0〜3 (+ OBDR 中抜き板フィルタ) 評価ヘルパー"""
+    sym_up = str(symbol or "").strip().upper()
+    rule = symbol_rule or DEFAULT_SYMBOL_RULES.get(sym_up, DEFAULT_SYMBOL_RULES.get("XRP", {}))
+    radar = TechnicalRadar(max_spread_pct=max_spread_pct)
+    if atr_1h is None and klines_1h:
+        import pandas as pd
+        from src.indicators import calculate_indicators
+
+        df_k = calculate_indicators(pd.DataFrame(klines_1h))
+        if not df_k.empty and "atr_14" in df_k.columns:
+            atr_1h = float(df_k["atr_14"].iloc[-1])
+    return radar.evaluate_symbol_gates(
+        symbol=sym_up,
+        ticker=ticker,
+        symbol_rule=rule,
+        atr_1h=atr_1h,
+        equity_jpy=equity_jpy,
+        orderbook=orderbook,
+    )

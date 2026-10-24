@@ -34,7 +34,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.validator import DEFAULT_SYMBOL_RULES, _to_decimal
+from src.validator import DEFAULT_SYMBOL_RULES, _to_decimal, compute_anti_martingale_risk_params
 
 logger = logging.getLogger(__name__)
 
@@ -679,3 +679,15 @@ class MultiTierCircuitBreaker:
             "consecutive_breaches": self.l5_consecutive_breach_count,
             "bids_valid": True,
         }
+
+    def evaluate_anti_martingale_risk(
+        self,
+        portfolio: Dict[str, Any],
+        tickers: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """
+        テーマ5-(2): HWMからのドローダウン率 DD_t に応じた連続的アンチ・マーチンゲール 1R リスク率
+        および月間利益 +6.0% 超 & DD_t < 2.0% 時の非対称利益クッション拡大 (最大 1.85%) を算出する。
+        """
+        conservative_eq, _ = self.calculate_conservative_equity_jpy(portfolio, tickers)
+        return compute_anti_martingale_risk_params(portfolio=portfolio, total_equity=conservative_eq)

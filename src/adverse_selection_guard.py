@@ -341,6 +341,88 @@ class AdverseSelectionGuard:
         }
 
     # ------------------------------------------------------------------
+    # テーマ1-(3): 接近時OFIベロシティ・ガード (Approaching OFI Velocity Guard)
+    # ------------------------------------------------------------------
+    def evaluate_approaching_ofi_velocity_guard(
+        self,
+        symbol: str,
+        order_price: float,
+        order_size: float,
+        atr_val: float,
+        current_price: Optional[float] = None,
+        support_wall_price: Optional[float] = None,
+        initial_support_wall_size: Optional[float] = None,
+        now_sec: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """
+        現在価格が待機中の買い指値から `0.15 * ATR` 以内に接近した際、
+        直近の Taker 売り成行フローが急増（強い負のOFI / TFI）した場合、
+        またはサポート壁が消失した場合は、指値が貫通約定（逆選択）する前に即座にキャンセルして逃げる。
+        """
+        sym = symbol.strip().upper()
+        l1 = self.compute_layer1_obi(sym, order_price=order_price)
+        l2 = self.compute_layer2_tfi(sym, now_sec=now_sec)
+
+        ref_price = (
+            float(current_price)
+            if (current_price is not None and float(current_price) > 0)
+            else float(l1.get("best_bid") or l1.get("mid_price") or order_price)
+        )
+        safe_atr = max(1e-6, float(atr_val))
+        distance_to_order = max(0.0, ref_price - float(order_price))
+        distance_atr_ratio = distance_to_order / safe_atr
+        is_approaching = bool(distance_atr_ratio <= 0.15)
+
+        # サポート壁の現在残量を確認
+        ob = self._latest_orderbook.get(sym, {})
+        bids = ob.get("bids", [])
+        wall_ref_p = float(support_wall_price) if (support_wall_price and float(support_wall_price) > 0) else float(order_price)
+        current_wall_size = 0.0
+        for b in bids:
+            bp = float(b.get("price", 0.0))
+            bs = float(b.get("size", 0.0))
+            if abs(bp - wall_ref_p) <= max(1e-6, safe_atr * 0.05) or bp >= float(order_price) - 1e-9:
+                current_wall_size = max(current_wall_size, bs)
+
+        support_wall_vanished = False
+        if initial_support_wall_size is not None and float(initial_support_wall_size) > 0:
+            if current_wall_size < float(initial_support_wall_size) * 0.35:
+                support_wall_vanished = True
+        elif l1["bid_queue_at_or_above_order"] < 1.5 * float(order_size):
+            support_wall_vanished = True
+
+        negative_ofi_tfi_surge = bool(
+            l2["tfi_60s"] <= -0.25
+            or l1["obi_5"] <= -0.25
+            or l2["ssi_60s"] >= 1.8
+            or l2["sell_sweep_detected"]
+        )
+
+        reasons: List[str] = []
+        if is_approaching and negative_ofi_tfi_surge:
+            reasons.append(
+                f"APPROACHING_OFI_VELOCITY_GUARD: 指値接近({distance_atr_ratio:.3f}×ATR <= 0.15×ATR)中に"
+                f"負のOFI/TFI急増(TFI_60s={l2['tfi_60s']:.2f}, OBI_5={l1['obi_5']:.2f}, SSI={l2['ssi_60s']:.2f})"
+            )
+        if is_approaching and support_wall_vanished:
+            reasons.append(
+                f"APPROACHING_SUPPORT_WALL_VANISHED: 指値接近({distance_atr_ratio:.3f}×ATR <= 0.15×ATR)中に"
+                f"サポート壁が消失(現在壁厚={current_wall_size:.4f})"
+            )
+
+        return {
+            "should_cancel": len(reasons) > 0,
+            "is_approaching": is_approaching,
+            "distance_atr_ratio": round(distance_atr_ratio, 4),
+            "negative_ofi_tfi_surge": negative_ofi_tfi_surge,
+            "support_wall_vanished": support_wall_vanished,
+            "current_wall_size": round(current_wall_size, 6),
+            "cancel_reasons": reasons,
+            "layer1": l1,
+            "layer2": l2,
+        }
+
+    # ------------------------------------------------------------------
     # 統合判定: 発注済み待機買い指値 (PENDING_BUY) の即時緊急キャンセル判定
     # ------------------------------------------------------------------
     def should_cancel_resting_buy_order(
@@ -350,6 +432,9 @@ class AdverseSelectionGuard:
         order_size: float,
         atr_5m: float,
         now_sec: Optional[float] = None,
+        current_price: Optional[float] = None,
+        support_wall_price: Optional[float] = None,
+        initial_support_wall_size: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         発注済みの待機買い指値 (`PENDING_BUY`) について、逆選択（大口売り浴びせによる貫通約定）を
@@ -380,9 +465,26 @@ class AdverseSelectionGuard:
         if l3["data_latency_sec"] > 5.0:
             cancel_reasons.append(f"板データ遅延({l3['data_latency_sec']:.1f}s > 5.0s)")
 
+        # 接近時OFIベロシティ・ガードの評価
+        approach_guard = self.evaluate_approaching_ofi_velocity_guard(
+            symbol=sym,
+            order_price=order_price,
+            order_size=order_size,
+            atr_val=atr_5m,
+            current_price=current_price,
+            support_wall_price=support_wall_price,
+            initial_support_wall_size=initial_support_wall_size,
+            now_sec=now_sec,
+        )
+        if approach_guard["should_cancel"]:
+            for r in approach_guard["cancel_reasons"]:
+                if r not in cancel_reasons:
+                    cancel_reasons.append(r)
+
         return {
             "should_cancel": len(cancel_reasons) > 0,
             "cancel_reasons": cancel_reasons,
+            "approaching_guard": approach_guard,
             "layer1": l1,
             "layer2": l2,
             "layer3": l3,

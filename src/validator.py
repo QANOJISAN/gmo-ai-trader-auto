@@ -549,6 +549,438 @@ def check_btc_circuit_breaker(market_summaries: Dict[str, Dict[str, Any]]) -> tu
     return False, ""
 
 
+def compute_anti_martingale_risk_params(
+    portfolio: Dict[str, Any],
+    total_equity: Union[Decimal, float, int],
+) -> Dict[str, Any]:
+    """
+    テーマ5-(2): 連続的アンチ・マーチンゲール係数と非対称利益クッション拡大
+    HWM（最高総資産）からのドローダウン率 DD_t = (HWM - E_t) / HWM に応じて基本 1R リスク率を階段関数で自動縮小:
+      - 0% <= DD_t < 3.0% : 1.50% (初期20,000円時 300円)
+      - 3.0% <= DD_t < 6.0%: 1.15% (230円)
+      - 6.0% <= DD_t < 10.0%: 0.80% (160円)
+      - 10.0% <= DD_t < 15.0%: 0.50% (100円)
+      - DD_t >= 15.0% : 0.00% (L5 キルスイッチ圏)
+    逆に、月間の確定利益が +6.0% を超えており、かつ DD_t < 2.0% の好調時は、
+    超過利益クッションの10%分だけ 1R リスク率を最大 1.85% まで非対称に拡大する。
+    """
+    eq_dec = _to_decimal(total_equity)
+    if eq_dec <= Decimal("0"):
+        eq_dec = Decimal("20000")
+
+    raw_init_cap = portfolio.get("initial_capital_jpy", portfolio.get("initial_equity_jpy"))
+    init_cap_dec = _to_decimal(raw_init_cap) if raw_init_cap is not None else Decimal("20000")
+    if init_cap_dec <= Decimal("0"):
+        init_cap_dec = Decimal("20000")
+
+    hwm_dec = max(_to_decimal(portfolio.get("peak_equity_jpy", 0)), init_cap_dec, eq_dec)
+    dd_ratio = max(Decimal("0"), (hwm_dec - eq_dec) / hwm_dec) if hwm_dec > Decimal("0") else Decimal("0")
+    dd_pct = dd_ratio * Decimal("100")
+
+    if dd_pct < Decimal("3.0"):
+        base_risk_pct = Decimal("0.0150")
+        tier_name = "TIER_0_NORMAL_150BPS"
+    elif dd_pct < Decimal("6.0"):
+        base_risk_pct = Decimal("0.0115")
+        tier_name = "TIER_1_DD_3_TO_6PCT_115BPS"
+    elif dd_pct < Decimal("10.0"):
+        base_risk_pct = Decimal("0.0080")
+        tier_name = "TIER_2_DD_6_TO_10PCT_80BPS"
+    elif dd_pct < Decimal("15.0"):
+        base_risk_pct = Decimal("0.0050")
+        tier_name = "TIER_3_DD_10_TO_15PCT_50BPS"
+    else:
+        base_risk_pct = Decimal("0.0000")
+        tier_name = "TIER_4_KILL_SWITCH_0BPS"
+
+    # 月間確定利益の集計（直近30日間の closed_trades または monthly_realized_pnl_jpy / monthly_return_pct）
+    explicit_monthly_ret_pct = portfolio.get("monthly_realized_return_pct")
+    explicit_monthly_pnl_jpy = portfolio.get("monthly_realized_pnl_jpy")
+    if explicit_monthly_ret_pct is not None:
+        monthly_return_pct = _to_decimal(explicit_monthly_ret_pct)
+    elif explicit_monthly_pnl_jpy is not None:
+        monthly_return_pct = (_to_decimal(explicit_monthly_pnl_jpy) / init_cap_dec) * Decimal("100")
+    else:
+        closed_trades = portfolio.get("closed_trades", []) or []
+        monthly_pnl = Decimal("0")
+        for tr in closed_trades[-100:]:
+            monthly_pnl += _to_decimal(tr.get("realized_pnl_jpy", tr.get("pnl_jpy", 0)))
+        monthly_return_pct = (monthly_pnl / init_cap_dec) * Decimal("100") if init_cap_dec > Decimal("0") else Decimal("0")
+
+    profit_cushion_bonus_pct = Decimal("0")
+    asymmetric_cushion_applied = False
+    if dd_pct < Decimal("2.0") and monthly_return_pct > Decimal("6.0"):
+        excess_return_pct = monthly_return_pct - Decimal("6.0")
+        # 超過利益クッションの10%分だけ 1R リスク率を最大 1.85% (+0.35%) まで拡大
+        profit_cushion_bonus_pct = min(Decimal("0.0035"), (excess_return_pct / Decimal("100")) * Decimal("0.10"))
+        if profit_cushion_bonus_pct > Decimal("0"):
+            base_risk_pct = min(Decimal("0.0185"), base_risk_pct + profit_cushion_bonus_pct)
+            asymmetric_cushion_applied = True
+            tier_name = "TIER_0_PROFIT_CUSHION_BOOST"
+
+    target_1r_jpy = (eq_dec * base_risk_pct).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return {
+        "hwm_equity_jpy": float(hwm_dec),
+        "current_equity_jpy": float(eq_dec),
+        "drawdown_pct": float(round(dd_pct, 4)),
+        "monthly_realized_return_pct": float(round(monthly_return_pct, 4)),
+        "base_1r_pct": float(round(base_risk_pct, 6)),
+        "profit_cushion_bonus_pct": float(round(profit_cushion_bonus_pct, 6)),
+        "asymmetric_cushion_applied": asymmetric_cushion_applied,
+        "anti_martingale_tier": tier_name,
+        "target_1r_jpy": float(target_1r_jpy),
+        "target_1r_decimal": target_1r_jpy,
+        "risk_pct_decimal": base_risk_pct,
+    }
+
+
+def evaluate_slot2_correlation_and_beta_control(
+    candidate_symbol: str,
+    candidate_confidence: Union[Decimal, float],
+    active_positions: List[Dict[str, Any]],
+    market_summaries: Dict[str, Dict[str, Any]],
+    base_1r_pct: Decimal = Decimal("0.0150"),
+) -> Dict[str, Any]:
+    """
+    テーマ5-(1): 2枠目（Slot 2）の対BTC相関・ベータ連動リスクヘアカットと Free-Roll Risk Recycling
+    - 1枠目（銘柄A）を保有中に2枠目（銘柄B）へ新規エントリーする際:
+      1. rho_{A, B} > 0.80 かつ beta_A + beta_B > 2.8 の高相関・高ベータ銘柄ペアの場合、
+         2枠目の要求確信度を >= 0.82 に引き上げる。
+      2. 1枠目がまだ Stage 2（建値ロック / OpenRisk_1 == 0）に到達しておらず（OpenRisk_1 > 0）、
+         かつ rho_{A, B} > 0.65 の場合は、2枠目の許容リスク R_2 を通常の 1.50%（300円）から
+         0.85%（170円）へ自動縮小（相関ヘアカット）する。
+      3. Free-Roll Risk Recycling: 1枠目が Stage 2（建値＋利益ロック完了、OpenRisk_1 == 0）に到達した後は、
+         2枠目を再びフルサイズ（1.50%＝300円）でエントリー可能とする。
+    """
+    cand_sym = str(candidate_symbol or "").strip().upper()
+    conf_dec = _to_decimal(candidate_confidence)
+    if not active_positions:
+        return {
+            "is_slot2": False,
+            "slot1_symbol": None,
+            "rho_ab": 0.0,
+            "beta_a": 0.0,
+            "beta_b": 1.0,
+            "beta_sum": 1.0,
+            "slot1_stage2_locked": False,
+            "slot1_open_risk_zero": True,
+            "required_min_confidence": 0.72,
+            "blocked_by_high_corr_beta": False,
+            "correlation_haircut_applied": False,
+            "free_roll_recycling_active": False,
+            "effective_slot2_risk_pct": float(base_1r_pct),
+            "effective_slot2_risk_pct_decimal": base_1r_pct,
+        }
+
+    pos1 = active_positions[0]
+    sym_a = str(pos1.get("symbol", "")).strip().upper()
+    sum_a = (market_summaries or {}).get(sym_a, {}) or {}
+    sum_b = (market_summaries or {}).get(cand_sym, {}) or {}
+
+    # 1枠目が Stage 2 (建値+利益ロック完了 / OpenRisk_1 == 0) に到達しているか判定
+    p1_entry = _to_decimal(pos1.get("entry_price", 0))
+    p1_sl = _to_decimal(pos1.get("stop_loss_price") or pos1.get("sl_price") or 0)
+    p1_stage = int(pos1.get("trailing_stage", 0) or 0)
+    p1_explicit_open_risk = pos1.get("open_risk_jpy")
+    stage2_locked = bool(
+        p1_stage >= 2
+        or (p1_entry > Decimal("0") and p1_sl >= p1_entry)
+        or (p1_explicit_open_risk is not None and _to_decimal(p1_explicit_open_risk) <= Decimal("0"))
+    )
+
+    # ベータ値・相関係数の取得（1hリターン系列または明示フィールドから計算）
+    has_corr_data = bool(
+        "pairwise_corr" in sum_b
+        or "pairwise_corr" in sum_a
+        or "corr_with_slot1" in sum_b
+        or "beta_vs_btc" in sum_b
+        or (sum_a.get("h1_indicators") or {}).get("returns_1h")
+        or (sum_b.get("h1_indicators") or {}).get("returns_1h")
+        or "rho_ab" in pos1
+    )
+
+    if not has_corr_data:
+        rho_ab = 0.50
+        beta_a = 1.0
+        beta_b = 1.0
+    else:
+        beta_a = float(pos1.get("beta_vs_btc", sum_a.get("beta_vs_btc", 1.0 if sym_a == "BTC" else 1.15)) or 1.0)
+        beta_b = float(sum_b.get("beta_vs_btc", 1.0 if cand_sym == "BTC" else 1.15) or 1.0)
+        pairwise_b = sum_b.get("pairwise_corr") or {}
+        pairwise_a = sum_a.get("pairwise_corr") or {}
+        if "corr_with_slot1" in sum_b:
+            rho_ab = float(sum_b["corr_with_slot1"])
+        elif "rho_ab" in pos1:
+            rho_ab = float(pos1["rho_ab"])
+        elif sym_a in pairwise_b:
+            rho_ab = float(pairwise_b[sym_a])
+        elif cand_sym in pairwise_a:
+            rho_ab = float(pairwise_a[cand_sym])
+        else:
+            rets_a = (sum_a.get("h1_indicators") or {}).get("returns_1h") or []
+            rets_b = (sum_b.get("h1_indicators") or {}).get("returns_1h") or []
+            n = min(len(rets_a), len(rets_b))
+            if n >= 3:
+                import numpy as np
+
+                arr_a = np.array(rets_a[-n:], dtype=float)
+                arr_b = np.array(rets_b[-n:], dtype=float)
+                if float(np.std(arr_a)) > 1e-12 and float(np.std(arr_b)) > 1e-12:
+                    rho_ab = float(np.corrcoef(arr_a, arr_b)[0, 1])
+                else:
+                    rho_ab = 0.50
+            else:
+                rho_ab = 0.50
+
+    beta_sum = beta_a + beta_b
+    high_corr_high_beta = bool(rho_ab > 0.80 and beta_sum > 2.8)
+    required_min_conf = 0.82 if high_corr_high_beta else 0.72
+    blocked_by_high_corr_beta = bool(high_corr_high_beta and float(conf_dec) < 0.82)
+
+    correlation_haircut_applied = False
+    free_roll_recycling_active = False
+    effective_risk_pct = base_1r_pct
+
+    if stage2_locked:
+        # Free-Roll Risk Recycling: Stage 2 到達済み (OpenRisk_1 == 0) ならフルサイズ (1.50%) へ復元
+        free_roll_recycling_active = True
+        effective_risk_pct = base_1r_pct
+    elif rho_ab > 0.65:
+        # OpenRisk_1 > 0 かつ rho_{A, B} > 0.65 の場合は 0.85% (170円) へ自動縮小
+        correlation_haircut_applied = True
+        effective_risk_pct = min(base_1r_pct, Decimal("0.0085"))
+
+    return {
+        "is_slot2": True,
+        "slot1_symbol": sym_a,
+        "rho_ab": round(rho_ab, 4),
+        "beta_a": round(beta_a, 4),
+        "beta_b": round(beta_b, 4),
+        "beta_sum": round(beta_sum, 4),
+        "slot1_stage2_locked": stage2_locked,
+        "slot1_open_risk_zero": stage2_locked,
+        "required_min_confidence": required_min_conf,
+        "blocked_by_high_corr_beta": blocked_by_high_corr_beta,
+        "correlation_haircut_applied": correlation_haircut_applied,
+        "free_roll_recycling_active": free_roll_recycling_active,
+        "effective_slot2_risk_pct": float(effective_risk_pct),
+        "effective_slot2_risk_pct_decimal": effective_risk_pct,
+    }
+
+
+def compute_3mode_dynamic_limit_execution(
+    symbol: str,
+    confidence: float,
+    summary: Dict[str, Any],
+    tick_size: Decimal,
+    explicit_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    テーマ1-(1): 3モード動的指値オフセットと板の買い壁1ティック前置き (Front-Running Tick)
+    - Mode 1 (AGGRESSIVE_BREAKOUT_PEG):
+      confidence >= 0.82 かつ ADX_1h > 28 かつ 最良気配インバランス I_t > 0.65 のブレイクアウト局面。
+      Best Ask - 1 tick (1ティック幅時は Best Bid) または浅い押し目 0.20 * ATR_15m に SOK 指値を配置。
+      最大3回追従ペグ、有効期限 45分 (0.75h)。
+    - Mode 2 (MOMENTUM_PULLBACK_DYNAMIC):
+      confidence 0.72〜0.81 の標準押し目局面。
+      基準オフセット ATR_15m * clip(0.65 - 0.35 * OBI_5, 0.25, 0.75) を計算した上で、
+      上位5〜10気配の中で最大の板厚を持つサポート壁の1ティック上 (support_wall_price + 1 tick) に指値を微調整。
+      有効期限 2.0時間。
+    - Mode 3 (DEEP_LIQUIDITY_DIP):
+      confidence 0.70〜0.75 のレンジ・中立局面。
+      0.70〜0.90 * ATR の深いサポート壁の手前に SOK 指値を静置（追従ペグなし、有効期限 4.0時間）。
+    """
+    price_info = (summary or {}).get("price", {}) or {}
+    h1_info = (summary or {}).get("h1_indicators", {}) or {}
+    daily_info = (summary or {}).get("daily_indicators", {}) or {}
+    micro = (summary or {}).get("microstructure", {}) or {}
+
+    last_p = _to_decimal(price_info.get("last", 0))
+    best_bid = _to_decimal(price_info.get("best_bid", last_p))
+    best_ask = _to_decimal(price_info.get("best_ask", last_p))
+    if best_bid <= Decimal("0"):
+        best_bid = last_p
+    if best_ask <= Decimal("0"):
+        best_ask = best_bid
+
+    # ATR_15m (なければ ATR_1h * 0.5 または daily ATR * 0.15)
+    atr_1h = _to_decimal(h1_info.get("atr_14", 0))
+    atr_daily = _to_decimal(daily_info.get("atr_14", 0))
+    atr_15m_raw = (summary or {}).get("atr_15m") or h1_info.get("atr_15m")
+    if atr_15m_raw is not None and _to_decimal(atr_15m_raw) > Decimal("0"):
+        atr_15m = _to_decimal(atr_15m_raw)
+    elif atr_1h > Decimal("0"):
+        atr_15m = atr_1h * Decimal("0.55")
+    elif atr_daily > Decimal("0"):
+        atr_15m = atr_daily * Decimal("0.18")
+    else:
+        atr_15m = max(tick_size, best_bid * Decimal("0.008"))
+
+    adx_1h = float(h1_info.get("adx_14", 20.0) or 20.0)
+    obi_5 = float(micro.get("obi_5", (summary or {}).get("orderbook_imbalance", 0.0)) or 0.0)
+    best_it = float(micro.get("best_imbalance_it", 0.5 + 0.5 * obi_5) or 0.5)
+    support_wall_p = _to_decimal(micro.get("support_wall_price", 0))
+    support_wall_sz = float(micro.get("support_wall_size", 0.0) or 0.0)
+
+    # 上位10気配の bids が orderbook にある場合はサポート壁を再確認
+    raw_bids = ((summary or {}).get("orderbook") or {}).get("bids") or []
+    if support_wall_p <= Decimal("0") and raw_bids:
+        parsed_bids = []
+        for b in raw_bids[:10]:
+            try:
+                bp = _to_decimal(b.get("price", 0) if isinstance(b, dict) else b[0])
+                bs = float(b.get("size", 0) if isinstance(b, dict) else b[1])
+                if bp > Decimal("0") and bs > 0:
+                    parsed_bids.append((bp, bs))
+            except Exception:
+                continue
+        if parsed_bids:
+            wall_bp, wall_bs = max(parsed_bids, key=lambda x: x[1])
+            support_wall_p = wall_bp
+            support_wall_sz = wall_bs
+
+    req_mode = str(explicit_mode or "").strip().upper()
+    if req_mode in ("AGGRESSIVE_BREAKOUT_PEG", "MOMENTUM_PULLBACK_DYNAMIC", "DEEP_LIQUIDITY_DIP"):
+        mode_name = req_mode
+    else:
+        if confidence >= 0.82 and adx_1h > 28.0 and best_it > 0.65:
+            mode_name = "AGGRESSIVE_BREAKOUT_PEG"
+        elif confidence < 0.72 or str(daily_info.get("trend", "")) == "DOWNTREND_OR_RANGE":
+            mode_name = "DEEP_LIQUIDITY_DIP"
+        else:
+            mode_name = "MOMENTUM_PULLBACK_DYNAMIC"
+
+    front_run_applied = False
+    if mode_name == "AGGRESSIVE_BREAKOUT_PEG":
+        offset_mult = 0.20
+        if best_ask > best_bid + tick_size:
+            cand_p = best_ask - tick_size
+        elif best_bid > Decimal("0"):
+            cand_p = best_bid
+        else:
+            cand_p = max(tick_size, last_p - Decimal("0.20") * atr_15m)
+        limit_p = round_to_step(cand_p, tick_size, rounding=ROUND_DOWN)
+        max_peg_count = 3
+        expiry_hours = 0.75  # 45分
+    elif mode_name == "DEEP_LIQUIDITY_DIP":
+        offset_mult = 0.80
+        base_target = max(tick_size, best_bid - Decimal("0.80") * atr_15m)
+        if Decimal("0") < support_wall_p < best_bid and abs(support_wall_p - base_target) <= atr_15m * Decimal("0.50"):
+            cand_p = min(best_bid, support_wall_p + tick_size)
+            front_run_applied = True
+        else:
+            cand_p = base_target
+        limit_p = round_to_step(cand_p, tick_size, rounding=ROUND_DOWN)
+        max_peg_count = 0
+        expiry_hours = 4.0
+    else:
+        # Mode 2: MOMENTUM_PULLBACK_DYNAMIC
+        offset_mult = max(0.25, min(0.75, 0.65 - 0.35 * obi_5))
+        base_target = max(tick_size, best_bid - _to_decimal(offset_mult) * atr_15m)
+        if Decimal("0") < support_wall_p <= best_bid:
+            cand_p = min(best_bid, support_wall_p + tick_size)
+            front_run_applied = True
+        else:
+            cand_p = base_target
+        limit_p = round_to_step(cand_p, tick_size, rounding=ROUND_DOWN)
+        max_peg_count = 0
+        expiry_hours = 2.0
+
+    if best_bid > Decimal("0") and limit_p > best_bid:
+        limit_p = round_to_step(best_bid, tick_size, rounding=ROUND_DOWN)
+
+    return {
+        "execution_mode_type": mode_name,
+        "offset_atr_mult": round(offset_mult, 4),
+        "atr_15m": float(round(atr_15m, 6)),
+        "obi_5": round(obi_5, 4),
+        "best_imbalance_it": round(best_it, 4),
+        "adx_1h": round(adx_1h, 2),
+        "support_wall_price": float(support_wall_p) if support_wall_p > Decimal("0") else 0.0,
+        "support_wall_size": round(support_wall_sz, 6),
+        "front_run_tick_applied": front_run_applied,
+        "calculated_limit_price": _format_number(limit_p),
+        "calculated_limit_decimal": limit_p,
+        "max_peg_count": max_peg_count,
+        "order_expiry_hours": expiry_hours,
+    }
+
+
+def evaluate_tranche_split_feasibility(
+    symbol: str,
+    order_size: Union[Decimal, float, int],
+    min_order_size: Union[Decimal, float, int],
+    size_step: Union[Decimal, float, int],
+    limit_price: Union[Decimal, float, int],
+    atr_15m: Union[Decimal, float, int],
+    tick_size: Union[Decimal, float, int],
+) -> Dict[str, Any]:
+    """
+    テーマ1-(2): 最小注文単位制約と分割トランシェ可否判定
+    Q_order >= 4.0 * minOrderSize を満たす銘柄（XRP、DOGE、XLM、ADA等）のみ 2トランシェ分割発注を許可し、
+    Q_order < 4.0 * minOrderSize の銘柄（SOL 0.03 等）は丸め誤差を防ぐため
+    必ず「単一注文（Single Order）＋ 動的ペギング」に一本化する。
+    """
+    q_dec = _to_decimal(order_size)
+    min_dec = _to_decimal(min_order_size)
+    step_dec = _to_decimal(size_step)
+    p_dec = _to_decimal(limit_price)
+    atr_dec = _to_decimal(atr_15m)
+    tick_dec = _to_decimal(tick_size)
+
+    ratio = float(q_dec / min_dec) if min_dec > Decimal("0") else 0.0
+    can_split = bool(min_dec > Decimal("0") and q_dec >= (min_dec * Decimal("4.0")))
+
+    if not can_split:
+        return {
+            "tranche_split_allowed": False,
+            "size_to_min_lot_ratio": round(ratio, 4),
+            "execution_tranche_mode": "SINGLE_ORDER_DYNAMIC_PEG",
+            "tranches": [
+                {
+                    "tranche_index": 1,
+                    "size": _format_number(q_dec),
+                    "limit_price": _format_number(p_dec),
+                }
+            ],
+        }
+
+    t1_size = round_to_step(q_dec * Decimal("0.50"), step_dec, rounding=ROUND_DOWN)
+    t2_size = round_to_step(q_dec - t1_size, step_dec, rounding=ROUND_DOWN)
+    if t1_size < min_dec or t2_size < min_dec:
+        return {
+            "tranche_split_allowed": False,
+            "size_to_min_lot_ratio": round(ratio, 4),
+            "execution_tranche_mode": "SINGLE_ORDER_DYNAMIC_PEG",
+            "tranches": [
+                {
+                    "tranche_index": 1,
+                    "size": _format_number(q_dec),
+                    "limit_price": _format_number(p_dec),
+                }
+            ],
+        }
+
+    t2_price = max(tick_dec, round_to_step(p_dec - max(tick_dec, atr_dec * Decimal("0.25")), tick_dec, rounding=ROUND_DOWN))
+    return {
+        "tranche_split_allowed": True,
+        "size_to_min_lot_ratio": round(ratio, 4),
+        "execution_tranche_mode": "TWO_TRANCHE_SPLIT",
+        "tranches": [
+            {
+                "tranche_index": 1,
+                "size": _format_number(t1_size),
+                "limit_price": _format_number(p_dec),
+            },
+            {
+                "tranche_index": 2,
+                "size": _format_number(t2_size),
+                "limit_price": _format_number(t2_price),
+            },
+        ],
+    }
+
+
 def validate_and_adjust_decision(
     decision: Dict[str, Any],
     portfolio: Dict[str, Any],
@@ -769,17 +1201,27 @@ def validate_and_adjust_decision(
     if atr_val <= 0:
         atr_val = last_price * Decimal("0.02")
 
-    # 1. 指値価格・TP・SL の丸め処理 (suggested_entry_offset_atr およびキー別名対応)
+    # 1. 指値価格・TP・SL の丸め処理 (3モード動的指値執行 & suggested_entry_offset_atr 対応)
     raw_limit = _to_decimal(raw_limit_candidate)
-    if (
-        action == "BUY"
-        and raw_limit <= Decimal("0")
-        and adjusted.get("suggested_entry_offset_atr") is not None
-    ):
-        offset_atr_d = max(Decimal("0"), _to_decimal(adjusted.get("suggested_entry_offset_atr")))
-        anchor_p = best_bid if best_bid > Decimal("0") else last_price
-        if anchor_p > Decimal("0"):
-            raw_limit = max(tick_size, anchor_p - (offset_atr_d * atr_val))
+    mode_exec_info: Dict[str, Any] = {}
+    if action == "BUY":
+        mode_exec_info = compute_3mode_dynamic_limit_execution(
+            symbol=symbol,
+            confidence=float(adjusted.get("confidence", 0.80) or 0.80),
+            summary=summary,
+            tick_size=tick_size,
+            explicit_mode=adjusted.get("execution_mode_type"),
+        )
+        if (
+            raw_limit <= Decimal("0")
+            and adjusted.get("suggested_entry_offset_atr") is None
+        ) or bool(adjusted.get("apply_3mode_offset")):
+            raw_limit = mode_exec_info["calculated_limit_decimal"]
+        elif raw_limit <= Decimal("0") and adjusted.get("suggested_entry_offset_atr") is not None:
+            offset_atr_d = max(Decimal("0"), _to_decimal(adjusted.get("suggested_entry_offset_atr")))
+            anchor_p = best_bid if best_bid > Decimal("0") else last_price
+            if anchor_p > Decimal("0"):
+                raw_limit = max(tick_size, anchor_p - (offset_atr_d * atr_val))
     if raw_limit <= 0:
         raw_limit = last_price
     limit_dec = round_to_step(raw_limit, tick_size, rounding=ROUND_DOWN)
@@ -959,13 +1401,40 @@ def validate_and_adjust_decision(
     else:
         max_alloc_pct = raw_alloc_pct
 
-    # パターンA: 1トレードあたりの許容損失額（SLリスク予算）を現在の総資産の 1.2%〜1.5%（実損失上限 2.0%）で動的算出
+    # パターンA + テーマ5-(2) 連続的アンチ・マーチンゲール & 非対称利益クッション拡大
     conf_val = _to_decimal(adjusted.get("confidence", 0.80))
-    # 確信度に応じて [1.2%, 1.5%] の範囲でスケーリング（通常の BUY 承認時 >=0.75 は 1.5% を上限として適用）
-    dynamic_risk_pct = Decimal("0.015") if conf_val >= Decimal("0.75") else Decimal("0.012")
-    dynamic_min_risk_jpy = total_equity * Decimal("0.012")
+    am_info = compute_anti_martingale_risk_params(portfolio=portfolio, total_equity=total_equity)
+    am_risk_pct = am_info["risk_pct_decimal"]
+    if am_info["drawdown_pct"] >= 3.0 or am_info["asymmetric_cushion_applied"]:
+        dynamic_risk_pct = am_risk_pct
+    else:
+        dynamic_risk_pct = Decimal("0.015") if conf_val >= Decimal("0.75") else Decimal("0.012")
+
+    # テーマ5-(1): 2枠目保有時の対BTC相関・ベータ連動リスク制御 & Free-Roll Risk Recycling
+    slot2_corr_info = evaluate_slot2_correlation_and_beta_control(
+        candidate_symbol=symbol,
+        candidate_confidence=conf_val,
+        active_positions=effective_active_positions,
+        market_summaries=market_summaries,
+        base_1r_pct=dynamic_risk_pct,
+    )
+    if action == "BUY" and slot2_corr_info["is_slot2"]:
+        if slot2_corr_info["blocked_by_high_corr_beta"]:
+            return _hold_decision(
+                adjusted,
+                symbol=symbol,
+                reason_prefix=(
+                    f"[高相関・高ベータ2枠目制限によりHOLDへ自動補正] 1枠目 {slot2_corr_info['slot1_symbol']} と "
+                    f"2枠目候補 {symbol} の相関係数 (ρ={slot2_corr_info['rho_ab']:.2f} > 0.80) および "
+                    f"対BTCベータ合算 (β_A+β_B={slot2_corr_info['beta_sum']:.2f} > 2.8) が高く、"
+                    f"確信度 ({float(conf_val):.2f}) が要求水準 (0.82) 未満のため見送ります。"
+                ),
+            )
+        dynamic_risk_pct = slot2_corr_info["effective_slot2_risk_pct_decimal"]
+
+    dynamic_min_risk_jpy = min(total_equity * Decimal("0.012"), total_equity * dynamic_risk_pct)
     dynamic_target_risk_jpy = max(dynamic_min_risk_jpy, total_equity * dynamic_risk_pct)
-    dynamic_hard_max_risk_jpy = total_equity * Decimal("0.020")
+    dynamic_hard_max_risk_jpy = max(dynamic_target_risk_jpy, total_equity * Decimal("0.020"))
 
     target_risk_cfg = _to_decimal(portfolio.get("target_risk_per_trade_jpy", 0))
     max_risk_cfg = _to_decimal(portfolio.get("max_risk_per_trade_jpy", 0))
@@ -1200,7 +1669,35 @@ def validate_and_adjust_decision(
         stressed_loss_jpy = int((stressed_loss_per_unit * size_dec).to_integral_value(rounding=ROUND_UP))
         rr_ratio = float(round(reward / risk, 2)) if risk > 0 else 0.0
 
+        tranche_info = evaluate_tranche_split_feasibility(
+            symbol=symbol,
+            order_size=size_dec,
+            min_order_size=min_order_size,
+            size_step=size_step,
+            limit_price=limit_dec,
+            atr_15m=mode_exec_info.get("atr_15m", atr_val * Decimal("0.20")),
+            tick_size=tick_size,
+        )
+
         adjusted["order_type"] = "LIMIT_POST_ONLY"
+        adjusted["execution_mode_type"] = mode_exec_info.get("execution_mode_type", "MOMENTUM_PULLBACK_DYNAMIC")
+        adjusted["mode_calculated_limit_price"] = mode_exec_info.get("calculated_limit_price", _format_number(limit_dec))
+        adjusted["support_wall_price"] = mode_exec_info.get("support_wall_price", 0.0)
+        adjusted["support_wall_size"] = mode_exec_info.get("support_wall_size", 0.0)
+        adjusted["front_run_tick_applied"] = bool(mode_exec_info.get("front_run_tick_applied", False))
+        adjusted["max_peg_count"] = int(mode_exec_info.get("max_peg_count", 0))
+        adjusted["order_expiry_hours"] = float(mode_exec_info.get("order_expiry_hours", 2.0))
+        adjusted["tranche_split_allowed"] = bool(tranche_info["tranche_split_allowed"])
+        adjusted["execution_tranche_mode"] = tranche_info["execution_tranche_mode"]
+        adjusted["tranches"] = tranche_info["tranches"]
+        adjusted["anti_martingale_tier"] = am_info["anti_martingale_tier"]
+        adjusted["effective_1r_risk_pct"] = float(round(dynamic_risk_pct, 6))
+        adjusted["effective_1r_risk_jpy"] = float(round(effective_target_risk_jpy, 2))
+        adjusted["asymmetric_cushion_applied"] = bool(am_info["asymmetric_cushion_applied"])
+        adjusted["slot2_correlation_haircut_applied"] = bool(slot2_corr_info["correlation_haircut_applied"])
+        adjusted["slot2_free_roll_recycling_active"] = bool(slot2_corr_info["free_roll_recycling_active"])
+        adjusted["slot2_rho_ab"] = slot2_corr_info["rho_ab"]
+        adjusted["slot2_beta_sum"] = slot2_corr_info["beta_sum"]
         adjusted["expected_loss_with_slippage_jpy"] = stressed_loss_jpy
         adjusted["portfolio_total_risk_jpy"] = int(
             (existing_risk_jpy + (nominal_loss_per_unit * size_dec)).to_integral_value(rounding=ROUND_HALF_UP)

@@ -54,6 +54,8 @@ class LLMShadowEvaluator:
         tp_price: float = 0.0,
         sl_price: float = 0.0,
         radar_score: float = 0.0,
+        bearish_counter_thesis: Optional[List[str]] = None,
+        bullish_conviction_factors: Optional[List[str]] = None,
         evaluated_at: Optional[datetime] = None,
     ) -> str:
         """AI判定（BUY または Veto HOLD）をシャドー評価対象として登録する"""
@@ -67,6 +69,9 @@ class LLMShadowEvaluator:
         if tp_price <= 0 and entry_price > 0:
             tp_price = round(entry_price * 1.060, 4)
 
+        ct_str = " / ".join(str(x) for x in (bearish_counter_thesis or []) if str(x).strip())
+        bull_str = " / ".join(str(x) for x in (bullish_conviction_factors or []) if str(x).strip())
+
         rec = {
             "eval_id": eval_id,
             "symbol": sym_up,
@@ -77,6 +82,8 @@ class LLMShadowEvaluator:
             "entry_price": float(entry_price),
             "tp_price": float(tp_price),
             "sl_price": float(sl_price),
+            "bearish_counter_thesis": ct_str,
+            "bullish_conviction_factors": bull_str,
             "mfe_4h_pct": None,
             "mae_4h_pct": None,
             "mfe_12h_pct": None,
@@ -101,6 +108,8 @@ class LLMShadowEvaluator:
                 tp_price=str(tp_price),
                 sl_price=str(sl_price),
                 radar_score=float(radar_score),
+                bearish_counter_thesis=ct_str,
+                bullish_conviction_factors=bull_str,
                 evaluated_at=now_jst,
             )
         return eval_id
@@ -278,3 +287,184 @@ class LLMShadowEvaluator:
             )
             updated_count += 1
         return updated_count
+
+    def _collect_recent_records_for_calibration(self, limit: int = 30) -> List[Dict[str, Any]]:
+        """メモリ台帳および SQLite WAL から直近 N 件のレコードを取得し正規化する"""
+        merged: Dict[str, Dict[str, Any]] = {}
+        if self.db_wal is not None and hasattr(self.db_wal, "fetch_recent_shadow_evaluations"):
+            try:
+                db_rows = self.db_wal.fetch_recent_shadow_evaluations(limit=limit)
+                for r in db_rows:
+                    eid = str(r.get("eval_id", ""))
+                    if not eid:
+                        continue
+                    merged[eid] = {
+                        "eval_id": eid,
+                        "symbol": str(r.get("symbol", "")).upper(),
+                        "ai_action": str(r.get("decision") or r.get("ai_action") or "HOLD").upper(),
+                        "conviction_score": int(r.get("conviction_score", 0) or 0),
+                        "entry_price": float(r.get("entry_price", 0.0) or 0.0),
+                        "tp_price": float(r.get("take_profit_price") or r.get("tp_price") or 0.0),
+                        "sl_price": float(r.get("stop_loss_price") or r.get("sl_price") or 0.0),
+                        "mfe_24h_pct": r.get("mfe_24h_pct"),
+                        "mae_24h_pct": r.get("mae_24h_pct"),
+                        "virtual_pnl_24h_jpy": r.get("pnl_24h_pct") if r.get("virtual_pnl_24h_jpy") is None else r.get("virtual_pnl_24h_jpy"),
+                        "outcome_24h": str(r.get("outcome_class") or r.get("outcome_24h") or "PENDING").upper(),
+                        "bearish_counter_thesis": str(r.get("bearish_counter_thesis", "")),
+                        "bullish_conviction_factors": str(r.get("bullish_conviction_factors", "")),
+                    }
+            except Exception:
+                pass
+
+        for eid, rec in self.records.items():
+            merged[eid] = dict(rec)
+
+        all_recs = list(merged.values())
+        return all_recs[-max(1, int(limit)) :]
+
+    def compute_self_calibration_scorecard(
+        self,
+        limit: int = 30,
+        alpha_0: float = 2.0,
+        beta_0: float = 2.0,
+        k_weight: float = 5.0,
+    ) -> Dict[str, Any]:
+        """
+        直近20〜30件の `llm_shadow_evaluations` レコードから閉ループ自己較正スコアカードを集計する。
+        - ① FPR（過信率）：`BUY` 判定後に SL 被弾した割合と直近の失敗要約
+        - ② FNR（機会損失率）：`HOLD`（Veto）判定後に `+2.0R` 以上上昇（または TP 到達）した割合と逃したトレード要約
+        - ③ TNR（Veto正解率）：`HOLD` 判定により下落・SL 被弾を回避した割合
+        - ベータ・二項ベイズ較正パラメータと動的閾値 `effective_threshold = max(0.72, Quantile_0.75)`
+        """
+        recent_recs = self._collect_recent_records_for_calibration(limit=limit)
+        buy_total = 0
+        buy_wins = 0
+        buy_sl_hits = 0
+        hold_total = 0
+        hold_missed_rallies = 0
+        hold_avoided_drops = 0
+
+        recent_failed_buys: List[str] = []
+        recent_missed_holds: List[str] = []
+        raw_confidences: List[float] = []
+
+        for rec in recent_recs:
+            conv = int(rec.get("conviction_score", 0) or 0)
+            p_raw = max(0.0, min(1.0, conv / 100.0))
+            if conv > 0:
+                raw_confidences.append(p_raw)
+
+            outcome = str(rec.get("outcome_24h", "PENDING") or "PENDING").upper()
+            pnl = rec.get("virtual_pnl_24h_jpy")
+            if outcome in ("PENDING", "NO_DATA") and pnl is None:
+                continue
+
+            act = str(rec.get("ai_action", "HOLD")).upper()
+            sym = str(rec.get("symbol", "UNKNOWN")).upper()
+            entry_p = float(rec.get("entry_price", 0.0) or 0.0)
+            sl_p = float(rec.get("sl_price", 0.0) or 0.0)
+            mfe_24 = float(rec.get("mfe_24h_pct", 0.0) or 0.0)
+            mae_24 = float(rec.get("mae_24h_pct", 0.0) or 0.0)
+            pnl_val = float(pnl or 0.0)
+            risk_pct = (
+                abs(entry_p - sl_p) / entry_p * 100.0
+                if (entry_p > 0 and 0 < sl_p < entry_p)
+                else 1.5
+            )
+            two_r_pct = max(2.0, risk_pct * 2.0)
+
+            if act == "BUY":
+                buy_total += 1
+                if outcome == "SL_HIT" or pnl_val < 0.0:
+                    buy_sl_hits += 1
+                    recent_failed_buys.append(
+                        f"{sym} BUY失敗(score={conv}, outcome={outcome}, MAE={mae_24:+.2f}%, PnL={pnl_val:+.0f}円)"
+                    )
+                elif outcome == "TP_HIT" or pnl_val > 0.0:
+                    buy_wins += 1
+            elif act == "HOLD":
+                hold_total += 1
+                if outcome == "TP_HIT" or mfe_24 >= two_r_pct:
+                    hold_missed_rallies += 1
+                    recent_missed_holds.append(
+                        f"{sym} HOLD機会損失(score={conv}, MFE={mfe_24:+.2f}% >= +2.0R[{two_r_pct:.2f}%])"
+                    )
+                if outcome == "SL_HIT" or mae_24 <= -risk_pct or pnl_val <= 0.0:
+                    hold_avoided_drops += 1
+
+        fpr_rate = (buy_sl_hits / buy_total) if buy_total > 0 else 0.0
+        fnr_rate = (hold_missed_rallies / hold_total) if hold_total > 0 else 0.0
+        tnr_rate = (hold_avoided_drops / hold_total) if hold_total > 0 else 0.0
+
+        if raw_confidences:
+            sorted_c = sorted(raw_confidences)
+            idx_75 = 0.75 * (len(sorted_c) - 1)
+            lo_idx = int(idx_75)
+            hi_idx = min(len(sorted_c) - 1, lo_idx + 1)
+            frac = idx_75 - lo_idx
+            q75 = sorted_c[lo_idx] + frac * (sorted_c[hi_idx] - sorted_c[lo_idx])
+            mean_conf = sum(sorted_c) / len(sorted_c)
+        else:
+            q75 = 0.72
+            mean_conf = 0.72
+
+        effective_threshold = max(0.72, round(q75, 4))
+        empirical_win_rate = (buy_wins / buy_total) if buy_total > 0 else 0.50
+
+        return {
+            "evaluated_sample_size": buy_total + hold_total,
+            "buy_total": buy_total,
+            "buy_wins": buy_wins,
+            "buy_sl_hits": buy_sl_hits,
+            "hold_total": hold_total,
+            "hold_missed_rallies": hold_missed_rallies,
+            "hold_avoided_drops": hold_avoided_drops,
+            "fpr_overconfidence_rate": round(fpr_rate, 4),
+            "fnr_missed_opportunity_rate": round(fnr_rate, 4),
+            "tnr_veto_accuracy_rate": round(tnr_rate, 4),
+            "empirical_win_rate": round(empirical_win_rate, 4),
+            "mean_raw_confidence": round(mean_conf, 4),
+            "quantile_75_confidence": round(q75, 4),
+            "effective_threshold": round(effective_threshold, 4),
+            "recent_failed_buys": recent_failed_buys[-3:],
+            "recent_missed_holds": recent_missed_holds[-3:],
+            "bayesian_prior": {"alpha_0": alpha_0, "beta_0": beta_0, "k_weight": k_weight},
+        }
+
+    def calibrate_confidence_and_threshold(
+        self,
+        raw_confidence: float,
+        limit: int = 30,
+        alpha_0: float = 2.0,
+        beta_0: float = 2.0,
+        k_weight: float = 5.0,
+    ) -> Dict[str, Any]:
+        """
+        ベータ・二項ベイズ較正＆動的分位点閾値調整を実行する:
+          p_calibrated = (alpha_0 + W + k * p_raw) / (alpha_0 + beta_0 + N + k)
+          effective_threshold = max(0.72, Quantile_0.75)
+        """
+        p_raw = max(0.0, min(1.0, float(raw_confidence or 0.0)))
+        scorecard = self.compute_self_calibration_scorecard(
+            limit=limit,
+            alpha_0=alpha_0,
+            beta_0=beta_0,
+            k_weight=k_weight,
+        )
+        w_wins = float(scorecard["buy_wins"])
+        n_total = float(scorecard["buy_total"])
+        denom = float(alpha_0) + float(beta_0) + n_total + float(k_weight)
+        p_calibrated = (
+            (float(alpha_0) + w_wins + float(k_weight) * p_raw) / denom
+            if denom > 0
+            else p_raw
+        )
+        effective_threshold = float(scorecard["effective_threshold"])
+        return {
+            "raw_confidence": round(p_raw, 4),
+            "calibrated_confidence": round(p_calibrated, 4),
+            "quantile_75_confidence": scorecard["quantile_75_confidence"],
+            "effective_threshold": round(effective_threshold, 4),
+            "passes_dynamic_threshold": p_raw >= effective_threshold,
+            "scorecard": scorecard,
+        }

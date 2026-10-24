@@ -38,11 +38,43 @@ def _now_jst(now_dt: Optional[datetime] = None) -> datetime:
     return now_dt.astimezone(JST)
 
 
+class RegimeName(str):
+    """
+    4状態レジーム (`BROAD_RISK_ON`, `BTC_DOMINANCE_DRAIN`, `NEUTRAL_SELECTIVE`, `RISK_OFF_CRASH`) と
+    旧3分類 (`TREND_UP`, `RANGE`, `RISK_OFF_CRASH`) の完全後方互換性を持つ文字列クラス。
+    """
+
+    _ALIASES = {
+        "BROAD_RISK_ON": {"BROAD_RISK_ON", "TREND_UP"},
+        "BTC_DOMINANCE_DRAIN": {"BTC_DOMINANCE_DRAIN", "RANGE", "TREND_UP"},
+        "NEUTRAL_SELECTIVE": {"NEUTRAL_SELECTIVE", "RANGE"},
+        "RISK_OFF_CRASH": {"RISK_OFF_CRASH"},
+    }
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            s_self = super().__str__()
+            s_other = str.__str__(other) if isinstance(other, RegimeName) else other
+            if s_self == s_other:
+                return True
+            return s_other in self._ALIASES.get(s_self, {s_self})
+        return super().__eq__(other)
+
+    def __ne__(self, other: object) -> bool:
+        return not self.__eq__(other)
+
+    def __hash__(self) -> int:
+        return super().__hash__()
+
+
 class MarketRegimeFilter:
     """
-    市場全体の地合い (`TREND_UP` / `RANGE` / `RISK_OFF_CRASH`) を判定し、
-    `RISK_OFF_CRASH` 時は2時間のヒステリシス冷却期間と未約定買い指値の一括キャンセルを提供する。
+    市場全体の地合いを4状態マトリクス (`BROAD_RISK_ON` / `BTC_DOMINANCE_DRAIN` / `NEUTRAL_SELECTIVE` / `RISK_OFF_CRASH`)
+    （および後方互換 `TREND_UP` / `RANGE` / `RISK_OFF_CRASH`）で判定し、
+    `RISK_OFF_CRASH` 時は2時間のヒステリシス冷却期間・未約定買い指値の一括キャンセル・保有建玉Stage 4タイトニングを提供する。
     """
+
+    MAJOR_REGIME_SYMBOLS = {"BTC", "ETH", "XRP", "SOL"}
 
     def __init__(
         self,
@@ -50,18 +82,36 @@ class MarketRegimeFilter:
         btc_4h_crash_pct: float = -4.0,
         btc_4h_crash_rsi: float = 22.0,
         min_breadth_ratio: float = 0.25,
+        alt_drain_breadth_threshold: float = 0.40,
         hysteresis_hours: float = 2.0,
     ) -> None:
         self.btc_1h_crash_pct = float(btc_1h_crash_pct)
         self.btc_4h_crash_pct = float(btc_4h_crash_pct)
         self.btc_4h_crash_rsi = float(btc_4h_crash_rsi)
         self.min_breadth_ratio = float(min_breadth_ratio)
+        self.alt_drain_breadth_threshold = float(alt_drain_breadth_threshold)
         self.hysteresis_hours = float(hysteresis_hours)
 
-        self.current_regime: str = "RANGE"
+        self.current_regime: str = RegimeName("NEUTRAL_SELECTIVE")
         self.risk_off_triggered_at: Optional[datetime] = None
         self.risk_off_cooldown_until: Optional[datetime] = None
         self.last_reason: str = ""
+
+    @property
+    def is_risk_off(self) -> bool:
+        return str(self.current_regime) == "RISK_OFF_CRASH"
+
+    @property
+    def is_broad_risk_on(self) -> bool:
+        return str(self.current_regime) == "BROAD_RISK_ON"
+
+    @property
+    def is_btc_dominance_drain(self) -> bool:
+        return str(self.current_regime) == "BTC_DOMINANCE_DRAIN"
+
+    @property
+    def is_neutral_selective(self) -> bool:
+        return str(self.current_regime) == "NEUTRAL_SELECTIVE"
 
     def evaluate(
         self,
@@ -129,14 +179,20 @@ class MarketRegimeFilter:
 
         btc_4h_rsi = float(btc_h4.get("rsi_14") or btc_h4.get("confirmed_rsi_14") or 50.0)
 
-        # Breadth（スクリーニング銘柄のうち 1h EMA50/SMA25 または日足/4hトレンドが上向きの比率）
+        # Breadth（スクリーニング銘柄のうち 1h EMA50/SMA25 または日足/4hトレンドが上向きの比率、およびBTC除くアルトBreadth）
         total_syms = 0
         bullish_syms = 0
+        alt_total_syms = 0
+        alt_bullish_syms = 0
         explicit_bearish_breadth_count = 0
         for sym, summary in (market_summaries or {}).items():
             if not isinstance(summary, dict):
                 continue
+            sym_up = str(sym).strip().upper()
             total_syms += 1
+            is_alt = sym_up != "BTC"
+            if is_alt:
+                alt_total_syms += 1
             h1 = summary.get("h1_indicators") or {}
             h4 = summary.get("h4_indicators") or {}
             daily = summary.get("daily_indicators") or {}
@@ -168,8 +224,11 @@ class MarketRegimeFilter:
 
             if is_above:
                 bullish_syms += 1
+                if is_alt:
+                    alt_bullish_syms += 1
 
         breadth_ratio = (bullish_syms / total_syms) if total_syms > 0 else 1.0
+        alt_breadth_ratio = (alt_bullish_syms / alt_total_syms) if alt_total_syms > 0 else breadth_ratio
 
         # RISK_OFF_CRASH トリガー判定
         crash_triggered = False
@@ -195,20 +254,28 @@ class MarketRegimeFilter:
             )
 
         if crash_triggered:
-            self.current_regime = "RISK_OFF_CRASH"
+            self.current_regime = RegimeName("RISK_OFF_CRASH")
             self.risk_off_triggered_at = now_jst
             self.risk_off_cooldown_until = now_jst + timedelta(hours=self.hysteresis_hours)
             self.last_reason = " / ".join(reasons)
             return {
-                "regime": "RISK_OFF_CRASH",
+                "regime": self.current_regime,
+                "regime_4state": "RISK_OFF_CRASH",
+                "legacy_regime": "RISK_OFF_CRASH",
+                "is_risk_off": True,
                 "allow_new_buy": False,
                 "should_cancel_pending_buys": True,
+                "tighten_trailing_to_stage4": True,
+                "allowed_execution_modes": [],
+                "base_1r_pct": 0.0,
+                "allowed_symbol_filter": "NONE",
                 "in_hysteresis_cooldown": False,
                 "cooldown_until": self.risk_off_cooldown_until.isoformat(timespec="seconds"),
                 "btc_change_1h_pct": round(btc_1h_pct, 2),
                 "btc_change_4h_pct": round(btc_4h_pct, 2),
                 "btc_rsi_4h": round(btc_4h_rsi, 2),
                 "breadth_ratio": round(breadth_ratio, 4),
+                "alt_breadth_ratio": round(alt_breadth_ratio, 4),
                 "reasons": reasons,
             }
 
@@ -222,39 +289,81 @@ class MarketRegimeFilter:
                     f"RISK_OFF_CRASH 冷却ヒステリシス継続中 "
                     f"(残り {remaining_min:.0f}分 / 解除予定 {cd_until_jst.isoformat(timespec='seconds')})"
                 )
-                self.current_regime = "RISK_OFF_CRASH"
+                self.current_regime = RegimeName("RISK_OFF_CRASH")
                 return {
-                    "regime": "RISK_OFF_CRASH",
+                    "regime": self.current_regime,
+                    "regime_4state": "RISK_OFF_CRASH",
+                    "legacy_regime": "RISK_OFF_CRASH",
+                    "is_risk_off": True,
                     "allow_new_buy": False,
                     "should_cancel_pending_buys": True,
+                    "tighten_trailing_to_stage4": True,
+                    "allowed_execution_modes": [],
+                    "base_1r_pct": 0.0,
+                    "allowed_symbol_filter": "NONE",
                     "in_hysteresis_cooldown": True,
                     "cooldown_until": cd_until_jst.isoformat(timespec="seconds"),
                     "btc_change_1h_pct": round(btc_1h_pct, 2),
                     "btc_change_4h_pct": round(btc_4h_pct, 2),
                     "btc_rsi_4h": round(btc_4h_rsi, 2),
                     "breadth_ratio": round(breadth_ratio, 4),
+                    "alt_breadth_ratio": round(alt_breadth_ratio, 4),
                     "reasons": [hyst_reason],
                 }
 
-        # 冷却期間経過後は解除
+        # 冷却期間経過後は解除 -> 残り3状態 (BROAD_RISK_ON / BTC_DOMINANCE_DRAIN / NEUTRAL_SELECTIVE) を判定
         self.risk_off_cooldown_until = None
         btc_trend = str(btc_daily.get("trend", ""))
-        if btc_trend in ("STRONG_UPTREND", "UPTREND") and breadth_ratio >= 0.50:
-            self.current_regime = "TREND_UP"
-            reasons.append(f"BTC上昇トレンド ({btc_trend}) ＆ Breadth良好 ({breadth_ratio * 100:.0f}%)")
+        btc_bullish = (
+            btc_trend in ("STRONG_UPTREND", "UPTREND")
+            or btc_1h_pct >= 0.50
+            or btc_4h_pct >= 1.00
+        )
+
+        if btc_bullish and alt_total_syms >= 1 and alt_breadth_ratio < self.alt_drain_breadth_threshold:
+            # BTC_DOMINANCE_DRAIN: BTCは強いがアルトBreadth < 40% の独歩高・アルト停滞局面
+            self.current_regime = RegimeName("BTC_DOMINANCE_DRAIN")
+            legacy_regime = "RANGE"
+            allowed_modes = ["MOMENTUM_PULLBACK_DYNAMIC"]
+            base_1r = 0.0135
+            sym_filter = "MAJORS_OR_HIGH_TFI"
+            reasons.append(
+                f"BTC独歩高・アルト停滞 (BTC={btc_trend or 'BULL'}, アルトBreadth={alt_breadth_ratio * 100:.0f}% < {self.alt_drain_breadth_threshold * 100:.0f}%)"
+            )
+        elif btc_trend in ("STRONG_UPTREND", "UPTREND") and breadth_ratio >= 0.50:
+            # BROAD_RISK_ON: 全面強気・アルト循環
+            self.current_regime = RegimeName("BROAD_RISK_ON")
+            legacy_regime = "TREND_UP"
+            allowed_modes = ["AGGRESSIVE_BREAKOUT_PEG", "MOMENTUM_PULLBACK_DYNAMIC"]
+            base_1r = 0.015
+            sym_filter = "ALL_17"
+            reasons.append(f"全面強気・アルト循環 ({btc_trend}) ＆ Breadth良好 ({breadth_ratio * 100:.0f}%)")
         else:
-            self.current_regime = "RANGE"
-            reasons.append(f"レンジ・選別相場 (Breadth={breadth_ratio * 100:.0f}%)")
+            # NEUTRAL_SELECTIVE: 中立・個別材料相場 (BKSRスクイーズ解放やCVD吸収が確認された厳選銘柄のみ)
+            self.current_regime = RegimeName("NEUTRAL_SELECTIVE")
+            legacy_regime = "RANGE"
+            allowed_modes = ["MOMENTUM_PULLBACK_DYNAMIC", "DEEP_LIQUIDITY_DIP"]
+            base_1r = 0.012
+            sym_filter = "SQUEEZE_OR_ABSORPTION_ONLY"
+            reasons.append(f"中立・個別材料選別相場 (Breadth={breadth_ratio * 100:.0f}%)")
 
         return {
             "regime": self.current_regime,
+            "regime_4state": str(self.current_regime),
+            "legacy_regime": legacy_regime,
+            "is_risk_off": False,
             "allow_new_buy": True,
             "should_cancel_pending_buys": False,
+            "tighten_trailing_to_stage4": False,
+            "allowed_execution_modes": allowed_modes,
+            "base_1r_pct": base_1r,
+            "allowed_symbol_filter": sym_filter,
             "in_hysteresis_cooldown": False,
             "cooldown_until": None,
             "btc_change_1h_pct": round(btc_1h_pct, 2),
             "btc_change_4h_pct": round(btc_4h_pct, 2),
             "btc_rsi_4h": round(btc_4h_rsi, 2),
             "breadth_ratio": round(breadth_ratio, 4),
+            "alt_breadth_ratio": round(alt_breadth_ratio, 4),
             "reasons": reasons,
         }
