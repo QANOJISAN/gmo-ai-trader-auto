@@ -200,6 +200,8 @@ def classify_jp_crypto_tax_regime(
         "estimated_tax_jpy": estimated_tax_jpy,
         "after_tax_net_pnl_jpy": after_tax_net_pnl_jpy,
         "carryforward_loss_jpy": carryforward_loss_jpy,
+        "post_2028_tax_regime": "SEPARATE_20315",
+        "post_2028_separate_tax_rate": 0.20315,
     }
 
 
@@ -1120,7 +1122,31 @@ class DatabaseWAL:
                         ),
                     )
                     # Forensic Ledger 共有バス (`tax_ledger_events`) への自動記録
-                    if side_up == "SELL":
+                    if side_up == "BUY":
+                        tax_meta_buy = classify_jp_crypto_tax_regime(dt_jst, realized_pnl_jpy=0)
+                        self._insert_tax_ledger_event_unlocked(
+                            event_id=f"exec_open_{exec_id}",
+                            timestamp_jst=tax_meta_buy["timestamp_jst"],
+                            tax_year=tax_meta_buy["tax_year"],
+                            tax_regime=tax_meta_buy["tax_regime"],
+                            effective_tax_rate=tax_meta_buy["effective_tax_rate"],
+                            loss_carryforward_years=tax_meta_buy["loss_carryforward_years"],
+                            exchange_registration=tax_meta_buy["exchange_registration"],
+                            symbol=sym,
+                            event_type="SPOT_TRADE_BUY",
+                            side=side_up,
+                            size=float(size_d),
+                            price_jpy=float(price_d),
+                            gross_proceeds_jpy=float(gross_jpy),
+                            cost_basis_jpy=float(delta_b),
+                            fee_or_rebate_jpy=float(maker_rebate_jpy - taker_fee_jpy),
+                            realized_pnl_jpy=0.0,
+                            estimated_tax_jpy=0.0,
+                            after_tax_net_pnl_jpy=0.0,
+                            source_order_id=oid,
+                            created_ts_ms=ts_ms,
+                        )
+                    elif side_up == "SELL":
                         tax_meta_sell = classify_jp_crypto_tax_regime(dt_jst, realized_pnl_jpy=realized_b)
                         self._insert_tax_ledger_event_unlocked(
                             event_id=f"exec_close_{exec_id}",

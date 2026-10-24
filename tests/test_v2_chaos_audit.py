@@ -5806,6 +5806,461 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
         self.assertEqual(promo_c["decision"], "KEEP_FROZEN_OR_SCALE_DOWN")
         self.assertFalse(promo_c["all_5_gates_live_pass"])
 
+    def test_round19_grand_final_post_r11_comprehensive_integration_audit(self) -> None:
+        r"""
+        Round 19 Grand Final Audit Test (Round 12〜18 全追加機能の横断結合・エッジケース・E2Eストレス総合監査):
+        1. `DatabaseWAL` (`v_forensic_tax_ledger`) ➔ `ForensicTaxAuditor.load_and_audit_from_wal_db` 直結ブリッジ監査:
+           - `SPOT_TRADE_BUY`, `SPOT_TRADE_CLOSE`, `MAKER_REBATE`, `TAKER_FEE`, `DAILY_FEE_FRACTION_REFUND` を
+             `v2_state_wal.db` に記録し、`?mode=ro` Read-Only WAL 接続から自動リプレイして、移動平均法・総平均法および
+             2027年総合課税 (`COMPREHENSIVE_MISC`) / 2028年申告分離課税 (`SEPARATE_20315`) へ1円の誤差もなく集計されることを検証。
+        2. Webダッシュボード (`/api/status`) ＆ ゼロ知識 AES-256-GCM PWA スナップショットの Round 13〜18 テレメトリ統合監査:
+           - `tier1_symbols`, `tier2_symbols`, `blacklisted_symbols`, `jst_session_name`, `allow_new_buy`,
+             `mintrl_freeze_stage`, `losing_streak_ladder`, `sprt_llr`, `cusum_s_minus`, `dynamic_blacklisted_symbols`,
+             `process_priority_tier`, `global_risk_bus`, `tax_regime_status` の全項目出力と `docs/` 平文ゼロ漏洩を検証。
+        3. 5大保護イベント（①05:45〜06:15ロールオーバー、②21:30米指標ウィンドウ、③Global Risk Bus THROTTLE/HALT_HEDGE、
+           ④RISK_OFF_CRASHレジーム急落、⑤UPS低バッテリー/OSシャットダウン）複合発火時における
+           「未約定 `PENDING_BUY` のみ退避 ＆ 保有建玉の取引所サーバー `STOP` 逆指値100%維持」E2Eストレステスト。
+        4. AST（抽象構文木）による全 `.py` ファイル横断の静的コード監査（旧v1完全不在、全 `subprocess` の `CREATE_NO_WINDOW` 適用、
+           禁止PRAGMA不在の完全証明）。
+        """
+        import ast
+        import json
+        from decimal import Decimal
+        from src.database_wal import DatabaseWAL
+        from src.forensic_tax_auditor import ForensicTaxAuditor, load_and_audit_from_wal_db
+        from src.global_risk_bus import RiskBusSentinelWriter
+        from src.pwa_crypto import decrypt_json_envelope
+        from web_dashboard import WebDashboardService
+
+        # ==================================================================
+        # 1. DatabaseWAL (v_forensic_tax_ledger) ➔ ForensicTaxAuditor 直結ブリッジ監査
+        # ==================================================================
+        with tempfile.TemporaryDirectory() as tmpdir_tax:
+            wal_db_path = Path(tmpdir_tax) / "v2_state_wal.db"
+            wal = DatabaseWAL(db_path=wal_db_path, auto_sync_files=False)
+            try:
+                ts_2027_buy1 = int(datetime(2027, 7, 1, 10, 0, 0, tzinfo=JST).timestamp() * 1000)
+                ts_2027_buy2 = int(datetime(2027, 8, 15, 14, 0, 0, tzinfo=JST).timestamp() * 1000)
+                ts_2027_sell1 = int(datetime(2027, 10, 10, 18, 0, 0, tzinfo=JST).timestamp() * 1000)
+                ts_2027_ref = int(datetime(2027, 10, 11, 6, 0, 30, tzinfo=JST).timestamp() * 1000)
+                ts_2028_sell2 = int(datetime(2028, 2, 1, 12, 0, 0, tzinfo=JST).timestamp() * 1000)
+                ts_2028_ref = int(datetime(2028, 2, 2, 6, 0, 30, tzinfo=JST).timestamp() * 1000)
+
+                # ① 2027-07-01: BTC 0.02 @ 10,000,000円 買付 (Gross 200,000円, Makerリベート -20円)
+                wal.record_execution(
+                    execution_id="R19_E1",
+                    order_id="R19_O1",
+                    symbol="BTC",
+                    side="BUY",
+                    size="0.02",
+                    price="10000000",
+                    fee_jpy="-20",
+                    executed_ts_ms=ts_2027_buy1,
+                )
+                # ② 2027-08-15: BTC 0.02 @ 12,000,000円 買付 (Gross 240,000円, Taker手数料 +120円)
+                wal.record_execution(
+                    execution_id="R19_E2",
+                    order_id="R19_O2",
+                    symbol="BTC",
+                    side="BUY",
+                    size="0.02",
+                    price="12000000",
+                    fee_jpy="120",
+                    executed_ts_ms=ts_2027_buy2,
+                )
+                # ③ 2027-10-10: BTC 0.02 @ 13,000,000円 売却 (Gross 260,000円, Taker手数料 +130円)
+                wal.record_execution(
+                    execution_id="R19_E3",
+                    order_id="R19_O3",
+                    symbol="BTC",
+                    side="SELL",
+                    size="0.02",
+                    price="13000000",
+                    fee_jpy="130",
+                    executed_ts_ms=ts_2027_sell1,
+                )
+                # ④ 2027-10-11 06:00:30: 朝06:00手数料端数返金 (+15円)
+                wal.record_fee_adjustment(
+                    date_str="2027-10-11",
+                    amount_jpy=15,
+                    note="DAILY_FEE_FRACTION_SETTLEMENT (06:00:30 JST)",
+                    now_ts_ms=ts_2027_ref,
+                )
+                # ⑤ 2028-02-01: 残り BTC 0.02 @ 14,000,000円 売却 (Gross 280,000円, Makerリベート -28円)
+                wal.record_execution(
+                    execution_id="R19_E4",
+                    order_id="R19_O4",
+                    symbol="BTC",
+                    side="SELL",
+                    size="0.02",
+                    price="14000000",
+                    fee_jpy="-28",
+                    executed_ts_ms=ts_2028_sell2,
+                )
+                # ⑥ 2028-02-02 06:00:30: 朝06:00手数料端数返金 (+12円)
+                wal.record_fee_adjustment(
+                    date_str="2028-02-02",
+                    amount_jpy=12,
+                    note="DAILY_FEE_FRACTION_SETTLEMENT (06:00:30 JST)",
+                    now_ts_ms=ts_2028_ref,
+                )
+
+                # 方式① (rebate_incorporation_mode=False: 雑所得独立計上) で Read-Only WAL 直結監査
+                audit_m1 = load_and_audit_from_wal_db(wal_db_path, rebate_incorporation_mode=False)
+                self.assertTrue(audit_m1["readonly_verified"])
+                self.assertEqual(audit_m1["years_present"], [2027, 2028])
+                counts = audit_m1["event_type_counts"]
+                self.assertEqual(counts.get("SPOT_TRADE_BUY"), 2)
+                self.assertEqual(counts.get("SPOT_TRADE_CLOSE"), 2)
+                self.assertEqual(counts.get("MAKER_REBATE"), 2)
+                self.assertEqual(counts.get("TAKER_FEE"), 2)
+                self.assertEqual(counts.get("DAILY_FEE_FRACTION_REFUND"), 2)
+
+                # 2027年検証 (方式①):
+                # Buy1 Gross=200,000 (Rebate +20), Buy2 Cost=240,120 -> Pool 0.04 BTC, Cost=440,120 (単価 11,003,000円)
+                # Sell1 0.02 BTC: Gross=260,000 - CostBasis(220,060) - TakerFee(130) = +39,810円
+                # Rebate/Refund = +20 + 15 = +35円 -> 2027年総合課税合計 = 39,845円 (誤差0円)
+                sum_2027_m1 = audit_m1["summaries_by_year"][2027]
+                self.assertEqual(sum_2027_m1["comprehensive_spot_pnl_jpy"], Decimal("39810"))
+                self.assertEqual(sum_2027_m1["comprehensive_rebate_income_jpy"], Decimal("35"))
+                self.assertEqual(sum_2027_m1["fee_fraction_refund_jpy"], Decimal("15"))
+                self.assertEqual(sum_2027_m1["comprehensive_misc_taxable_income_jpy"], Decimal("39845"))
+                self.assertEqual(sum_2027_m1["separate_20315_taxable_income_jpy"], Decimal("0"))
+
+                # 2028年検証 (方式①):
+                # 期首繰越 0.02 BTC (原価 220,060円) -> Sell2 Gross=280,000 - 220,060 = +59,940円 + 2028端数返金12円 = +59,952円 (SEPARATE_20315)
+                # Makerリベート +28円は COMPREHENSIVE_MISC へ独立計上
+                sum_2028_m1 = audit_m1["summaries_by_year"][2028]
+                self.assertEqual(sum_2028_m1["separate_20315_raw_pnl_jpy"], Decimal("59952"))
+                self.assertEqual(sum_2028_m1["separate_20315_taxable_income_jpy"], Decimal("59952"))
+                self.assertEqual(sum_2028_m1["comprehensive_rebate_income_jpy"], Decimal("28"))
+                self.assertEqual(sum_2028_m1["comprehensive_misc_taxable_income_jpy"], Decimal("28"))
+                self.assertEqual(sum_2028_m1["fee_fraction_refund_jpy"], Decimal("12"))
+
+                # 方式② (rebate_incorporation_mode=True: 取得価額・譲渡費用加減算方式) でも検証
+                audit_m2 = ForensicTaxAuditor.load_and_audit_from_wal_db(wal_db_path, rebate_incorporation_mode=True)
+                sum_2027_m2 = audit_m2["summaries_by_year"][2027]
+                sum_2028_m2 = audit_m2["summaries_by_year"][2028]
+                # 2年間トータルの純損益合計 (39,845 + 59,952 + 28 = 99,825円) が方式①・方式②で1円の誤差もなく完全一致
+                total_net_m1 = (
+                    sum_2027_m1["comprehensive_misc_taxable_income_jpy"]
+                    + sum_2028_m1["separate_20315_taxable_income_jpy"]
+                    + sum_2028_m1["comprehensive_misc_taxable_income_jpy"]
+                )
+                total_net_m2 = (
+                    sum_2027_m2["comprehensive_misc_taxable_income_jpy"]
+                    + sum_2028_m2["separate_20315_taxable_income_jpy"]
+                    + sum_2028_m2["comprehensive_misc_taxable_income_jpy"]
+                )
+                self.assertEqual(total_net_m1, Decimal("99825"))
+                self.assertEqual(total_net_m2, Decimal("99825"))
+            finally:
+                wal.close()
+
+        # ==================================================================
+        # 2. Webダッシュボード (/api/status) ＆ ゼロ知識暗号化PWAスナップショット統合監査
+        # ==================================================================
+        with tempfile.TemporaryDirectory() as tmpdir_web:
+            web_base = Path(tmpdir_web)
+            (web_base / "portfolio.json").write_text(
+                json.dumps(
+                    {
+                        "initial_capital_jpy": 20000,
+                        "initial_equity_jpy": 20025,
+                        "jpy_balance": 20025,
+                        "peak_equity_jpy": 20025,
+                        "positions": [],
+                        "pending_orders": [],
+                        "closed_trades": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            svc = WebDashboardService(base_dir=web_base, port=18099)
+            try:
+                status_payload = svc.get_status_payload()
+                # Round 13〜18 新規ガバナンステレメトリ13項目の存在と値を検証
+                self.assertEqual(status_payload["tier1_symbols"], ["BTC", "ETH", "SOL", "XRP"])
+                self.assertEqual(
+                    status_payload["tier2_symbols"],
+                    ["ADA", "BCH", "DOGE", "DOT", "LINK", "LTC", "SUI", "XLM"],
+                )
+                self.assertEqual(
+                    status_payload["blacklisted_symbols"],
+                    ["ASTR", "ATOM", "FCR", "NAC", "WILD"],
+                )
+                self.assertTrue(isinstance(status_payload["jst_session_name"], str) and len(status_payload["jst_session_name"]) > 0)
+                self.assertIn("allow_new_buy", status_payload)
+                self.assertEqual(status_payload["mintrl_freeze_stage"]["mintrl_stage"], "STAGE0_HARD_FREEZE")
+                self.assertEqual(status_payload["losing_streak_ladder"]["ladder_stage"], "GREEN_NORMAL")
+                self.assertIn("sprt_llr", status_payload)
+                self.assertIn("cusum_s_minus", status_payload)
+                self.assertIsInstance(status_payload["dynamic_blacklisted_symbols"], list)
+                self.assertEqual(status_payload["process_priority_tier"]["auto_trader_tier"], 1)
+                self.assertEqual(status_payload["process_priority_tier"]["web_dashboard_tier"], 3)
+                self.assertEqual(status_payload["global_risk_bus"]["breaker_level"], 0)
+                self.assertEqual(status_payload["tax_regime_status"]["post_2028_separate_tax_rate"], 0.20315)
+
+                # 静的PWAバンドル出力時のゼロ知識 AES-256-GCM 暗号化 ＆ 平文漏洩ゼロ検証
+                docs_out = web_base / "docs"
+                exp_res = svc.export_static_pwa_bundle(output_dir=docs_out, include_charts=False)
+                self.assertTrue(exp_res["ok"])
+                raw_snap_text = (docs_out / "status_snapshot.json").read_text(encoding="utf-8")
+                raw_index_text = (docs_out / "index.html").read_text(encoding="utf-8")
+                pw = svc.get_pwa_unlock_password()
+                for forbidden_plain in ("20025", "20,025", pw, "STAGE0_HARD_FREEZE", "SEPARATE_20315"):
+                    self.assertNotIn(forbidden_plain, raw_snap_text)
+                self.assertNotIn(pw, raw_index_text)
+
+                dec_snap = decrypt_json_envelope(json.loads(raw_snap_text), pw)
+                self.assertEqual(dec_snap["tier1_symbols"], ["BTC", "ETH", "SOL", "XRP"])
+                self.assertEqual(dec_snap["mintrl_freeze_stage"]["mintrl_stage"], "STAGE0_HARD_FREEZE")
+                self.assertEqual(dec_snap["process_priority_tier"]["auto_trader_tier"], 1)
+            finally:
+                svc.close()
+
+        # ==================================================================
+        # 3. 5大緊急保護イベント複合発火時の「取引所サーバー STOP 注文100%保護」E2Eストレステスト
+        # ==================================================================
+        with tempfile.TemporaryDirectory() as tmpdir_stop:
+            stop_base = Path(tmpdir_stop)
+            pf_path = stop_base / "portfolio.json"
+            rb_path = stop_base / "risk_bus.db"
+            protected_sl_oid = "9100000001"
+            seed_pf = {
+                "jpy_balance": 20025.0,
+                "initial_capital_jpy": 20000.0,
+                "positions": [
+                    {
+                        "position_id": "pos_btc_r19",
+                        "symbol": "BTC",
+                        "side": "BUY",
+                        "size": 0.0005,
+                        "entry_price": 14000000.0,
+                        "current_price": 14050000.0,
+                        "stop_loss_price": 13800000.0,
+                        "take_profit_price": 14600000.0,
+                        "sl_order_id": protected_sl_oid,
+                        "state": "SL_ACTIVE",
+                        "trailing_stage": 1,
+                        "opened_at": "2026-10-21T04:00:00+09:00",
+                    }
+                ],
+                "pending_orders": [],
+            }
+            pf_path.write_text(json.dumps(seed_pf, ensure_ascii=False, indent=2), encoding="utf-8")
+            broker = PaperBroker(portfolio_path=pf_path)
+            sentinel = RiskBusSentinelWriter(rb_path)
+            daemon = AutoTraderDaemon(
+                base_dir=stop_base,
+                execution_mode="PAPER",
+                broker=broker,
+                dry_run_notify=True,
+                risk_bus_db_path=rb_path,
+            )
+            # ALLOWED_OWNER_DISCORD_ID が設定されている本番同等条件でも内部保護キャンセルが100%通ることを検証
+            daemon.remote_control.allowed_owner_discord_id = "999888777"
+            try:
+                def _inject_pending_buy(opened_iso: str = "2026-10-21T05:00:00+09:00") -> str:
+                    buy_ord = broker.place_order(
+                        symbol="SOL",
+                        side="BUY",
+                        execution_type="LIMIT",
+                        price="24000",
+                        size="0.3",
+                    )
+                    buy_oid = str(buy_ord["order_id"])
+                    pf_cur = daemon.oco_manager.load_portfolio()
+                    pf_cur["jpy_balance"] = 20025.0
+                    pf_cur["positions"] = [
+                        {
+                            "position_id": "pos_btc_r19",
+                            "symbol": "BTC",
+                            "side": "BUY",
+                            "size": 0.0005,
+                            "entry_price": 14000000.0,
+                            "current_price": 14050000.0,
+                            "stop_loss_price": 13800000.0,
+                            "take_profit_price": 14600000.0,
+                            "sl_order_id": protected_sl_oid,
+                            "state": "SL_ACTIVE",
+                            "trailing_stage": 1,
+                            "opened_at": opened_iso,
+                        }
+                    ]
+                    pf_cur["pending_orders"] = [
+                        {
+                            "order_id": buy_oid,
+                            "symbol": "SOL",
+                            "side": "BUY",
+                            "execution_type": "LIMIT",
+                            "limit_price": 24000.0,
+                            "size": 0.3,
+                            "executed_size": 0.0,
+                            "stop_loss_price": 23400.0,
+                            "take_profit_price": 25200.0,
+                            "state": "PENDING_BUY",
+                            "created_at": opened_iso,
+                        }
+                    ]
+                    daemon.oco_manager.save_portfolio(pf_cur)
+                    return buy_oid
+
+                def _assert_sl_protected_and_buy_evacuated(evac_buy_oid: str) -> None:
+                    pf_chk = daemon.oco_manager.load_portfolio()
+                    self.assertEqual(len(pf_chk.get("pending_orders", [])), 0)
+                    self.assertEqual(len(pf_chk.get("positions", [])), 1)
+                    self.assertEqual(pf_chk["positions"][0]["sl_order_id"], protected_sl_oid)
+                    active_ids = {str(o.get("order_id")) for o in broker.get_active_orders()}
+                    self.assertIn(protected_sl_oid, active_ids)
+                    self.assertNotIn(evac_buy_oid, active_ids)
+
+                tickers_ok = {
+                    "BTC": {"last": "14050000", "bid": "14048000", "ask": "14052000", "high": "14100000", "low": "14000000"},
+                    "SOL": {"last": "24100", "bid": "24095", "ask": "24105", "high": "24200", "low": "24050"},
+                }
+
+                # イベント①: 05:50 JST 日次ロールオーバー・ブラックアウト
+                oid_1 = _inject_pending_buy("2026-10-21T05:30:00+09:00")
+                daemon.run_fast_cycle(
+                    tickers=tickers_ok,
+                    now_dt=datetime(2026, 10, 21, 5, 50, 0, tzinfo=JST),
+                    exchange_status="OPEN",
+                )
+                _assert_sl_protected_and_buy_evacuated(oid_1)
+
+                # イベント②: 平日 21:30 JST 米主要マクロ経済指標ウィンドウ
+                oid_2 = _inject_pending_buy("2026-10-21T21:00:00+09:00")
+                daemon.run_fast_cycle(
+                    tickers=tickers_ok,
+                    now_dt=datetime(2026, 10, 21, 21, 30, 0, tzinfo=JST),
+                    exchange_status="OPEN",
+                )
+                _assert_sl_protected_and_buy_evacuated(oid_2)
+
+                # イベント③: Global Risk Bus THROTTLE (1) & HALT_HEDGE (2)
+                oid_3 = _inject_pending_buy("2026-10-21T21:45:00+09:00")
+                sentinel.evaluate_and_publish(
+                    btc_z_score=-4.5,
+                    avg_corr_distance=0.20,
+                    daily_drawdown_pct=3.5,
+                    gmo_spot_notional_jpy=18000.0,
+                    comprehensive_alt_notional_jpy=15000.0,
+                    tax_year=2027,
+                )
+                rb_enf = daemon.poll_and_enforce_global_risk_bus(
+                    now_dt=datetime(2026, 10, 21, 22, 0, 0, tzinfo=JST)
+                )
+                self.assertEqual(rb_enf["breaker_level"], 2)
+                _assert_sl_protected_and_buy_evacuated(oid_3)
+                # リスクバスを NORMAL(0) に戻して次のテストへ
+                sentinel.evaluate_and_publish(
+                    btc_z_score=-0.5,
+                    avg_corr_distance=0.65,
+                    daily_drawdown_pct=0.2,
+                )
+                daemon.remote_control.is_paused = False
+
+                # イベント④: RISK_OFF_CRASH レジーム急落 (BTC 1h -3.5%)
+                oid_4 = _inject_pending_buy("2026-10-21T22:00:00+09:00")
+                crash_summaries = {
+                    "BTC": {
+                        "price": {"last": 13900000.0, "best_bid": 13895000.0, "best_ask": 13905000.0, "spread_pct": 0.07},
+                        "h1_indicators": {"change_1h_pct": -3.5, "rsi_14": 25.0, "atr_14": 250000.0},
+                        "h4_indicators": {"change_4h_pct": -4.5, "rsi_14": 20.0, "atr_14": 450000.0},
+                        "daily_indicators": {"trend": "DOWNTREND", "rsi_14": 35.0, "atr_14": 700000.0},
+                    }
+                }
+                daemon.run_radar_and_ai_cycle(
+                    market_summaries=crash_summaries,
+                    symbol_rules=DEFAULT_SYMBOL_RULES,
+                    tickers=tickers_ok,
+                    now_dt=datetime(2026, 10, 21, 22, 10, 0, tzinfo=JST),
+                    exchange_status="OPEN",
+                )
+                _assert_sl_protected_and_buy_evacuated(oid_4)
+
+                # イベント⑤: UPS低バッテリー (ACLineStatus=0, BatteryLifePercent=30) 緊急グレースフル停止
+                oid_5 = _inject_pending_buy("2026-10-21T22:10:00+09:00")
+                ups_res = daemon.lifecycle_guard.check_power_and_execute_if_needed(
+                    simulated_status={"ACLineStatus": 0, "BatteryFlag": 4, "BatteryLifePercent": 30},
+                    now_dt=datetime(2026, 10, 21, 22, 15, 0, tzinfo=JST),
+                )
+                self.assertTrue(ups_res["triggered"])
+                _assert_sl_protected_and_buy_evacuated(oid_5)
+            finally:
+                sentinel.close()
+                daemon.db_wal.close()
+
+        # ==================================================================
+        # 4. AST（抽象構文木）による全 `.py` ファイル横断の静的コード監査
+        # ==================================================================
+        repo_root = Path(__file__).resolve().parent.parent
+        self.assertFalse(Path(r"e:\gmo-ai-trader").exists(), "旧v1ディレクトリが残存しています")
+
+        py_files = (
+            [repo_root / "auto_trader.py", repo_root / "web_dashboard.py"]
+            + sorted((repo_root / "src").glob("*.py"))
+            + sorted((repo_root / "tests").glob("*.py"))
+        )
+        self.assertGreaterEqual(len(py_files), 23)
+
+        prod_py_files = [repo_root / "auto_trader.py", repo_root / "web_dashboard.py"] + sorted(
+            (repo_root / "src").glob("*.py")
+        )
+        for py_path in py_files:
+            src_text = py_path.read_text(encoding="utf-8")
+            tree = ast.parse(src_text, filename=str(py_path))
+            if py_path in prod_py_files:
+                # docstring 以外の実行コード文字列リテラルを抽出し、禁止 PRAGMA や動的WALへの immutable=1 が一切存在しないことを検証
+                docstring_nodes = set()
+                for n in ast.walk(tree):
+                    if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if (
+                            n.body
+                            and isinstance(n.body[0], ast.Expr)
+                            and isinstance(n.body[0].value, ast.Constant)
+                            and isinstance(n.body[0].value.value, str)
+                        ):
+                            docstring_nodes.add(id(n.body[0].value))
+
+                for node in ast.walk(tree):
+                    if (
+                        isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and id(node) not in docstring_nodes
+                    ):
+                        val_str = node.value
+                        self.assertNotIn(
+                            "locking_mode = EXCLUSIVE",
+                            val_str,
+                            f"Forbidden EXCLUSIVE in {py_path.name}:{getattr(node, 'lineno', 0)}",
+                        )
+                        self.assertNotIn(
+                            "locking_mode=EXCLUSIVE",
+                            val_str,
+                            f"Forbidden EXCLUSIVE in {py_path.name}:{getattr(node, 'lineno', 0)}",
+                        )
+                        self.assertNotIn(
+                            "immutable=1",
+                            val_str,
+                            f"Forbidden immutable=1 in {py_path.name}:{getattr(node, 'lineno', 0)}",
+                        )
+
+                    # 全 subprocess.(run|Popen|check_output) 呼び出しに creationflags または **kwargs (CREATE_NO_WINDOW) が付与されていること
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                        if (
+                            isinstance(node.func.value, ast.Name)
+                            and node.func.value.id == "subprocess"
+                            and node.func.attr in ("run", "Popen", "check_output")
+                        ):
+                            kw_names = {kw.arg for kw in node.keywords}
+                            has_no_window = ("creationflags" in kw_names) or (None in kw_names)
+                            self.assertTrue(
+                                has_no_window,
+                                f"{py_path.name}:{node.lineno} の subprocess.{node.func.attr} に CREATE_NO_WINDOW が未指定です",
+                            )
+
 
 if __name__ == "__main__":
     unittest.main()

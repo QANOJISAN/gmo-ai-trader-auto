@@ -45,20 +45,32 @@ sys.dont_write_bytecode = True
 
 from dotenv import load_dotenv
 
-from src.circuit_breaker import MultiTierCircuitBreaker, SingleInstanceLock
-from src.database_wal import DatabaseWAL, atomic_write_text
+from src.circuit_breaker import (
+    MultiTierCircuitBreaker,
+    SingleInstanceLock,
+    evaluate_losing_streak_ladder,
+)
+from src.database_wal import DatabaseWAL, atomic_write_text, classify_jp_crypto_tax_regime
 from src.dpapi_vault import (
     build_github_basic_auth_header,
     encrypt_dotenv_secrets_inplace,
     get_secret_env,
     load_and_unprotect_dotenv,
 )
+from src.global_risk_bus import BREAKER_LEVEL_NAMES, BREAKER_LEVEL_NORMAL, RiskBusBotReader
 from src.gmo_client import GMOPublicClient
 from src.gmo_private_client import create_broker_client
 from src.json_utils import dumps_json, load_json_file
+from src.llm_shadow_evaluator import evaluate_mintrl_freeze_stage
 from src.notifier import mask_secrets
 from src.pseudo_oco_manager import PseudoOCOManager
 from src.pwa_crypto import encrypt_json_envelope, generate_default_pwa_password
+from src.regime_filter import (
+    BLACKLISTED_SYMBOLS,
+    TIER1_SYMBOLS,
+    TIER2_SYMBOLS,
+    evaluate_jst_session_and_schedule_matrix,
+)
 from src.remote_control import (
     RemoteControlManager,
     ReplayOrExpiredNonceError,
@@ -1165,11 +1177,108 @@ class WebDashboardService:
         market_regime = str(regime_info.get("regime", "NEUTRAL") or "NEUTRAL").upper()
         campaign_info = self._evaluate_campaign_info(pf, now_jst)
 
+        # Round 13〜18 ガバナンス・統計品質管理・マルチボット保護テレメトリ
+        jst_sched = evaluate_jst_session_and_schedule_matrix(now_dt=now_jst)
+        jst_session_name = str(jst_sched.get("session_name", "UNKNOWN"))
+        allow_new_buy = bool(
+            jst_sched.get("allow_new_buy", True)
+            and campaign_info.get("allow_new_buy", True)
+            and not is_paused
+            and not l3_status.get("blocked", False)
+            and not l4_status.get("blocked", False)
+            and not bool(self.circuit_breaker.l5_kill_switch_latched)
+        )
+        mintrl_info = evaluate_mintrl_freeze_stage(len(closed_raw))
+        ladder_info = l4_status.get("losing_streak_ladder") or evaluate_losing_streak_ladder(
+            int(l4_status.get("consecutive_losses", 0) or 0)
+        )
+
+        sprt_cusum_st: Dict[str, Any] = {}
+        try:
+            sprt_cusum_st = self.circuit_breaker.load_sprt_cusum_from_wal(self.db_wal) or {}
+        except Exception:
+            sprt_cusum_st = {}
+        if not sprt_cusum_st and isinstance(pf.get("sprt_cusum_state"), dict):
+            sprt_cusum_st = dict(pf["sprt_cusum_state"])
+
+        sprt_llr_val = round(float(sprt_cusum_st.get("sprt_llr", self.circuit_breaker.sprt_llr) or 0.0), 4)
+        cusum_s_minus_val = round(
+            float(
+                sprt_cusum_st.get(
+                    "portfolio_cusum_s_minus",
+                    self.circuit_breaker.portfolio_cusum_s_minus,
+                )
+                or 0.0
+            ),
+            4,
+        )
+        dyn_bl_raw = (
+            set(pf.get("dynamic_blacklisted_symbols", []) or [])
+            | set(sprt_cusum_st.get("dynamic_blacklisted_symbols", []) or [])
+            | set(self.circuit_breaker.dynamic_blacklisted_symbols)
+        )
+        dynamic_blacklisted_list = sorted(str(x).strip().upper() for x in dyn_bl_raw if x)
+
+        risk_bus_path = self.base_dir / "risk_bus.db"
+        if risk_bus_path.exists():
+            rb_reader: Optional[RiskBusBotReader] = None
+            try:
+                rb_reader = RiskBusBotReader(risk_bus_path)
+                rb_state = rb_reader.read_breaker_state()
+                global_risk_bus_info: Dict[str, Any] = {
+                    "active": True,
+                    **rb_state,
+                }
+            except Exception:
+                global_risk_bus_info = {
+                    "active": False,
+                    "breaker_level": BREAKER_LEVEL_NORMAL,
+                    "breaker_name": BREAKER_LEVEL_NAMES[BREAKER_LEVEL_NORMAL],
+                    "reason_code": "READ_SKIPPED",
+                }
+            finally:
+                if rb_reader is not None:
+                    rb_reader.close()
+        else:
+            global_risk_bus_info = {
+                "active": False,
+                "breaker_level": BREAKER_LEVEL_NORMAL,
+                "breaker_name": BREAKER_LEVEL_NAMES[BREAKER_LEVEL_NORMAL],
+                "reason_code": "STANDBY_SINGLE_BOT",
+            }
+        if int(global_risk_bus_info.get("breaker_level", 0) or 0) >= 1:
+            allow_new_buy = False
+
+        process_priority_tier_info = {
+            "auto_trader_tier": 1,
+            "auto_trader_priority": "HIGH_PRIORITY_CLASS (0x00000080)",
+            "risk_sentinel_tier": 2,
+            "risk_sentinel_priority": "ABOVE_NORMAL_PRIORITY_CLASS (0x00008000)",
+            "web_dashboard_tier": 3,
+            "web_dashboard_priority": "NORMAL_PRIORITY_CLASS (0x00000020)",
+            "git_backup_tier": 4,
+            "git_backup_priority": "BELOW_NORMAL_PRIORITY_CLASS (0x00004000)",
+        }
+        tax_regime_status_info = classify_jp_crypto_tax_regime(now_jst)
+
         lan_url = f"http://{self.lan_ip}:{self.port}"
         local_url = f"http://127.0.0.1:{self.port}"
 
         return {
             "timestamp": now_jst.isoformat(timespec="seconds"),
+            "tier1_symbols": sorted(TIER1_SYMBOLS),
+            "tier2_symbols": sorted(TIER2_SYMBOLS),
+            "blacklisted_symbols": sorted(BLACKLISTED_SYMBOLS),
+            "jst_session_name": jst_session_name,
+            "allow_new_buy": allow_new_buy,
+            "mintrl_freeze_stage": mintrl_info,
+            "losing_streak_ladder": ladder_info,
+            "sprt_llr": sprt_llr_val,
+            "cusum_s_minus": cusum_s_minus_val,
+            "dynamic_blacklisted_symbols": dynamic_blacklisted_list,
+            "process_priority_tier": process_priority_tier_info,
+            "global_risk_bus": global_risk_bus_info,
+            "tax_regime_status": tax_regime_status_info,
             "network_info": {
                 "lan_ip": self.lan_ip,
                 "port": self.port,
@@ -1184,6 +1293,10 @@ class WebDashboardService:
                 "is_paused": is_paused,
                 "market_regime": market_regime,
                 "regime_detail": regime_info,
+                "jst_session_name": jst_session_name,
+                "allow_new_buy": allow_new_buy,
+                "process_priority_tier": process_priority_tier_info,
+                "global_risk_bus": global_risk_bus_info,
                 "circuit_breakers": {
                     "l1_ws_sequence": "OK",
                     "l2_api_health": "OK",
@@ -1196,6 +1309,11 @@ class WebDashboardService:
                         "threshold_jpy": round(l5_floor_jpy, 0),
                         "headroom_jpy": round(cons_eq - l5_floor_jpy, 0),
                     },
+                    "sprt_llr": sprt_llr_val,
+                    "cusum_s_minus": cusum_s_minus_val,
+                    "dynamic_blacklisted_symbols": dynamic_blacklisted_list,
+                    "mintrl_freeze_stage": mintrl_info,
+                    "losing_streak_ladder": ladder_info,
                 },
             },
             "equity_summary": {

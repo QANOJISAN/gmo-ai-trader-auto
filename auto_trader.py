@@ -615,7 +615,8 @@ class AutoTraderDaemon:
     def clear_pending_buys_before_maintenance(self, now_dt: Optional[datetime] = None) -> Dict[str, Any]:
         """土曜 08:50〜08:55 JST に未約定の `BUY` 指値を事前クリアする（既存 SL 注文は維持）"""
         now_jst = _now_jst(now_dt)
-        res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+        owner_actor = self.remote_control.allowed_owner_discord_id or None
+        res = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
         self.pre_maintenance_cleared = True
         return res
 
@@ -635,7 +636,8 @@ class AutoTraderDaemon:
                 self.broker.update_market_tickers(tickers)
             except Exception:
                 pass
-        cancel_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+        owner_actor = self.remote_control.allowed_owner_discord_id or None
+        cancel_res = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
         closed_positions: List[Dict[str, Any]] = []
         pf_now = self.oco_manager.load_portfolio()
         for pos in list(pf_now.get("positions", []) or []):
@@ -744,7 +746,8 @@ class AutoTraderDaemon:
 
         # 1. 未約定の買い指値注文を全件キャンセル（部分約定分は安全にポジションへ昇格）
         try:
-            cancel_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+            owner_actor = self.remote_control.allowed_owner_discord_id or None
+            cancel_res = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
             if cancel_res.get("canceled_order_ids"):
                 settle_events.append(
                     {
@@ -929,7 +932,8 @@ class AutoTraderDaemon:
             self.campaign_phase = "PHASE1_PRE_DEADLINE_FREEZE"
             pf = self.oco_manager.load_portfolio()
             if (pf.get("pending_orders") or []) or not self._phase1_pre_freeze_cleared:
-                c_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                owner_actor = self.remote_control.allowed_owner_discord_id or None
+                c_res = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
                 self._phase1_pre_freeze_cleared = True
                 if c_res.get("canceled_order_ids"):
                     events.append(
@@ -1026,7 +1030,8 @@ class AutoTraderDaemon:
             self.campaign_phase = "PHASE2_PRE_DEADLINE_FREEZE"
             pf = self.oco_manager.load_portfolio()
             if (pf.get("pending_orders") or []) or not self._phase2_pre_freeze_cleared:
-                c_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                owner_actor = self.remote_control.allowed_owner_discord_id or None
+                c_res = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
                 self._phase2_pre_freeze_cleared = True
                 if c_res.get("canceled_order_ids"):
                     events.append(
@@ -1176,19 +1181,27 @@ class AutoTraderDaemon:
                 "events": campaign_res.get("events", []),
             }
 
-        # 0b. 日次ロールオーバー直前 (05:45〜05:59 JST) 未約定 BUY 自動クリア
+        # 0b. 日次ロールオーバー直前 (05:45〜05:59 JST) 未約定 BUY 自動クリア（STOP逆指値は厳格維持）
         mins_now = now_jst.hour * 60 + now_jst.minute
         owner_actor = self.remote_control.allowed_owner_discord_id or None
+        pre_maint_events: List[Dict[str, Any]] = []
         if (5 * 60 + 45) <= mins_now < (6 * 60):
             roll_day = now_jst.strftime("%Y-%m-%d")
-            if self._last_rollover_clear_date != roll_day:
+            pf_roll = self.oco_manager.load_portfolio()
+            if pf_roll.get("pending_orders") or self._last_rollover_clear_date != roll_day:
                 self._last_rollover_clear_date = roll_day
-                pf_roll = self.oco_manager.load_portfolio()
                 if pf_roll.get("pending_orders"):
-                    self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
+                    c_roll = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
+                    pre_maint_events.append(
+                        {
+                            "type": "DAILY_ROLLOVER_PENDING_BUY_EVACUATED",
+                            "canceled_buy_order_ids": c_roll.get("canceled_buy_order_ids", []),
+                            "preserved_sl_order_ids": c_roll.get("preserved_sl_order_ids", []),
+                            "timestamp": now_jst.isoformat(timespec="seconds"),
+                        }
+                    )
 
         # 0c. 土曜 08:00 JST 待機注文クリア / 08:45〜08:49 JST メンテ前ポジションエグジット / 08:50〜08:55 JST 未約定 BUY 事前クリア
-        pre_maint_events: List[Dict[str, Any]] = []
         if now_jst.weekday() == 5:
             if (8 * 60) <= mins_now < (8 * 60 + 5) and not self.saturday_0800_cleared:
                 self.saturday_0800_cleared = True
@@ -1427,7 +1440,7 @@ class AutoTraderDaemon:
             if l5_res.get("peak_updated"):
                 self.oco_manager.save_portfolio(pf_now, now_dt=now_jst)
             if l5_res["newly_triggered"]:
-                self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
                 pf_now = self.oco_manager.load_portfolio()
                 for l5_pos in list(pf_now.get("positions", []) or []):
                     if str(l5_pos.get("state", "PROTECTED")).upper() == "DUST_QUARANTINED":
@@ -1621,8 +1634,9 @@ class AutoTraderDaemon:
                 market_summaries=market_summaries,
                 exchange_status=ex_stat_clean or "OPEN",
             )
+            owner_actor = self.remote_control.allowed_owner_discord_id or None
             if jst_mat.get("should_clear_pending_buys") and (pf.get("pending_orders") or []):
-                self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
                 pf = self.oco_manager.load_portfolio()
             radar_eval = self.radar.evaluate_triggers(
                 market_summaries=market_summaries,
@@ -1644,10 +1658,10 @@ class AutoTraderDaemon:
                         f"{campaign_res['phase']}: 運用期限2時間前エントリー凍結中（新規買い停止・AI呼び出しスキップ）"
                     )
 
-            # RISK_OFF_CRASH 検知時は未約定の PENDING_BUY を即時キャンセル
+            # RISK_OFF_CRASH 検知時は未約定の PENDING_BUY を即時キャンセル（取引所 STOP 注文は100%維持）
             regime_info = radar_eval.get("regime_info", {})
             if regime_info.get("should_cancel_pending_buys") and (pf.get("pending_orders") or []):
-                c_res = self.remote_control.cancel_pending_entries_only(actor_id=None, now_dt=now_jst)
+                c_res = self.remote_control.cancel_pending_entries_only(actor_id=owner_actor, now_dt=now_jst)
                 pf = self.oco_manager.load_portfolio()
                 canceled_ids = c_res.get("canceled_buy_order_ids", []) or []
                 if canceled_ids:

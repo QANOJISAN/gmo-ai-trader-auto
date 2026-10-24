@@ -28,7 +28,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, getcontext
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Union
+
+from src.database_wal import connect_forensic_readonly
 
 getcontext().prec = 50
 
@@ -179,6 +182,7 @@ class ForensicTaxAuditor:
                 "comprehensive_spot_pnl_jpy": Decimal("0"),
                 "comprehensive_perp_defi_pnl_jpy": Decimal("0"),
                 "comprehensive_rebate_income_jpy": Decimal("0"),
+                "fee_fraction_refund_jpy": Decimal("0"),
             }
         return self._year_buckets[yr]
 
@@ -473,6 +477,7 @@ class ForensicTaxAuditor:
             "comprehensive_spot_pnl_jpy": bucket["comprehensive_spot_pnl_jpy"],
             "comprehensive_perp_defi_pnl_jpy": bucket["comprehensive_perp_defi_pnl_jpy"],
             "comprehensive_rebate_income_jpy": bucket["comprehensive_rebate_income_jpy"],
+            "fee_fraction_refund_jpy": bucket["fee_fraction_refund_jpy"],
             "separate_20315_taxable_income_jpy": separate_taxable,
             "comprehensive_misc_taxable_income_jpy": comprehensive_taxable,
             "prior_carryforward_used_jpy": prior_cf_used,
@@ -485,6 +490,285 @@ class ForensicTaxAuditor:
             "total_estimated_tax_jpy": estimated_separate_tax + estimated_max_comp_tax,
             "total_income_for_deduction_check_jpy": total_income_for_deduction_check,
             "basis_method_comparison": self.compute_basis_method_comparison(),
+        }
+
+    def record_daily_fee_fraction_refund(
+        self,
+        *,
+        amount_jpy: Union[str, int, float, Decimal],
+        timestamp_jst: Optional[Union[str, int, float, datetime]] = None,
+        venue: str = "GMO_COIN",
+        tax_regime_hint: Optional[str] = None,
+        record_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        毎朝 06:00 JST の GMOコイン手数料端数返金 (`DAILY_FEE_FRACTION_REFUND`) を記録する。
+        - 2027年以前: `COMPREHENSIVE_MISC`（総合課税・雑所得）バケットへ算入。
+        - 2028年以降: 国内登録業者 (`GMO_COIN`) の手数料端数精算として、`SEPARATE_20315` ヒントまたは
+          `rebate_incorporation_mode=True` の場合は `SEPARATE_20315` バケット、それ以外は `COMPREHENSIVE_MISC` へ算入。
+        """
+        dt_jst = _parse_jst(timestamp_jst)
+        tax_year = int(dt_jst.year)
+        venue_up = str(venue or "GMO_COIN").strip().upper()
+        amt_d = _to_dec(amount_jpy)
+        bucket = self._ensure_year_bucket(tax_year)
+        bucket["fee_fraction_refund_jpy"] += amt_d
+
+        is_dom = venue_up in DOMESTIC_REGISTERED_VENUES
+        hint_up = str(tax_regime_hint or "").strip().upper()
+        if tax_year >= 2028 and is_dom and (self.rebate_incorporation_mode or hint_up == "SEPARATE_20315"):
+            tax_cat = TaxCategory.SEPARATE_20315
+            bucket["separate_spot_pnl_jpy"] += amt_d
+        else:
+            tax_cat = TaxCategory.COMPREHENSIVE_MISC
+            bucket["comprehensive_rebate_income_jpy"] += amt_d
+
+        rec_id = record_id or f"refund-{len(self.records) + 1:06d}"
+        rec = AuditedTradeRecord(
+            record_id=rec_id,
+            timestamp_jst=dt_jst.isoformat(timespec="seconds"),
+            tax_year=tax_year,
+            venue=venue_up,
+            asset="JPY",
+            side="REFUND",
+            qty=Decimal("0"),
+            price_jpy=Decimal("1"),
+            gross_jpy=amt_d,
+            fee_jpy=-amt_d,
+            tax_category=tax_cat,
+            realized_pnl_jpy=amt_d if tax_cat == TaxCategory.SEPARATE_20315 else Decimal("0"),
+            rebate_income_jpy=amt_d if tax_cat == TaxCategory.COMPREHENSIVE_MISC else Decimal("0"),
+            moving_unit_cost_after_jpy=Decimal("0"),
+            cost_basis_jpy=Decimal("0"),
+        )
+        self.records.append(rec)
+        return {
+            "record_id": rec_id,
+            "tax_year": tax_year,
+            "venue": venue_up,
+            "tax_category": tax_cat.value,
+            "amount_jpy": amt_d,
+        }
+
+    @classmethod
+    def load_and_audit_from_wal_db(
+        cls,
+        db_path: Union[str, Path],
+        tax_year: Optional[int] = None,
+        rebate_incorporation_mode: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        `v2_state_wal.db` へ Read-Only WAL モード (`?mode=ro`, `PRAGMA query_only=ON;`) で接続し、
+        `v_forensic_tax_ledger` ビューから全税務イベント (`SPOT_TRADE_BUY`, `SPOT_TRADE_CLOSE`,
+        `MAKER_REBATE`, `TAKER_FEE`, `DAILY_FEE_FRACTION_REFUND`) を時系列順にリプレイして
+        `Decimal` 精度で移動平均法・総平均法および2027総合課税 / 2028申告分離課税バケットを監査集計する。
+        """
+        auditor = cls(rebate_incorporation_mode=rebate_incorporation_mode)
+        ro_conn = connect_forensic_readonly(db_path)
+        try:
+            rows = ro_conn.execute(
+                """
+                SELECT * FROM v_forensic_tax_ledger
+                ORDER BY
+                    created_ts_ms ASC,
+                    timestamp_jst ASC,
+                    CASE event_type
+                        WHEN 'SPOT_TRADE_BUY' THEN 1
+                        WHEN 'SPOT_TRADE_CLOSE' THEN 2
+                        WHEN 'MAKER_REBATE' THEN 3
+                        WHEN 'TAKER_FEE' THEN 4
+                        WHEN 'DAILY_FEE_FRACTION_REFUND' THEN 5
+                        ELSE 6
+                    END ASC,
+                    event_id ASC
+                """
+            ).fetchall()
+            ledger_rows = [dict(r) for r in rows]
+        finally:
+            ro_conn.close()
+
+        # `record_execution` が生成する `exec_open_<id>` / `exec_close_<id>` と `rebate_<id>` / `fee_<id>` のペア特定
+        companion_fee_by_exec_id: Dict[str, Decimal] = {}
+        paired_companion_event_ids: Set[str] = set()
+        spot_exec_ids: Set[str] = set()
+
+        for r in ledger_rows:
+            ev_id = str(r.get("event_id", "")).strip()
+            ev_type = str(r.get("event_type", "")).strip().upper()
+            if ev_type in ("SPOT_TRADE_BUY", "SPOT_TRADE_CLOSE"):
+                if ev_id.startswith("exec_open_"):
+                    spot_exec_ids.add(ev_id[len("exec_open_") :])
+                elif ev_id.startswith("exec_close_"):
+                    spot_exec_ids.add(ev_id[len("exec_close_") :])
+
+        for r in ledger_rows:
+            ev_id = str(r.get("event_id", "")).strip()
+            ev_type = str(r.get("event_type", "")).strip().upper()
+            if ev_type == "MAKER_REBATE" and ev_id.startswith("rebate_"):
+                ex_id = ev_id[len("rebate_") :]
+                if ex_id in spot_exec_ids:
+                    paired_companion_event_ids.add(ev_id)
+                    companion_fee_by_exec_id[ex_id] = -abs(_to_dec(r.get("fee_or_rebate_jpy", 0)))
+            elif ev_type == "TAKER_FEE" and ev_id.startswith("fee_"):
+                ex_id = ev_id[len("fee_") :]
+                if ex_id in spot_exec_ids:
+                    paired_companion_event_ids.add(ev_id)
+                    companion_fee_by_exec_id[ex_id] = abs(
+                        _to_dec(r.get("cost_basis_jpy") or r.get("fee_or_rebate_jpy") or 0)
+                    )
+
+        event_type_counts: Dict[str, int] = {}
+        current_year: Optional[int] = None
+
+        for r in ledger_rows:
+            ev_id = str(r.get("event_id", "")).strip()
+            ev_type = str(r.get("event_type", "")).strip().upper()
+            row_yr = int(r.get("tax_year") or _parse_jst(r.get("timestamp_jst")).year)
+            event_type_counts[ev_type] = event_type_counts.get(ev_type, 0) + 1
+
+            if current_year is None:
+                current_year = row_yr
+                auditor._ensure_year_bucket(current_year)
+            elif row_yr > current_year:
+                for yr_step in range(current_year + 1, row_yr + 1):
+                    auditor.rollover_tax_year(yr_step)
+                current_year = row_yr
+
+            ex_reg = str(r.get("exchange_registration", "JP_FSA_REGISTERED_GMO")).strip().upper()
+            venue = "GMO_COIN" if ("GMO" in ex_reg or "FSA" in ex_reg) else ex_reg
+            sym = str(r.get("symbol", "BTC")).strip().upper()
+            ts_jst = r.get("timestamp_jst")
+            qty_d = _to_dec(r.get("size", 0))
+            price_d = _to_dec(r.get("price_jpy", 0))
+            gross_d = _to_dec(r.get("gross_proceeds_jpy", 0))
+            cost_d = _to_dec(r.get("cost_basis_jpy", 0))
+            fee_or_rebate_d = _to_dec(r.get("fee_or_rebate_jpy", 0))
+            realized_d = _to_dec(r.get("realized_pnl_jpy", 0))
+
+            if ev_type == "SPOT_TRADE_BUY":
+                ex_id = ev_id[len("exec_open_") :] if ev_id.startswith("exec_open_") else ""
+                if fee_or_rebate_d != Decimal("0"):
+                    fee_jpy_val = -fee_or_rebate_d
+                elif ex_id and ex_id in companion_fee_by_exec_id:
+                    fee_jpy_val = companion_fee_by_exec_id[ex_id]
+                else:
+                    fee_jpy_val = Decimal("0")
+
+                if qty_d > Decimal("0") and price_d > Decimal("0"):
+                    auditor.record_spot_fill(
+                        venue=venue,
+                        asset=sym,
+                        side="BUY",
+                        qty=qty_d,
+                        price_jpy=price_d,
+                        fee_jpy=fee_jpy_val,
+                        timestamp_jst=ts_jst,
+                        record_id=ev_id,
+                    )
+
+            elif ev_type == "SPOT_TRADE_CLOSE":
+                ex_id = ev_id[len("exec_close_") :] if ev_id.startswith("exec_close_") else ""
+                if fee_or_rebate_d != Decimal("0"):
+                    fee_jpy_val = -fee_or_rebate_d
+                elif ex_id and ex_id in companion_fee_by_exec_id:
+                    fee_jpy_val = companion_fee_by_exec_id[ex_id]
+                else:
+                    fee_jpy_val = Decimal("0")
+
+                pool = auditor.get_pool(sym)
+                if qty_d > Decimal("0") and price_d <= Decimal("0") and gross_d > Decimal("0"):
+                    price_d = gross_d / qty_d
+
+                if qty_d > Decimal("0") and price_d > Decimal("0"):
+                    # もし単独の SPOT_TRADE_CLOSE イベントで先行する BUY プール数量が不足している場合は、
+                    # イベントに記録された cost_basis_jpy (または gross - realized) から期首/先行取得原価を補完する
+                    if pool.moving_qty < qty_d:
+                        missing_qty = qty_d - pool.moving_qty
+                        inferred_total_cost = cost_d if cost_d > Decimal("0") else max(Decimal("0"), gross_d - realized_d)
+                        missing_cost = max(Decimal("0"), inferred_total_cost - pool.moving_cost_jpy)
+                        pool.moving_qty += missing_qty
+                        pool.moving_cost_jpy += missing_cost
+                        pool.year_buy_qty += missing_qty
+                        pool.year_buy_cost_jpy += missing_cost
+
+                    auditor.record_spot_fill(
+                        venue=venue,
+                        asset=sym,
+                        side="SELL",
+                        qty=qty_d,
+                        price_jpy=price_d,
+                        fee_jpy=fee_jpy_val,
+                        timestamp_jst=ts_jst,
+                        record_id=ev_id,
+                    )
+                else:
+                    # 数量を持たないサマリー型 SPOT_TRADE_CLOSE レコードの場合
+                    bucket = auditor._ensure_year_bucket(row_yr)
+                    is_dom = venue in DOMESTIC_REGISTERED_VENUES
+                    if row_yr >= 2028 and is_dom:
+                        bucket["separate_spot_pnl_jpy"] += realized_d
+                    else:
+                        bucket["comprehensive_spot_pnl_jpy"] += realized_d
+
+            elif ev_type == "MAKER_REBATE":
+                if ev_id in paired_companion_event_ids:
+                    continue
+                reb_amt = abs(fee_or_rebate_d if fee_or_rebate_d != Decimal("0") else realized_d)
+                bucket = auditor._ensure_year_bucket(row_yr)
+                is_dom = venue in DOMESTIC_REGISTERED_VENUES
+                if auditor.rebate_incorporation_mode and row_yr >= 2028 and is_dom:
+                    bucket["separate_spot_pnl_jpy"] += reb_amt
+                else:
+                    bucket["comprehensive_rebate_income_jpy"] += reb_amt
+
+            elif ev_type == "TAKER_FEE":
+                if ev_id in paired_companion_event_ids:
+                    continue
+                fee_amt = abs(cost_d if cost_d != Decimal("0") else (fee_or_rebate_d if fee_or_rebate_d != Decimal("0") else realized_d))
+                bucket = auditor._ensure_year_bucket(row_yr)
+                is_dom = venue in DOMESTIC_REGISTERED_VENUES
+                if row_yr >= 2028 and is_dom:
+                    bucket["separate_spot_pnl_jpy"] -= fee_amt
+                else:
+                    bucket["comprehensive_spot_pnl_jpy"] -= fee_amt
+
+            elif ev_type == "DAILY_FEE_FRACTION_REFUND":
+                refund_amt = realized_d if realized_d != Decimal("0") else fee_or_rebate_d
+                auditor.record_daily_fee_fraction_refund(
+                    amount_jpy=refund_amt,
+                    timestamp_jst=ts_jst,
+                    venue=venue,
+                    tax_regime_hint=str(r.get("tax_regime", "")),
+                    record_id=ev_id,
+                )
+
+        years_present = sorted(auditor._year_buckets.keys())
+        if tax_year is not None and int(tax_year) not in auditor._year_buckets:
+            auditor._ensure_year_bucket(int(tax_year))
+            years_present = sorted(auditor._year_buckets.keys())
+
+        summaries_by_year: Dict[int, Dict[str, Any]] = {}
+        running_cf = Decimal("0")
+        for yr in years_present:
+            yr_sum = auditor.audit_year_summary(yr, prior_separate_loss_carryforward_jpy=running_cf)
+            summaries_by_year[yr] = yr_sum
+            if yr >= 2028:
+                running_cf = yr_sum["prior_carryforward_remaining_jpy"] + yr_sum["carryforward_loss_3yr_jpy"]
+
+        target_yr = int(tax_year) if tax_year is not None else (years_present[-1] if years_present else datetime.now(JST).year)
+        target_summary = summaries_by_year.get(target_yr) or auditor.audit_year_summary(target_yr)
+
+        return {
+            "auditor": auditor,
+            "db_path": str(db_path),
+            "readonly_verified": True,
+            "events_processed": len(ledger_rows),
+            "event_type_counts": event_type_counts,
+            "years_present": years_present,
+            "tax_year": target_yr,
+            "summary": target_summary,
+            "summaries_by_year": summaries_by_year,
+            "basis_method_comparison": auditor.compute_basis_method_comparison(),
         }
 
     def evaluate_2027_year_end_tax_harvesting(
@@ -555,3 +839,19 @@ class ForensicTaxAuditor:
             "gmo_gain_positions": gmo_gain_positions,
             "alerts": alerts,
         }
+
+
+def load_and_audit_from_wal_db(
+    db_path: Union[str, Path],
+    tax_year: Optional[int] = None,
+    rebate_incorporation_mode: bool = False,
+) -> Dict[str, Any]:
+    """
+    `ForensicTaxAuditor.load_and_audit_from_wal_db` のモジュールレベル・ブリッジ関数。
+    """
+    return ForensicTaxAuditor.load_and_audit_from_wal_db(
+        db_path=db_path,
+        tax_year=tax_year,
+        rebate_incorporation_mode=rebate_incorporation_mode,
+    )
+

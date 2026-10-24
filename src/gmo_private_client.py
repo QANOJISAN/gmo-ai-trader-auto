@@ -1275,8 +1275,11 @@ class PaperBroker:
         public_client: Optional[GMOPublicClient] = None,
         wal_db: Optional[DatabaseWAL] = None,
     ) -> None:
-        self.paper_orders_path = Path(paper_orders_path)
         self.portfolio_path = Path(portfolio_path)
+        if paper_orders_path == "paper_orders.json" and self.portfolio_path != Path("portfolio.json"):
+            self.paper_orders_path = self.portfolio_path.parent / "paper_orders.json"
+        else:
+            self.paper_orders_path = Path(paper_orders_path)
         self.public_client = public_client
         self.wal_db = wal_db
         self.clock_offset_ms: int = 0
@@ -1295,10 +1298,45 @@ class PaperBroker:
 
     def _ensure_state_file(self) -> Dict[str, Any]:
         if not self.paper_orders_path.exists():
+            seeded_orders: List[Dict[str, Any]] = []
+            next_oid = 9100000001
+            if self.portfolio_path.exists():
+                try:
+                    pf_seed = load_json_file(self.portfolio_path)
+                    if isinstance(pf_seed, dict):
+                        for pos in pf_seed.get("positions", []) or []:
+                            if not isinstance(pos, dict):
+                                continue
+                            sl_oid = str(pos.get("sl_order_id", "") or "").strip()
+                            if not sl_oid:
+                                continue
+                            sym_s = str(pos.get("symbol", "") or "").strip().upper()
+                            sl_px = str(pos.get("stop_loss_price", 0) or 0)
+                            sz_s = str(pos.get("size", 0) or 0)
+                            seeded_orders.append(
+                                {
+                                    "order_id": sl_oid,
+                                    "symbol": sym_s,
+                                    "side": "SELL",
+                                    "execution_type": "STOP",
+                                    "settle_type": "OPEN",
+                                    "price": sl_px,
+                                    "size": sz_s,
+                                    "executed_size": "0",
+                                    "status": "WAITING",
+                                    "time_in_force": "FAS",
+                                    "losscut_price": sl_px,
+                                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                                }
+                            )
+                            if sl_oid.isdigit():
+                                next_oid = max(next_oid, int(sl_oid) + 1)
+                except Exception:
+                    pass
             init_state = {
-                "next_order_id": 9100000001,
+                "next_order_id": next_oid,
                 "next_execution_id": 7100000001,
-                "orders": [],
+                "orders": seeded_orders,
                 "executions": [],
             }
             write_json_file(self.paper_orders_path, init_state)
