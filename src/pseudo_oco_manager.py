@@ -30,7 +30,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from src.database_wal import DatabaseWAL
+from src.database_wal import DatabaseWAL, classify_jp_crypto_tax_regime
 from src.gmo_private_client import (
     GMOPrivateAPIError,
     GMOPrivateClient,
@@ -2552,6 +2552,7 @@ class PseudoOCOManager:
         pf["realized_pnl_total_jpy"] = new_realized
         pf["total_realized_pnl_jpy"] = new_realized
 
+        tax_meta = classify_jp_crypto_tax_regime(now_jst, realized_pnl_jpy=pnl_jpy)
         closed_record = {
             "symbol": sym,
             "size": float(size_d),
@@ -2567,11 +2568,36 @@ class PseudoOCOManager:
             "exit_order_id": str(exit_order_id),
             "opened_at": str(pos.get("opened_at", "")),
             "closed_at": now_jst.isoformat(timespec="seconds"),
+            "tax_year": tax_meta["tax_year"],
+            "tax_regime": tax_meta["tax_regime"],
+            "effective_tax_rate": tax_meta["effective_tax_rate"],
+            "loss_carryforward_years": tax_meta["loss_carryforward_years"],
+            "exchange_registration": tax_meta["exchange_registration"],
+            "estimated_tax_jpy": tax_meta["estimated_tax_jpy"],
+            "after_tax_net_pnl_jpy": tax_meta["after_tax_net_pnl_jpy"],
         }
         pf.setdefault("closed_trades", []).append(closed_record)
         if self.wal_db is not None:
             ts_ms = int(now_jst.timestamp() * 1000)
             e_oid = str(exit_order_id or f"close_{sym}_{ts_ms}")
+            try:
+                self.wal_db.record_tax_ledger_event(
+                    event_id=f"trade_close_{e_oid}_{ts_ms}",
+                    symbol=sym,
+                    event_type="SPOT_TRADE_CLOSE",
+                    side="SELL",
+                    size=float(size_d),
+                    price_jpy=float(exit_d),
+                    gross_proceeds_jpy=float(net_proceeds_jpy),
+                    cost_basis_jpy=float(cost_jpy_d),
+                    fee_or_rebate_jpy=float(-exit_fee_d),
+                    realized_pnl_jpy=float(pnl_jpy),
+                    source_order_id=e_oid,
+                    timestamp_jst=now_jst,
+                    now_ts_ms=ts_ms,
+                )
+            except Exception as tax_exc:
+                logger.debug("record_tax_ledger_event スキップ: %s", tax_exc)
             if exit_order_id and exit_order_id != "ALREADY_FILLED_OR_DUST":
                 self.wal_db.upsert_order(
                     order_id=e_oid,

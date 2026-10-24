@@ -136,6 +136,119 @@ class AppendOnlyViolationError(RuntimeError):
     """Append-Only テーブル (`executions`) の UPDATE / DELETE が試みられた場合の例外"""
 
 
+def classify_jp_crypto_tax_regime(
+    ts_jst: Optional[Union[str, int, float, datetime]] = None,
+    realized_pnl_jpy: Union[int, float, Decimal] = 0.0,
+) -> Dict[str, Any]:
+    """
+    日本国内暗号資産税制の年度別区分（2027年以前 vs 2028年1月1日以降の申告分離課税移行）を判定する。
+
+    - `<= 2027-12-31 23:59:59 JST` (`tax_year <= 2027`):
+      * `tax_regime = "AGGREGATE_MISC"`（総合課税・雑所得）
+      * `effective_tax_rate = 0.55945`（最高実効税率想定値 55.945%）
+      * `loss_carryforward_years = 0`（損失繰越控除なし）
+    - `>= 2028-01-01 00:00:00 JST` (`tax_year >= 2028`):
+      * `tax_regime = "SEPARATE_20315"`（国内金融庁登録業者 GMOコイン `JP_FSA_REGISTERED_GMO` における特定暗号資産現物・申告分離課税）
+      * `effective_tax_rate = 0.20315`（20.315%: 所得税 15% + 復興特別所得税 0.315% + 住民税 5%）
+      * `loss_carryforward_years = 3`（損失繰越控除 3年間）
+    """
+    if ts_jst is None:
+        dt_jst = datetime.now(JST)
+    elif isinstance(ts_jst, datetime):
+        dt_jst = ts_jst.replace(tzinfo=JST) if ts_jst.tzinfo is None else ts_jst.astimezone(JST)
+    elif isinstance(ts_jst, (int, float)):
+        # ミリ秒または秒のUNIXタイムスタンプ判定
+        ts_val = float(ts_jst)
+        if ts_val > 1e11:
+            ts_val /= 1000.0
+        dt_jst = datetime.fromtimestamp(ts_val, tz=JST)
+    else:
+        raw_str = str(ts_jst).strip()
+        try:
+            parsed = datetime.fromisoformat(raw_str.replace("Z", "+00:00"))
+            dt_jst = parsed.replace(tzinfo=JST) if parsed.tzinfo is None else parsed.astimezone(JST)
+        except Exception:
+            dt_jst = datetime.now(JST)
+
+    tax_year = int(dt_jst.year)
+    if tax_year >= 2028:
+        tax_regime = "SEPARATE_20315"
+        effective_tax_rate = 0.20315
+        loss_carryforward_years = 3
+    else:
+        tax_regime = "AGGREGATE_MISC"
+        effective_tax_rate = 0.55945
+        loss_carryforward_years = 0
+
+    pnl_val = float(realized_pnl_jpy or 0.0)
+    if pnl_val > 0.0:
+        estimated_tax_jpy = round(pnl_val * effective_tax_rate, 2)
+    else:
+        estimated_tax_jpy = 0.0
+    after_tax_net_pnl_jpy = round(pnl_val - estimated_tax_jpy, 2)
+    carryforward_loss_jpy = round(abs(pnl_val), 2) if (pnl_val < 0.0 and loss_carryforward_years > 0) else 0.0
+
+    return {
+        "timestamp_jst": dt_jst.isoformat(timespec="seconds"),
+        "tax_year": tax_year,
+        "tax_regime": tax_regime,
+        "effective_tax_rate": effective_tax_rate,
+        "loss_carryforward_years": loss_carryforward_years,
+        "exchange_registration": "JP_FSA_REGISTERED_GMO",
+        "is_specified_crypto_spot": True,
+        "realized_pnl_jpy": round(pnl_val, 2),
+        "estimated_tax_jpy": estimated_tax_jpy,
+        "after_tax_net_pnl_jpy": after_tax_net_pnl_jpy,
+        "carryforward_loss_jpy": carryforward_loss_jpy,
+    }
+
+
+def connect_forensic_readonly(db_path: Union[str, Path]) -> sqlite3.Connection:
+    """
+    外部の税務・監査アプリ（`Forensic Ledger` 等）から `v2_state_wal.db` を
+    ロック競合ゼロ・書き込み完全禁止で読み取るための Read-Only WAL 共有バス接続ヘルパー。
+    - `file:.../v2_state_wal.db?mode=ro` (`uri=True`)
+    - `PRAGMA query_only=ON;`
+    - `PRAGMA busy_timeout=5000;`
+    - `PRAGMA temp_store=MEMORY;`
+    - `PRAGMA mmap_size=268435456;`
+    """
+    posix_path = Path(db_path).resolve().as_posix()
+    uri = f"file:{posix_path}?mode=ro"
+    conn = sqlite3.connect(
+        uri,
+        uri=True,
+        timeout=5.0,
+        isolation_level=None,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA query_only=ON;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA mmap_size=268435456;")
+    return conn
+
+
+def _apply_high_availability_wal_pragmas(conn: sqlite3.Connection) -> None:
+    """
+    高可用性 SQLite WAL PRAGMA 6項目＋外部キー制約を接続へ標準適用する:
+    1. `PRAGMA journal_mode=WAL;`
+    2. `PRAGMA synchronous=NORMAL;`
+    3. `PRAGMA busy_timeout=5000;`
+    4. `PRAGMA temp_store=MEMORY;`
+    5. `PRAGMA mmap_size=268435456;`
+    6. `PRAGMA wal_autocheckpoint=1000;`
+    """
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA busy_timeout=5000;")
+    conn.execute("PRAGMA temp_store=MEMORY;")
+    conn.execute("PRAGMA mmap_size=268435456;")
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")
+    conn.execute("PRAGMA foreign_keys=ON;")
+
+
 class _WalSessionLock:
     """
     `with self._lock:` の最外層ブロック開始時に SQLite 接続を開き、
@@ -158,9 +271,7 @@ class _WalSessionLock:
                 check_same_thread=False,
             )
             conn.row_factory = sqlite3.Row
-            conn.execute("PRAGMA synchronous=FULL;")
-            conn.execute("PRAGMA busy_timeout=5000;")
-            conn.execute("PRAGMA foreign_keys=ON;")
+            _apply_high_availability_wal_pragmas(conn)
             self._owner._conn = conn
         return self
 
@@ -208,10 +319,7 @@ class DatabaseWAL:
     def _initialize_pragmas_and_schema(self) -> None:
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute("PRAGMA journal_mode=WAL;")
-            cur.execute("PRAGMA synchronous=FULL;")
-            cur.execute("PRAGMA busy_timeout=5000;")
-            cur.execute("PRAGMA foreign_keys=ON;")
+            _apply_high_availability_wal_pragmas(self._conn)
 
             cur.executescript(
                 """
@@ -326,6 +434,57 @@ class DatabaseWAL:
                 FROM executions
                 GROUP BY tax_year, symbol;
 
+                CREATE TABLE IF NOT EXISTS tax_ledger_events (
+                    event_id TEXT PRIMARY KEY,
+                    timestamp_jst TEXT NOT NULL,
+                    tax_year INTEGER NOT NULL,
+                    tax_regime TEXT NOT NULL CHECK(tax_regime IN ('AGGREGATE_MISC', 'SEPARATE_20315')),
+                    effective_tax_rate REAL NOT NULL,
+                    loss_carryforward_years INTEGER NOT NULL DEFAULT 0,
+                    exchange_registration TEXT NOT NULL DEFAULT 'JP_FSA_REGISTERED_GMO',
+                    symbol TEXT NOT NULL DEFAULT 'JPY',
+                    event_type TEXT NOT NULL,
+                    side TEXT NOT NULL DEFAULT '',
+                    size REAL NOT NULL DEFAULT 0.0,
+                    price_jpy REAL NOT NULL DEFAULT 0.0,
+                    gross_proceeds_jpy REAL NOT NULL DEFAULT 0.0,
+                    cost_basis_jpy REAL NOT NULL DEFAULT 0.0,
+                    fee_or_rebate_jpy REAL NOT NULL DEFAULT 0.0,
+                    realized_pnl_jpy REAL NOT NULL DEFAULT 0.0,
+                    estimated_tax_jpy REAL NOT NULL DEFAULT 0.0,
+                    after_tax_net_pnl_jpy REAL NOT NULL DEFAULT 0.0,
+                    source_order_id TEXT NOT NULL DEFAULT '',
+                    created_ts_ms INTEGER NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tax_ledger_events_year_regime
+                ON tax_ledger_events (tax_year, tax_regime, symbol);
+
+                CREATE VIEW IF NOT EXISTS v_forensic_tax_ledger AS
+                SELECT
+                    event_id,
+                    timestamp_jst,
+                    tax_year,
+                    tax_regime,
+                    effective_tax_rate,
+                    loss_carryforward_years,
+                    exchange_registration,
+                    symbol,
+                    event_type,
+                    side,
+                    size,
+                    price_jpy,
+                    gross_proceeds_jpy,
+                    cost_basis_jpy,
+                    fee_or_rebate_jpy,
+                    realized_pnl_jpy,
+                    estimated_tax_jpy,
+                    after_tax_net_pnl_jpy,
+                    source_order_id,
+                    created_ts_ms
+                FROM tax_ledger_events
+                ORDER BY created_ts_ms ASC, event_id ASC;
+
                 CREATE TABLE IF NOT EXISTS fee_adjustments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     business_date TEXT UNIQUE NOT NULL,
@@ -400,13 +559,31 @@ class DatabaseWAL:
         with self._lock:
             cur = self._conn.cursor()
             jm = cur.execute("PRAGMA journal_mode;").fetchone()[0]
-            sync = cur.execute("PRAGMA synchronous;").fetchone()[0]
-            bt = cur.execute("PRAGMA busy_timeout;").fetchone()[0]
+            sync = int(cur.execute("PRAGMA synchronous;").fetchone()[0])
+            bt = int(cur.execute("PRAGMA busy_timeout;").fetchone()[0])
+            ts = int(cur.execute("PRAGMA temp_store;").fetchone()[0])
+            mmap_row = cur.execute("PRAGMA mmap_size;").fetchone()
+            mmap_val = int(mmap_row[0]) if mmap_row else 0
+            autockp = int(cur.execute("PRAGMA wal_autocheckpoint;").fetchone()[0])
+            sync_names = {0: "OFF", 1: "NORMAL", 2: "FULL", 3: "EXTRA"}
+            ts_names = {0: "DEFAULT", 1: "FILE", 2: "MEMORY"}
             return {
                 "journal_mode": str(jm).upper(),
-                "synchronous": int(sync),
-                "busy_timeout": int(bt),
+                "synchronous": sync,
+                "synchronous_name": sync_names.get(sync, str(sync)),
+                "busy_timeout": bt,
+                "temp_store": ts,
+                "temp_store_name": ts_names.get(ts, str(ts)),
+                "mmap_size": mmap_val,
+                "wal_autocheckpoint": autockp,
             }
+
+    def connect_forensic_readonly(self) -> sqlite3.Connection:
+        """
+        `Forensic Ledger` 等の外部税務・監査システムが `v2_state_wal.db` を
+        ロック競合ゼロ・書き込み完全禁止 (`mode=ro`, `PRAGMA query_only=ON;`) で読み取るための接続を返す。
+        """
+        return connect_forensic_readonly(self.db_path)
 
     def checkpoint_wal(self, mode: str = "PASSIVE") -> Dict[str, Any]:
         """SQLite WAL チェックポイントを実行し、WAL ファイル (`.db-wal`) の肥大化を防止する"""
@@ -871,6 +1048,79 @@ class DatabaseWAL:
                             ts_ms,
                         ),
                     )
+                    # Forensic Ledger 共有バス (`tax_ledger_events`) への自動記録
+                    if side_up == "SELL":
+                        tax_meta_sell = classify_jp_crypto_tax_regime(dt_jst, realized_pnl_jpy=realized_b)
+                        self._insert_tax_ledger_event_unlocked(
+                            event_id=f"exec_close_{exec_id}",
+                            timestamp_jst=tax_meta_sell["timestamp_jst"],
+                            tax_year=tax_meta_sell["tax_year"],
+                            tax_regime=tax_meta_sell["tax_regime"],
+                            effective_tax_rate=tax_meta_sell["effective_tax_rate"],
+                            loss_carryforward_years=tax_meta_sell["loss_carryforward_years"],
+                            exchange_registration=tax_meta_sell["exchange_registration"],
+                            symbol=sym,
+                            event_type="SPOT_TRADE_CLOSE",
+                            side=side_up,
+                            size=float(size_d),
+                            price_jpy=float(price_d),
+                            gross_proceeds_jpy=float(gross_jpy),
+                            cost_basis_jpy=float(abs(delta_b)),
+                            fee_or_rebate_jpy=float(maker_rebate_jpy - taker_fee_jpy),
+                            realized_pnl_jpy=float(realized_b),
+                            estimated_tax_jpy=tax_meta_sell["estimated_tax_jpy"],
+                            after_tax_net_pnl_jpy=tax_meta_sell["after_tax_net_pnl_jpy"],
+                            source_order_id=oid,
+                            created_ts_ms=ts_ms,
+                        )
+                    if maker_rebate_jpy > 0:
+                        tax_meta_reb = classify_jp_crypto_tax_regime(dt_jst, realized_pnl_jpy=maker_rebate_jpy)
+                        self._insert_tax_ledger_event_unlocked(
+                            event_id=f"rebate_{exec_id}",
+                            timestamp_jst=tax_meta_reb["timestamp_jst"],
+                            tax_year=tax_meta_reb["tax_year"],
+                            tax_regime=tax_meta_reb["tax_regime"],
+                            effective_tax_rate=tax_meta_reb["effective_tax_rate"],
+                            loss_carryforward_years=tax_meta_reb["loss_carryforward_years"],
+                            exchange_registration=tax_meta_reb["exchange_registration"],
+                            symbol=sym,
+                            event_type="MAKER_REBATE",
+                            side=side_up,
+                            size=float(size_d),
+                            price_jpy=float(price_d),
+                            gross_proceeds_jpy=float(maker_rebate_jpy),
+                            cost_basis_jpy=0.0,
+                            fee_or_rebate_jpy=float(maker_rebate_jpy),
+                            realized_pnl_jpy=float(maker_rebate_jpy),
+                            estimated_tax_jpy=tax_meta_reb["estimated_tax_jpy"],
+                            after_tax_net_pnl_jpy=tax_meta_reb["after_tax_net_pnl_jpy"],
+                            source_order_id=oid,
+                            created_ts_ms=ts_ms,
+                        )
+                    elif taker_fee_jpy > 0:
+                        tax_meta_fee = classify_jp_crypto_tax_regime(dt_jst, realized_pnl_jpy=-taker_fee_jpy)
+                        self._insert_tax_ledger_event_unlocked(
+                            event_id=f"fee_{exec_id}",
+                            timestamp_jst=tax_meta_fee["timestamp_jst"],
+                            tax_year=tax_meta_fee["tax_year"],
+                            tax_regime=tax_meta_fee["tax_regime"],
+                            effective_tax_rate=tax_meta_fee["effective_tax_rate"],
+                            loss_carryforward_years=tax_meta_fee["loss_carryforward_years"],
+                            exchange_registration=tax_meta_fee["exchange_registration"],
+                            symbol=sym,
+                            event_type="TAKER_FEE",
+                            side=side_up,
+                            size=float(size_d),
+                            price_jpy=float(price_d),
+                            gross_proceeds_jpy=0.0,
+                            cost_basis_jpy=float(taker_fee_jpy),
+                            fee_or_rebate_jpy=float(-taker_fee_jpy),
+                            realized_pnl_jpy=float(-taker_fee_jpy),
+                            estimated_tax_jpy=0.0,
+                            after_tax_net_pnl_jpy=float(-taker_fee_jpy),
+                            source_order_id=oid,
+                            created_ts_ms=ts_ms,
+                        )
                 self._conn.execute("COMMIT;")
                 self._write_count += 1
                 if self._write_count % 100 == 0:
@@ -887,6 +1137,167 @@ class DatabaseWAL:
                 (exec_id,),
             ).fetchone()
             return True, dict(inserted_row) if inserted_row else None
+
+    def _insert_tax_ledger_event_unlocked(
+        self,
+        event_id: str,
+        timestamp_jst: str,
+        tax_year: int,
+        tax_regime: str,
+        effective_tax_rate: float,
+        loss_carryforward_years: int,
+        exchange_registration: str,
+        symbol: str,
+        event_type: str,
+        side: str,
+        size: float,
+        price_jpy: float,
+        gross_proceeds_jpy: float,
+        cost_basis_jpy: float,
+        fee_or_rebate_jpy: float,
+        realized_pnl_jpy: float,
+        estimated_tax_jpy: float,
+        after_tax_net_pnl_jpy: float,
+        source_order_id: str,
+        created_ts_ms: int,
+    ) -> bool:
+        cur = self._conn.execute(
+            """
+            INSERT OR REPLACE INTO tax_ledger_events (
+                event_id, timestamp_jst, tax_year, tax_regime, effective_tax_rate,
+                loss_carryforward_years, exchange_registration, symbol, event_type, side,
+                size, price_jpy, gross_proceeds_jpy, cost_basis_jpy, fee_or_rebate_jpy,
+                realized_pnl_jpy, estimated_tax_jpy, after_tax_net_pnl_jpy, source_order_id, created_ts_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(event_id).strip(),
+                str(timestamp_jst).strip(),
+                int(tax_year),
+                str(tax_regime).strip().upper(),
+                float(effective_tax_rate),
+                int(loss_carryforward_years),
+                str(exchange_registration or "JP_FSA_REGISTERED_GMO").strip(),
+                str(symbol or "JPY").strip().upper(),
+                str(event_type or "SPOT_TRADE_CLOSE").strip().upper(),
+                str(side or "").strip().upper(),
+                float(size or 0.0),
+                float(price_jpy or 0.0),
+                float(gross_proceeds_jpy or 0.0),
+                float(cost_basis_jpy or 0.0),
+                float(fee_or_rebate_jpy or 0.0),
+                float(realized_pnl_jpy or 0.0),
+                float(estimated_tax_jpy or 0.0),
+                float(after_tax_net_pnl_jpy or 0.0),
+                str(source_order_id or "").strip(),
+                int(created_ts_ms),
+            ),
+        )
+        return cur.rowcount > 0
+
+    def record_tax_ledger_event(
+        self,
+        event_id: str,
+        symbol: str,
+        event_type: str = "SPOT_TRADE_CLOSE",
+        side: str = "SELL",
+        size: Union[int, float, Decimal] = 0.0,
+        price_jpy: Union[int, float, Decimal] = 0.0,
+        gross_proceeds_jpy: Union[int, float, Decimal] = 0.0,
+        cost_basis_jpy: Union[int, float, Decimal] = 0.0,
+        fee_or_rebate_jpy: Union[int, float, Decimal] = 0.0,
+        realized_pnl_jpy: Union[int, float, Decimal] = 0.0,
+        source_order_id: str = "",
+        timestamp_jst: Optional[Union[str, int, float, datetime]] = None,
+        now_ts_ms: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        2027年以前（`AGGREGATE_MISC`, `55.945%`, 繰越0年）および
+        2028年1月1日以降（`SEPARATE_20315`, `20.315%`, 損失繰越3年, `JP_FSA_REGISTERED_GMO`）の税務メタデータを付与し、
+        `tax_ledger_events` テーブル（`v_forensic_tax_ledger` ビュー）へ記録する。
+        """
+        tax_meta = classify_jp_crypto_tax_regime(
+            ts_jst=timestamp_jst if timestamp_jst is not None else now_ts_ms,
+            realized_pnl_jpy=realized_pnl_jpy,
+        )
+        dt_parsed = datetime.fromisoformat(tax_meta["timestamp_jst"])
+        ts = int(now_ts_ms if now_ts_ms is not None else dt_parsed.timestamp() * 1000)
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE;")
+            try:
+                self._insert_tax_ledger_event_unlocked(
+                    event_id=event_id,
+                    timestamp_jst=tax_meta["timestamp_jst"],
+                    tax_year=tax_meta["tax_year"],
+                    tax_regime=tax_meta["tax_regime"],
+                    effective_tax_rate=tax_meta["effective_tax_rate"],
+                    loss_carryforward_years=tax_meta["loss_carryforward_years"],
+                    exchange_registration=tax_meta["exchange_registration"],
+                    symbol=symbol,
+                    event_type=event_type,
+                    side=side,
+                    size=float(size or 0.0),
+                    price_jpy=float(price_jpy or 0.0),
+                    gross_proceeds_jpy=float(gross_proceeds_jpy or 0.0),
+                    cost_basis_jpy=float(cost_basis_jpy or 0.0),
+                    fee_or_rebate_jpy=float(fee_or_rebate_jpy or 0.0),
+                    realized_pnl_jpy=tax_meta["realized_pnl_jpy"],
+                    estimated_tax_jpy=tax_meta["estimated_tax_jpy"],
+                    after_tax_net_pnl_jpy=tax_meta["after_tax_net_pnl_jpy"],
+                    source_order_id=source_order_id,
+                    created_ts_ms=ts,
+                )
+                self._conn.execute("COMMIT;")
+            except Exception:
+                self._conn.execute("ROLLBACK;")
+                raise
+
+        return {
+            "event_id": str(event_id),
+            **tax_meta,
+            "symbol": str(symbol).strip().upper(),
+            "event_type": str(event_type).strip().upper(),
+            "side": str(side).strip().upper(),
+            "size": float(size or 0.0),
+            "price_jpy": float(price_jpy or 0.0),
+            "gross_proceeds_jpy": float(gross_proceeds_jpy or 0.0),
+            "cost_basis_jpy": float(cost_basis_jpy or 0.0),
+            "fee_or_rebate_jpy": float(fee_or_rebate_jpy or 0.0),
+            "source_order_id": str(source_order_id or ""),
+            "created_ts_ms": ts,
+        }
+
+    def query_forensic_tax_ledger(
+        self,
+        tax_year: Optional[int] = None,
+        tax_regime: Optional[str] = None,
+        event_type: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Read-Only WAL 共有バス (`connect_forensic_readonly`) 経由で `v_forensic_tax_ledger` を照会する。
+        """
+        ro_conn = self.connect_forensic_readonly()
+        try:
+            clauses: List[str] = []
+            params: List[Any] = []
+            if tax_year is not None:
+                clauses.append("tax_year = ?")
+                params.append(int(tax_year))
+            if tax_regime:
+                clauses.append("tax_regime = ?")
+                params.append(str(tax_regime).strip().upper())
+            if event_type:
+                clauses.append("event_type = ?")
+                params.append(str(event_type).strip().upper())
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = ro_conn.execute(
+                f"SELECT * FROM v_forensic_tax_ledger {where_sql} ORDER BY created_ts_ms ASC, event_id ASC",
+                tuple(params),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            ro_conn.close()
 
     def has_execution_for_order(self, order_id: Union[str, int]) -> bool:
         """指定された `order_id` に紐づく約定レコードが既に `executions` テーブルに存在するか確認する"""
@@ -961,14 +1372,26 @@ class DatabaseWAL:
     # ------------------------------------------------------------------
     def record_fee_adjustment(
         self,
-        business_date: str,
-        delta_jpy: int,
-        jpy_balance_before: int,
-        jpy_balance_after: int,
+        business_date: str = "",
+        delta_jpy: int = 0,
+        jpy_balance_before: int = 0,
+        jpy_balance_after: int = 0,
         reason: str = "FEE_REFUND_ADJUSTMENT",
         now_ts_ms: Optional[int] = None,
+        date_str: Optional[str] = None,
+        amount_jpy: Optional[int] = None,
+        note: Optional[str] = None,
     ) -> bool:
+        eff_date = str(date_str or business_date or datetime.now(JST).strftime("%Y-%m-%d")).strip()
+        eff_delta = int(amount_jpy if amount_jpy is not None else delta_jpy)
+        eff_reason = str(note or reason or "FEE_REFUND_ADJUSTMENT").strip()
         ts = int(now_ts_ms if now_ts_ms is not None else time.time() * 1000)
+        try:
+            dt_event = datetime.fromisoformat(f"{eff_date}T06:00:30+09:00")
+        except Exception:
+            dt_event = datetime.fromtimestamp(ts / 1000.0, tz=JST)
+        tax_meta = classify_jp_crypto_tax_regime(dt_event, realized_pnl_jpy=eff_delta)
+
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE;")
             try:
@@ -978,10 +1401,34 @@ class DatabaseWAL:
                         business_date, delta_jpy, jpy_balance_before, jpy_balance_after, reason, created_ts_ms
                     ) VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (business_date, int(delta_jpy), int(jpy_balance_before), int(jpy_balance_after), reason, ts),
+                    (eff_date, eff_delta, int(jpy_balance_before), int(jpy_balance_after), eff_reason, ts),
                 )
+                inserted = cur.rowcount == 1
+                if inserted:
+                    self._insert_tax_ledger_event_unlocked(
+                        event_id=f"fee_refund_{eff_date}",
+                        timestamp_jst=tax_meta["timestamp_jst"],
+                        tax_year=tax_meta["tax_year"],
+                        tax_regime=tax_meta["tax_regime"],
+                        effective_tax_rate=tax_meta["effective_tax_rate"],
+                        loss_carryforward_years=tax_meta["loss_carryforward_years"],
+                        exchange_registration=tax_meta["exchange_registration"],
+                        symbol="JPY",
+                        event_type="DAILY_FEE_FRACTION_REFUND",
+                        side="REFUND",
+                        size=0.0,
+                        price_jpy=1.0,
+                        gross_proceeds_jpy=float(eff_delta),
+                        cost_basis_jpy=0.0,
+                        fee_or_rebate_jpy=float(eff_delta),
+                        realized_pnl_jpy=float(eff_delta),
+                        estimated_tax_jpy=tax_meta["estimated_tax_jpy"],
+                        after_tax_net_pnl_jpy=tax_meta["after_tax_net_pnl_jpy"],
+                        source_order_id=f"DAILY_0600_{eff_date}",
+                        created_ts_ms=ts,
+                    )
                 self._conn.execute("COMMIT;")
-                return cur.rowcount == 1
+                return inserted
             except Exception:
                 self._conn.execute("ROLLBACK;")
                 raise

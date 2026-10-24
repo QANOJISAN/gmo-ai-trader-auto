@@ -789,10 +789,10 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             tmp_dir = Path(tmp_str)
             wal = DatabaseWAL(tmp_dir / "cat6.db", portfolio_json_path=tmp_dir / "portfolio.json")
 
-            # #43: WAL PRAGMA 検証 (journal_mode=WAL, synchronous=FULL(2), busy_timeout=5000)
+            # #43: WAL PRAGMA 検証 (journal_mode=WAL, synchronous=NORMAL(1)/FULL(2), busy_timeout=5000)
             pragmas = wal.get_pragmas()
             self.assertEqual(pragmas["journal_mode"], "WAL")
-            self.assertEqual(pragmas["synchronous"], 2)
+            self.assertIn(pragmas["synchronous"], (1, 2))
             self.assertEqual(pragmas["busy_timeout"], 5000)
 
             # #44: Append-Only トリガー検証 (executions の UPDATE / DELETE 禁止)
@@ -3218,6 +3218,7 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             encoding="utf-8",
             errors="replace",
             check=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
         )
         acl_out = icacls_res.stdout
         self.assertNotIn("BUILTIN\\Users", acl_out)
@@ -4671,6 +4672,275 @@ class TestV2ChaosAudit64Items(unittest.TestCase):
             self.assertEqual(cal_res["mintrl_stage"], "STAGE0_HARD_FREEZE")
             self.assertTrue(cal_res["parameters_frozen"])
             self.assertEqual(cal_res["shadow_weight"], 0.25)
+            wal.close()
+
+    def test_round16_no_window_subprocess_wal_pragmas_ups_guard_and_2028_tax_forensic_bus_audit(self) -> None:
+        """
+        Round 16 監査テスト:
+        ① コンソールポップアップの完全根絶（全 `.py` ファイルの `subprocess` における `CREATE_NO_WINDOW = 0x08000000`
+           ＆ `STARTUPINFO(SW_HIDE=0)` ＆ `launch_hidden.vbs` の `0` 指定検証）
+        ② `DatabaseWAL` の6つの高可用性 PRAGMA（`WAL`, `synchronous=NORMAL(1)`, `busy_timeout=5000`,
+           `temp_store=MEMORY(2)`, `mmap_size=268435456`, `wal_autocheckpoint=1000`）の適用検証
+        ③ `SystemLifecycleGuard` において、デスクトップPC（`ACLineStatus=1, BatteryLifePercent=255`）で誤発動しないこと、
+           およびバッテリー低下（`ACLineStatus=0, BatteryLifePercent=35`）またはOSシャットダウンシグナル時に
+           「`PENDING_BUY` のみキャンセルし、既存建玉の `STOP` 逆指値は維持したまま `wal_checkpoint(TRUNCATE)` を完了する」ことの検証
+        ④ `classify_jp_crypto_tax_regime` において、`2027-12-31 23:59:59 JST` が `AGGREGATE_MISC (0.55945)`、
+           `2028-01-01 00:00:00 JST` が `SEPARATE_20315 (0.20315, loss_carryforward_years=3)` と正確に区分されること、
+           および `connect_forensic_readonly()` による Read-Only WAL 共有バス経由で `v_forensic_tax_ledger` が
+           ロック競合ゼロで読み取れ、誤った書き込み（`INSERT`/`UPDATE`）は `sqlite3.OperationalError` で即座に拒絶されることの検証
+        """
+        import ast
+        import os
+        from src.database_wal import classify_jp_crypto_tax_regime, connect_forensic_readonly
+        from src.system_lifecycle_guard import (
+            CREATE_NO_WINDOW,
+            CTRL_SHUTDOWN_EVENT,
+            SW_HIDE,
+            SYSTEM_POWER_STATUS,
+            SystemLifecycleGuard,
+            build_hidden_subprocess_kwargs,
+            get_system_power_status,
+        )
+
+        repo_root = Path(__file__).resolve().parent.parent
+
+        # ------------------------------------------------------------------
+        # ① コンソールポップアップの完全根絶監査 (AST 全スキャン & VBS/PS1 検証)
+        # ------------------------------------------------------------------
+        hidden_kw = build_hidden_subprocess_kwargs(is_git=True)
+        if os.name == "nt":
+            self.assertEqual(hidden_kw["creationflags"], CREATE_NO_WINDOW)
+            self.assertEqual(hidden_kw["startupinfo"].wShowWindow, SW_HIDE)
+        self.assertEqual(hidden_kw["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(hidden_kw["env"]["GCM_INTERACTIVE"], "never")
+
+        subprocess_calls_checked = 0
+        for py_file in repo_root.rglob("*.py"):
+            if ".venv" in py_file.parts:
+                continue
+            tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                    if isinstance(node.func.value, ast.Name) and node.func.value.id == "subprocess":
+                        if node.func.attr in ("run", "Popen", "check_output", "call", "check_call"):
+                            subprocess_calls_checked += 1
+                            kw_names = {k.arg for k in node.keywords if k.arg is not None}
+                            has_kwargs_unpack = any(k.arg is None for k in node.keywords)
+                            self.assertTrue(
+                                "creationflags" in kw_names or has_kwargs_unpack,
+                                f"{py_file.name}:{node.lineno} subprocess.{node.func.attr} is missing creationflags=CREATE_NO_WINDOW",
+                            )
+        self.assertGreaterEqual(subprocess_calls_checked, 6)
+
+        vbs_text = (repo_root / "launch_hidden.vbs").read_text(encoding="utf-8")
+        self.assertIn("shell.Run(cmd, 0, True)", vbs_text)
+
+        # ------------------------------------------------------------------
+        # ② 高可用性 SQLite WAL PRAGMA 6項目の全面適用検証
+        # ------------------------------------------------------------------
+        with tempfile.TemporaryDirectory() as tmp_dir_str:
+            tmp_path = Path(tmp_dir_str)
+            wal = DatabaseWAL(tmp_path / "round16_wal.db", portfolio_json_path=tmp_path / "portfolio.json")
+            pragmas = wal.get_pragmas()
+            self.assertEqual(pragmas["journal_mode"], "WAL")
+            self.assertEqual(pragmas["synchronous"], 1)  # NORMAL(1)
+            self.assertEqual(pragmas["synchronous_name"], "NORMAL")
+            self.assertEqual(pragmas["busy_timeout"], 5000)
+            self.assertEqual(pragmas["temp_store"], 2)  # MEMORY(2)
+            self.assertEqual(pragmas["temp_store_name"], "MEMORY")
+            self.assertEqual(pragmas["mmap_size"], 268435456)
+            self.assertEqual(pragmas["wal_autocheckpoint"], 1000)
+
+            # ------------------------------------------------------------------
+            # ③ Win32 `SYSTEM_POWER_STATUS` (c_ubyte) ＆ UPS / OSシャットダウン保護検証
+            # ------------------------------------------------------------------
+            field_types = dict(SYSTEM_POWER_STATUS._fields_)
+            self.assertEqual(field_types["ACLineStatus"].__name__, "c_ubyte")
+            self.assertEqual(field_types["BatteryLifePercent"].__name__, "c_ubyte")
+
+            # デスクトップPC AC常時接続 (ACLineStatus=1, BatteryLifePercent=255) で誤発動しないこと
+            p_desktop = get_system_power_status(
+                simulated_status={"ACLineStatus": 1, "BatteryFlag": 128, "BatteryLifePercent": 255}
+            )
+            self.assertFalse(p_desktop["should_emergency_graceful_stop"])
+            self.assertEqual(p_desktop["power_mode"], "DESKTOP_AC_NO_BATTERY")
+
+            # バッテリー駆動中でも残量 75% (> 40%) なら通常稼働継続
+            p_batt_ok = get_system_power_status(
+                simulated_status={"ACLineStatus": 0, "BatteryFlag": 1, "BatteryLifePercent": 75}
+            )
+            self.assertFalse(p_batt_ok["should_emergency_graceful_stop"])
+
+            # UPS バッテリー低下 (ACLineStatus=0, BatteryLifePercent=35 <= 40) で緊急グレースフル停止発動
+            ex = ChaosMockExchange(tmp_path, wal_db=wal)
+            oco = PseudoOCOManager(
+                broker=ex,
+                portfolio_path=tmp_path / "portfolio.json",
+                wal_db=wal,
+                dry_run_notify=True,
+            )
+            rc = RemoteControlManager(oco_manager=oco, db_wal=wal, allowed_owner_discord_id="owner_777")
+            guard = SystemLifecycleGuard(
+                oco_manager=oco,
+                remote_control=rc,
+                db_wal=wal,
+                dry_run_notify=True,
+                register_win32_handler=False,
+            )
+
+            t0 = datetime(2026, 10, 24, 15, 0, 0, tzinfo=JST)
+            # 1) 保有ポジション (BCH: 取引所サーバー上の STOP 注文あり) を作成
+            oco.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "BCH",
+                    "limit_price": 44000,
+                    "size": 0.1,
+                    "take_profit_price": 46500,
+                    "stop_loss_price": 42500,
+                },
+                tickers={"BCH": {"ask": 44100, "bid": 44050, "last": 44050}},
+                now_dt=t0,
+            )
+            oco.step(tickers={"BCH": {"ask": 43950, "bid": 43940, "last": 43945}}, now_dt=t0 + timedelta(seconds=10))
+            # 2) 未約定の待機買い指値 (SOL: PENDING_BUY) を作成
+            oco.place_new_buy_order(
+                {
+                    "action": "BUY",
+                    "symbol": "SOL",
+                    "limit_price": 19500,
+                    "size": 0.1,
+                    "take_profit_price": 21000,
+                    "stop_loss_price": 18800,
+                },
+                tickers={"SOL": {"ask": 20000, "bid": 19990, "last": 20000}},
+                now_dt=t0 + timedelta(seconds=20),
+            )
+            pf_before = oco.load_portfolio()
+            self.assertEqual(len(pf_before["positions"]), 1)
+            self.assertEqual(len(pf_before["pending_orders"]), 1)
+            active_sl_oid = pf_before["positions"][0]["sl_order_id"]
+            pending_buy_oid = pf_before["pending_orders"][0]["order_id"]
+
+            # デスクトップAC状態では何もキャンセルされないこと
+            chk_desktop = guard.check_power_and_execute_if_needed(
+                simulated_status={"ACLineStatus": 1, "BatteryFlag": 128, "BatteryLifePercent": 255},
+                now_dt=t0 + timedelta(seconds=25),
+            )
+            self.assertFalse(chk_desktop["triggered"])
+            self.assertEqual(len(oco.load_portfolio()["pending_orders"]), 1)
+
+            # UPS バッテリー残量 35% 検知 -> PENDING_BUY のみキャンセル、STOP は完全維持、WAL TRUNCATE 完了
+            chk_ups = guard.check_power_and_execute_if_needed(
+                simulated_status={"ACLineStatus": 0, "BatteryFlag": 2, "BatteryLifePercent": 35},
+                now_dt=t0 + timedelta(seconds=30),
+            )
+            self.assertTrue(chk_ups["triggered"])
+            shut_res = chk_ups["shutdown_result"]
+            self.assertEqual(shut_res["status"], "GRACEFUL_SHUTDOWN_COMPLETED")
+            self.assertIn(pending_buy_oid, shut_res["canceled_buy_order_ids"])
+            self.assertIn(active_sl_oid, shut_res["preserved_sl_order_ids"])
+            self.assertEqual(shut_res["wal_checkpoint"]["mode"], "TRUNCATE")
+
+            pf_after = oco.load_portfolio()
+            self.assertEqual(len(pf_after["pending_orders"]), 0)
+            self.assertEqual(len(pf_after["positions"]), 1)
+            self.assertEqual(pf_after["positions"][0]["sl_order_id"], active_sl_oid)
+            # 取引所モック上でも BCH の STOP 注文が WAITING のまま生きており、SOL の LIMIT BUY はキャンセル済みであること
+            bch_active = ex.get_active_orders("BCH")
+            self.assertEqual(len(bch_active), 1)
+            self.assertEqual(bch_active[0]["order_id"], active_sl_oid)
+            self.assertEqual(len(ex.get_active_orders("SOL")), 0)
+
+            # OS シャットダウンシグナル (CTRL_SHUTDOWN_EVENT=6) の冪等ハンドリング検証
+            guard_os = SystemLifecycleGuard(
+                oco_manager=oco,
+                remote_control=rc,
+                db_wal=wal,
+                dry_run_notify=True,
+                register_win32_handler=False,
+            )
+            os_sig_res = guard_os.handle_os_ctrl_event(CTRL_SHUTDOWN_EVENT, now_dt=t0 + timedelta(seconds=40))
+            self.assertEqual(os_sig_res["reason"], "WIN32_CTRL_SHUTDOWN_EVENT")
+            self.assertEqual(os_sig_res["wal_checkpoint"]["mode"], "TRUNCATE")
+            self.assertIn(active_sl_oid, os_sig_res["preserved_sl_order_ids"])
+
+            # ------------------------------------------------------------------
+            # ④ 2028年申告分離課税（20.315%）区分 ＆ Forensic Ledger Read-Only WAL 共有バス検証
+            # ------------------------------------------------------------------
+            tax_2027 = classify_jp_crypto_tax_regime("2027-12-31T23:59:59+09:00", realized_pnl_jpy=10000)
+            self.assertEqual(tax_2027["tax_year"], 2027)
+            self.assertEqual(tax_2027["tax_regime"], "AGGREGATE_MISC")
+            self.assertAlmostEqual(tax_2027["effective_tax_rate"], 0.55945, places=5)
+            self.assertEqual(tax_2027["loss_carryforward_years"], 0)
+            self.assertEqual(tax_2027["exchange_registration"], "JP_FSA_REGISTERED_GMO")
+            self.assertAlmostEqual(tax_2027["estimated_tax_jpy"], 5594.50, places=2)
+            self.assertAlmostEqual(tax_2027["after_tax_net_pnl_jpy"], 4405.50, places=2)
+
+            tax_2028 = classify_jp_crypto_tax_regime("2028-01-01T00:00:00+09:00", realized_pnl_jpy=10000)
+            self.assertEqual(tax_2028["tax_year"], 2028)
+            self.assertEqual(tax_2028["tax_regime"], "SEPARATE_20315")
+            self.assertAlmostEqual(tax_2028["effective_tax_rate"], 0.20315, places=5)
+            self.assertEqual(tax_2028["loss_carryforward_years"], 3)
+            self.assertEqual(tax_2028["exchange_registration"], "JP_FSA_REGISTERED_GMO")
+            self.assertAlmostEqual(tax_2028["estimated_tax_jpy"], 2031.50, places=2)
+            self.assertAlmostEqual(tax_2028["after_tax_net_pnl_jpy"], 7968.50, places=2)
+
+            # 2027年・2028年の税務イベントおよび 06:00 JST 端数返金を記録
+            wal.record_tax_ledger_event(
+                event_id="evt_2027_close_1",
+                symbol="SOL",
+                event_type="SPOT_TRADE_CLOSE",
+                side="SELL",
+                size=0.5,
+                price_jpy=22000,
+                gross_proceeds_jpy=11000,
+                cost_basis_jpy=10000,
+                fee_or_rebate_jpy=2.0,
+                realized_pnl_jpy=1002.0,
+                source_order_id="ord_2027_1",
+                timestamp_jst="2027-12-31T23:59:59+09:00",
+            )
+            wal.record_tax_ledger_event(
+                event_id="evt_2028_close_1",
+                symbol="BTC",
+                event_type="SPOT_TRADE_CLOSE",
+                side="SELL",
+                size=0.001,
+                price_jpy=15000000,
+                gross_proceeds_jpy=15000,
+                cost_basis_jpy=13000,
+                fee_or_rebate_jpy=3.0,
+                realized_pnl_jpy=2003.0,
+                source_order_id="ord_2028_1",
+                timestamp_jst="2028-01-01T00:00:00+09:00",
+            )
+            wal.record_fee_adjustment(
+                date_str="2028-01-02",
+                amount_jpy=4,
+                note="DAILY_FEE_FRACTION_SETTLEMENT (06:00:30 JST)",
+            )
+
+            rows_2027 = wal.query_forensic_tax_ledger(tax_year=2027)
+            rows_2028 = wal.query_forensic_tax_ledger(tax_year=2028)
+            self.assertTrue(any(r["event_id"] == "evt_2027_close_1" and r["tax_regime"] == "AGGREGATE_MISC" for r in rows_2027))
+            self.assertTrue(any(r["event_id"] == "evt_2028_close_1" and r["tax_regime"] == "SEPARATE_20315" for r in rows_2028))
+            self.assertTrue(any(r["event_type"] == "DAILY_FEE_FRACTION_REFUND" and r["tax_regime"] == "SEPARATE_20315" for r in rows_2028))
+
+            # Forensic Ledger Read-Only WAL 共有バス (`connect_forensic_readonly`) の読み取り成功 ＆ 書き込み拒絶検証
+            ro_conn = connect_forensic_readonly(wal.db_path)
+            try:
+                view_rows = ro_conn.execute("SELECT * FROM v_forensic_tax_ledger").fetchall()
+                self.assertGreaterEqual(len(view_rows), 3)
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro_conn.execute(
+                        "INSERT INTO tax_ledger_events (event_id, timestamp_jst, tax_year, tax_regime, effective_tax_rate, created_ts_ms) "
+                        "VALUES ('illegal_write', '2028-01-01T00:00:00+09:00', 2028, 'SEPARATE_20315', 0.20315, 1)"
+                    )
+                with self.assertRaises(sqlite3.OperationalError):
+                    ro_conn.execute("UPDATE tax_ledger_events SET realized_pnl_jpy = 999999")
+            finally:
+                ro_conn.close()
             wal.close()
 
 

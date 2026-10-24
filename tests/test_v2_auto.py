@@ -581,7 +581,13 @@ class TestV2AutoTradingSystem(unittest.TestCase):
                     f"if ($errors.Count -gt 0) {{ Write-Error ($errors | Out-String); exit 1 }}"
                 ),
             ]
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+            )
             self.assertEqual(proc.returncode, 0, f"{ps_name} AST parse failed: {proc.stderr}")
 
     def test_07_partial_fill_expiry_and_safety_circuit_breakers(self) -> None:

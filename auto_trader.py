@@ -68,6 +68,7 @@ from src.regime_filter import (
     evaluate_jst_session_and_schedule_matrix,
 )
 from src.remote_control import RemoteControlManager, TieredNotificationDispatcher
+from src.system_lifecycle_guard import SystemLifecycleGuard
 from src.validator import DEFAULT_SYMBOL_RULES, validate_and_adjust_decision
 from src.wfa_backtester import ConservativeSpotBacktester
 from src.ws_hybrid_engine import WSHybridEngine
@@ -316,6 +317,13 @@ class AutoTraderDaemon:
         )
         self.backtester = ConservativeSpotBacktester()
         self.instance_lock = SingleInstanceLock(self.lock_path)
+        self.lifecycle_guard = SystemLifecycleGuard(
+            oco_manager=self.oco_manager,
+            remote_control=self.remote_control,
+            db_wal=self.db_wal,
+            notifier=self.notifier,
+            dry_run_notify=self.dry_run_notify,
+        )
 
         # 内部状態
         self.in_maintenance_sleep: bool = False
@@ -987,6 +995,19 @@ class AutoTraderDaemon:
         """
         now_jst = _now_jst(now_dt)
         prevent_windows_sleep()
+
+        # Win32 OSシャットダウン・UPS低バッテリー検知時のグレースフル停止チェック
+        if getattr(self, "lifecycle_guard", None) is not None:
+            power_chk = self.lifecycle_guard.check_power_and_execute_if_needed(now_dt=now_jst)
+            if power_chk.get("triggered"):
+                shut_info = power_chk.get("shutdown_result") or {}
+                return {
+                    "status": "LIFECYCLE_GRACEFUL_HALT",
+                    "reason": shut_info.get("reason", "OS_OR_UPS_SHUTDOWN"),
+                    "shutdown_result": shut_info,
+                    "timestamp": now_jst.isoformat(timespec="seconds"),
+                    "events": [],
+                }
 
         if self.auth_halted or getattr(self.broker, "halted", False):
             self.auth_halted = True
@@ -1896,6 +1917,11 @@ class AutoTraderDaemon:
 
     def shutdown(self) -> None:
         """デーモン終了時のリソース解放（WSトークン失効・WALクローズ・ロック解放）"""
+        try:
+            if getattr(self, "lifecycle_guard", None) is not None:
+                self.lifecycle_guard.unregister_console_ctrl_handler()
+        except Exception:
+            pass
         try:
             if getattr(self, "ws_engine", None) is not None:
                 self.ws_engine.shutdown()

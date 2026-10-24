@@ -173,13 +173,24 @@ def push_docs_snapshot_async(
                 except Exception:
                     return
 
-            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            startup_info = None
+            if os.name == "nt" and hasattr(subprocess, "STARTUPINFO"):
+                startup_info = subprocess.STARTUPINFO()
+                startup_info.dwFlags |= getattr(subprocess, "STARTF_USESHOWWINDOW", 0x00000001)
+                startup_info.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            git_env = os.environ.copy()
+            git_env["GIT_TERMINAL_PROMPT"] = "0"
+            git_env["GCM_INTERACTIVE"] = "never"
+
             r_remote = subprocess.run(
                 ["git", "-C", str(resolved), "remote", "get-url", "origin"],
                 capture_output=True,
                 text=True,
                 timeout=10,
                 creationflags=creation_flags,
+                startupinfo=startup_info,
+                env=git_env,
             )
             if r_remote.returncode != 0 or not r_remote.stdout.strip():
                 return
@@ -190,6 +201,8 @@ def push_docs_snapshot_async(
                 text=True,
                 timeout=15,
                 creationflags=creation_flags,
+                startupinfo=startup_info,
+                env=git_env,
             )
             r_diff = subprocess.run(
                 ["git", "-C", str(resolved), "diff", "--cached", "--quiet", "--", "docs/"],
@@ -197,6 +210,8 @@ def push_docs_snapshot_async(
                 text=True,
                 timeout=10,
                 creationflags=creation_flags,
+                startupinfo=startup_info,
+                env=git_env,
             )
             if r_diff.returncode == 0:
                 return
@@ -216,9 +231,11 @@ def push_docs_snapshot_async(
                 text=True,
                 timeout=20,
                 creationflags=creation_flags,
+                startupinfo=startup_info,
+                env=git_env,
             )
             auth_header = build_github_basic_auth_header(dotenv_path=resolved / ".env")
-            push_cmd = ["git", "-C", str(resolved)]
+            push_cmd = ["git", "-C", str(resolved), "-c", "credential.helper="]
             if auth_header:
                 push_cmd.extend(["-c", f"http.extraheader={auth_header}"])
             push_cmd.extend(["push", "origin", "main"])
@@ -228,6 +245,8 @@ def push_docs_snapshot_async(
                 text=True,
                 timeout=30,
                 creationflags=creation_flags,
+                startupinfo=startup_info,
+                env=git_env,
             )
             if r_push.returncode == 0:
                 _LAST_GIT_PUSH_MONO = time.monotonic()
